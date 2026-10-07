@@ -196,7 +196,7 @@ Le risposte vengono salvate in `/root/vps-installer/answers.env` (root, 600).
   └── logs/
   ```
   Permessi: cartella `panel:panel` 750; `www-data` nel gruppo `panel` solo per leggere `public/`.
-- Pool PHP-FPM `panel`: socket `/run/php/php8.4-fpm-panel.sock`, `open_basedir` limitato a `/var/www/<pannello>`, `/opt/vps/phpmyadmin`, `/opt/vps/manifest.json`, `/tmp`.
+- Pool PHP-FPM `panel`: socket `/run/php/php8.4-fpm-panel.sock`, `open_basedir` limitato a `/var/www/<pannello>`, `/opt/vps/phpmyadmin`, `/opt/vps/manifest.json` (niente `/tmp`: `sys_temp_dir` e `upload_tmp_dir` puntano a `storage/tmp`).
 - DB `panel` + utente `panel` (permessi solo su `panel`).
 - Utente DB `panel_dbadmin`: tutti i permessi **solo** sui database con prefisso `site_`, nessun permesso globale (niente `CREATE USER`). DB e utenti dei siti li crea lo script root `vps-site` (vedi handoff). Serve per lavorare sui DB dei siti da phpMyAdmin.
 - Su un rilancio le password esistenti in `config/.env` vengono riusate.
