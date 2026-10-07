@@ -25,10 +25,10 @@ run_steps() {
     # lo stato e `set -e` resta attivo anche se run_steps è chiamata in un
     # contesto che lo disabilita (if, ||, bats `run`).
     rc=0
-    bash -c '
+    "$BASH" -c '
       source "$1"
       if [[ -f "$VPS_ANSWERS" ]]; then answers_load; fi
-      set -Eeuo pipefail
+      enable_error_trap
       step_enabled() { return 0; }
       source "$2"
       if step_enabled; then

@@ -49,3 +49,17 @@ setup() {
   run_steps
   [ "$(cat "$OUT")" = "20" ]
 }
+
+@test "lo step vede le risposte e le variabili derivate" {
+  ADMIN_USER=manu PANEL_DOMAIN=panel.miosito.it answers_save
+  printf 'step_main() { echo "$ADMIN_USER $PANEL_ROOT" >>"$OUT"; }\n' >"$VPS_ROOT/steps/10-a.sh"
+  run_steps
+  [ "$(cat "$OUT")" = "manu /var/www/panel.miosito.it" ]
+}
+
+@test "il comando che fallisce finisce nel log" {
+  printf 'step_main() { false_cmd_xyz; }\n' >"$VPS_ROOT/steps/10-a.sh"
+  run run_steps
+  [ "$status" -ne 0 ]
+  grep -q "false_cmd_xyz" "$VPS_LOG"
+}
