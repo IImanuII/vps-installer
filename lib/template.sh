@@ -2,6 +2,7 @@
 # Rendering dei template con envsubst, limitato alle variabili elencate.
 
 # Variabili non presenti in ANSWER_VARS ma ammesse nei template.
+# shellcheck disable=SC2034  # usata dai test e dai moduli
 KNOWN_TEMPLATE_VARS=(
   PANEL_ROOT SSH_ALLOW_USERS PHP_VERSION VPS_OPT
   PMA_BLOWFISH PMA_CONTROL_PASS
