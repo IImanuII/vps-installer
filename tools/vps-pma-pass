@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# vps-pma-pass set — nuova password (da stdin) per la basic auth di phpMyAdmin.
+: "${VPS_OPT:=/opt/vps}" "${VPS_LOG:=/var/log/vps-tools.log}"
+: "${VPS_TEMPLATES:=$VPS_OPT/templates}"
+for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
+  # shellcheck source=/dev/null
+  source "$_lib"
+done
+tool_init
+
+[[ "${1:-}" == set ]] || json_err "uso: vps-pma-pass set (password da stdin)"
+pass="$(read_stdin_limited 256)"
+pass="${pass%$'\n'}"
+valid_password "$pass" || json_err "password non valida: minimo 12 caratteri, una riga"
+user="$(jq -r '.admin_user // empty' "$(manifest_path)")"
+valid_username "$user" || json_err "utente admin non valido nel manifest"
+printf '%s' "$pass" | pma_set_basic_auth "$user"
+json_ok

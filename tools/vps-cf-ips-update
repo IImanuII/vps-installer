@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# vps-cf-ips-update — aggiorna real_ip di Nginx e regole UFW con gli IP Cloudflare.
+: "${VPS_OPT:=/opt/vps}" "${VPS_LOG:=/var/log/vps-tools.log}"
+: "${VPS_TEMPLATES:=$VPS_OPT/templates}"
+for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
+  # shellcheck source=/dev/null
+  source "$_lib"
+done
+tool_init
+
+m="$(manifest_path)"
+[[ "$(jq -r '.cloudflare.enabled' "$m")" == true ]] || json_err "Cloudflare non è attivo su questa VPS"
+lock=no
+if [[ "$(jq -r '.cloudflare.origin_locked' "$m")" == true ]]; then
+  lock=yes
+fi
+cf_apply_ips "$lock"
+now="$(date -Iseconds)"
+manifest_set '.cloudflare.ips_updated_at = $t' --arg t "$now"
+json_ok --arg t "$now" '{ok: true, updated_at: $t}'

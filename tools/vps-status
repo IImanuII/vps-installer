@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# vps-status — stato del server in JSON.
+: "${VPS_OPT:=/opt/vps}" "${VPS_LOG:=/var/log/vps-tools.log}"
+: "${VPS_TEMPLATES:=$VPS_OPT/templates}"
+for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
+  # shellcheck source=/dev/null
+  source "$_lib"
+done
+tool_init
+
+services='{}'
+for s in nginx "php$PHP_VERSION-fpm" mariadb redis-server fail2ban; do
+  st="$(systemctl is-active "$s" 2>/dev/null || true)"
+  services="$(jq -c --arg k "$s" --arg v "${st:-unknown}" '. + {($k): $v}' <<<"$services")"
+done
+read -r dsize dused davail < <(df -B1 --output=size,used,avail / | tail -n 1)
+read -r mtotal mused mavail < <(free -b | awk '/^Mem:/ { print $2, $3, $7 }')
+read -r l1 l5 l15 _ </proc/loadavg
+up="$(cut -d' ' -f1 /proc/uptime)"
+upg="$(apt list --upgradable 2>/dev/null | grep -c 'upgradable from' || true)"
+reboot=false
+if [[ -f /var/run/reboot-required ]]; then
+  reboot=true
+fi
+
+json_ok --argjson services "$services" \
+  --argjson dsize "$dsize" --argjson dused "$dused" --argjson davail "$davail" \
+  --argjson mtotal "$mtotal" --argjson mused "$mused" --argjson mavail "$mavail" \
+  --argjson l1 "$l1" --argjson l5 "$l5" --argjson l15 "$l15" \
+  --argjson up "${up%.*}" --argjson upg "${upg:-0}" --argjson reboot "$reboot" \
+  '{ok: true, services: $services,
+    disk: {total: $dsize, used: $dused, available: $davail},
+    memory: {total: $mtotal, used: $mused, available: $mavail},
+    load: [$l1, $l5, $l15], uptime_seconds: $up,
+    updates: {upgradable: $upg, reboot_required: $reboot}}'

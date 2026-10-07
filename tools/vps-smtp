@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# vps-smtp set|test EMAIL|disable — configurazione email (JSON da stdin per set).
+# JSON: {"host","port","user","pass","from","alert_email"}
+: "${VPS_OPT:=/opt/vps}" "${VPS_LOG:=/var/log/vps-tools.log}"
+: "${VPS_TEMPLATES:=$VPS_OPT/templates}"
+for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
+  # shellcheck source=/dev/null
+  source "$_lib"
+done
+tool_init
+
+case "${1:-}" in
+  set)
+    cfg="$(read_stdin_limited 4096)"
+    jq -e 'type == "object"' >/dev/null 2>&1 <<<"$cfg" || json_err "configurazione JSON non valida"
+    SMTP_HOST="$(jq -r '.host // ""' <<<"$cfg")"
+    SMTP_PORT="$(jq -r '.port // "" | tostring' <<<"$cfg")"
+    SMTP_USER="$(jq -r '.user // ""' <<<"$cfg")"
+    SMTP_PASS="$(jq -r '.pass // ""' <<<"$cfg")"
+    SMTP_FROM="$(jq -r '.from // ""' <<<"$cfg")"
+    ALERT_EMAIL="$(jq -r '.alert_email // ""' <<<"$cfg")"
+    valid_domain "$SMTP_HOST" || json_err "host SMTP non valido"
+    valid_smtp_port "$SMTP_PORT" || json_err "porta SMTP non valida (25, 465, 587, 2525)"
+    valid_line "$SMTP_USER" || json_err "utente SMTP non valido"
+    valid_line "$SMTP_PASS" || json_err "password SMTP non valida"
+    valid_email "$SMTP_FROM" || json_err "mittente non valido"
+    valid_email "$ALERT_EMAIL" || json_err "email degli avvisi non valida"
+    mail_render_config
+    manifest_set '.mail.configured = true | .mail.alert_email = $e' --arg e "$ALERT_EMAIL"
+    json_ok
+    ;;
+  test)
+    valid_email "${2:-}" || json_err "uso: vps-smtp test EMAIL"
+    [[ -f "$VPS_OPT/secrets/msmtprc" ]] || json_err "email non configurata"
+    mail_send_test "$2" || json_err "invio non riuscito (dettagli in /var/log/msmtp.log)"
+    json_ok
+    ;;
+  disable)
+    rm -f "$VPS_OPT/secrets/msmtprc" "$MSMTPRC_LINK"
+    manifest_set '.mail.configured = false | .mail.alert_email = null'
+    json_ok
+    ;;
+  *)
+    json_err "uso: vps-smtp set|test EMAIL|disable"
+    ;;
+esac
