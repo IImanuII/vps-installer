@@ -16,7 +16,7 @@ json_err() {
 
 tool_init() {
   set -Eeuo pipefail
-  trap 'json_err "errore interno (dettagli in $VPS_LOG)"' ERR
+  trap 'rc=$?; if [[ $BASHPID == "$$" ]]; then log "ERRORE: ${BASH_COMMAND}"; json_err "errore interno (dettagli in $VPS_LOG)"; fi; exit "$rc"' ERR
   die() {
     # shellcheck disable=SC2317
     log "ERRORE: $*"

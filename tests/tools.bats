@@ -63,8 +63,39 @@ setup() {
 }
 
 @test "il sudoers elenca solo gli script wrapper" {
-  run grep -c '/opt/vps/bin/vps-' "$REPO_ROOT/templates/sudoers-vps-panel"
+  f="$REPO_ROOT/templates/sudoers-vps-panel"
+  run grep -c '/opt/vps/bin/vps-' "$f"
   [ "$output" -ge 1 ]
-  run grep -q 'ALL$' "$REPO_ROOT/templates/sudoers-vps-panel"
+  run grep -q 'ALL$' "$f"
   [ "$status" -ne 0 ]
+  grep -qxF 'Defaults:panel env_reset' "$f"
+  grep -qxF 'panel ALL=(root) NOPASSWD: /opt/vps/bin/vps-status, /opt/vps/bin/vps-cf-token, /opt/vps/bin/vps-cf-ips-update, /opt/vps/bin/vps-smtp, /opt/vps/bin/vps-pma-pass, /opt/vps/bin/vps-pma-update' "$f"
+  if command -v visudo >/dev/null 2>&1; then
+    visudo -cf "$f"
+  fi
+}
+
+@test "vps-cf-token set salva il token con permessi 600" {
+  make_stub curl 'echo "{\"result\":[{\"id\":\"zid\"}]}"'
+  mkdir -p "$VPS_OPT/secrets"
+  tok="$(printf 'a%.0s' {1..40})"
+  run bash -c "printf '%s' '$tok' | bash '$T/vps-cf-token' set"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .ok <<<"$output")" = true ]
+  grep -qxF "dns_cloudflare_api_token = $tok" "$VPS_OPT/secrets/cloudflare.ini"
+  [ "$(stat -c %a "$VPS_OPT/secrets/cloudflare.ini")" = 600 ]
+}
+
+@test "in caso di errore stdout contiene un solo oggetto JSON" {
+  run bash -c "printf 'corto' | bash '$T/vps-cf-token' set 2>/dev/null"
+  [ "$status" -eq 1 ]
+  [ "$(jq -sc 'length' <<<"$output")" = 1 ]
+  [ "$(jq -r .ok <<<"$output")" = false ]
+}
+
+@test "vps-pma-pass rifiuta password oltre 72 byte" {
+  long="$(printf 'a%.0s' {1..80})"
+  run bash -c "printf '%s' '$long' | bash '$T/vps-pma-pass' set"
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"72"* ]]
 }

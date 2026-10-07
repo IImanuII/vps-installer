@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
 # vps-cf-ips-update — aggiorna real_ip di Nginx e regole UFW con gli IP Cloudflare.
+# Sotto sudo l'ambiente del chiamante non deve influenzare lo script.
+if [[ -n "${SUDO_USER:-}" ]]; then
+  VPS_OPT=/opt/vps
+  VPS_LIB=$VPS_OPT/lib
+  VPS_TEMPLATES=$VPS_OPT/templates
+  VPS_LOG=/var/log/vps-tools.log
+  unset MSMTPRC_LINK HTPASSWD_PMA ALIASES_FILE PMA_DIR NGINX_SNIPPETS CF_API CF_IPS_URL PMA_BASE_URL
+  [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
+  chmod 640 "$VPS_LOG"
+fi
 : "${VPS_OPT:=/opt/vps}" "${VPS_LOG:=/var/log/vps-tools.log}"
 : "${VPS_TEMPLATES:=$VPS_OPT/templates}"
 for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do

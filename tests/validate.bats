@@ -62,6 +62,8 @@ setup() {
   valid_email mario@example.com
   run valid_email mario; [ "$status" -ne 0 ]
   run valid_email 'a b@c.it'; [ "$status" -ne 0 ]
+  run valid_email 'a,b@c.it'; [ "$status" -ne 0 ]
+  run valid_email 'a|b@c.it'; [ "$status" -ne 0 ]
 }
 
 @test "fuso orario e locale" {

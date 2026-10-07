@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 # vps-smtp set|test EMAIL|disable — configurazione email (JSON da stdin per set).
 # JSON: {"host","port","user","pass","from","alert_email"}
+# Sotto sudo l'ambiente del chiamante non deve influenzare lo script.
+if [[ -n "${SUDO_USER:-}" ]]; then
+  VPS_OPT=/opt/vps
+  VPS_LIB=$VPS_OPT/lib
+  VPS_TEMPLATES=$VPS_OPT/templates
+  VPS_LOG=/var/log/vps-tools.log
+  unset MSMTPRC_LINK HTPASSWD_PMA ALIASES_FILE PMA_DIR NGINX_SNIPPETS CF_API CF_IPS_URL PMA_BASE_URL
+  [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
+  chmod 640 "$VPS_LOG"
+fi
 : "${VPS_OPT:=/opt/vps}" "${VPS_LOG:=/var/log/vps-tools.log}"
 : "${VPS_TEMPLATES:=$VPS_OPT/templates}"
 for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
@@ -37,6 +47,7 @@ case "${1:-}" in
     ;;
   disable)
     rm -f "$VPS_OPT/secrets/msmtprc" "$MSMTPRC_LINK"
+    printf '# vps-installer: nessun alias configurato\n' | write_file "$ALIASES_FILE" 644 root:root
     manifest_set '.mail.configured = false | .mail.alert_email = null'
     json_ok
     ;;

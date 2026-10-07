@@ -11,14 +11,23 @@ step_main() {
   manifest_write
 
   if is_yes "$PANEL_ENABLED"; then
-    local tmp="$VPS_ROOT/sudoers-vps-panel"
+    local tmp
+    tmp="$(mktemp)"
     cp "$VPS_TEMPLATES/sudoers-vps-panel" "$tmp"
-    visudo -cqf "$tmp" || die "Regole sudoers non valide"
+    if ! visudo -cqf "$tmp"; then
+      rm -f "$tmp"
+      die "Regole sudoers non valide"
+    fi
     install -m 440 -o root -g root "$tmp" /etc/sudoers.d/vps-panel
+    rm -f "$tmp"
+  else
+    rm -f /etc/sudoers.d/vps-panel
   fi
 
   if is_yes "$CF_ENABLED"; then
     install -m 644 "$VPS_TEMPLATES/cron-vps" /etc/cron.d/vps
     manifest_set '.cloudflare.ips_updated_at = $t' --arg t "$(date -Iseconds)"
+  else
+    rm -f /etc/cron.d/vps
   fi
 }
