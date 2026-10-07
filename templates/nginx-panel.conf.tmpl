@@ -1,0 +1,48 @@
+# vps-installer: pannello
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${PANEL_DOMAIN};
+    include /etc/nginx/snippets/acme.conf;
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${PANEL_DOMAIN};
+
+    ssl_certificate /etc/letsencrypt/live/${PANEL_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${PANEL_DOMAIN}/privkey.pem;
+    include /etc/nginx/snippets/ssl-params.conf;
+    include /etc/nginx/snippets/security-headers.conf;
+
+    root ${PANEL_ROOT}/public;
+    index index.php index.html;
+
+    access_log /var/log/nginx/${PANEL_DOMAIN}.access.log main;
+    error_log /var/log/nginx/${PANEL_DOMAIN}.error.log error;
+
+    limit_req zone=req_limit_per_ip burst=20 nodelay;
+
+    location ~ /\.(?!well-known) {
+        deny all;
+    }
+
+    # Estensioni del pannello (es. phpMyAdmin)
+    include /etc/nginx/snippets/panel.d/*.conf;
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~ \.php$ {
+        try_files $uri =404;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_pass unix:/run/php/php${PHP_VERSION}-fpm-panel.sock;
+    }
+}

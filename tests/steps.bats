@@ -46,3 +46,17 @@ setup() {
   run grep -q 'ssl_stapling' "$REPO_ROOT/templates/nginx-ssl-params.conf"
   [ "$status" -ne 0 ]
 }
+
+@test "vhost e pool del pannello" {
+  PANEL_DOMAIN=panel.miosito.it PANEL_ROOT=/var/www/panel.miosito.it
+  render_template "$REPO_ROOT/templates/nginx-panel.conf.tmpl" "$BATS_TEST_TMPDIR/vhost" 644 "$(id -un):$(id -gn)" PANEL_DOMAIN PANEL_ROOT PHP_VERSION
+  grep -q 'server_name panel.miosito.it;' "$BATS_TEST_TMPDIR/vhost"
+  grep -q 'ssl_certificate /etc/letsencrypt/live/panel.miosito.it/fullchain.pem;' "$BATS_TEST_TMPDIR/vhost"
+  grep -q 'root /var/www/panel.miosito.it/public;' "$BATS_TEST_TMPDIR/vhost"
+  grep -q 'include /etc/nginx/snippets/panel.d/\*.conf;' "$BATS_TEST_TMPDIR/vhost"
+  grep -q 'limit_req zone=req_limit_per_ip' "$BATS_TEST_TMPDIR/vhost"
+  grep -q 'return 301 https://$host$request_uri;' "$BATS_TEST_TMPDIR/vhost"
+  render_template "$REPO_ROOT/templates/php-pool-panel.conf.tmpl" "$BATS_TEST_TMPDIR/pool" 644 "$(id -un):$(id -gn)" PANEL_ROOT PHP_VERSION VPS_OPT
+  grep -qxF 'listen = /run/php/php8.4-fpm-panel.sock' "$BATS_TEST_TMPDIR/pool"
+  grep -q "open_basedir\] = /var/www/panel.miosito.it/:$VPS_OPT/phpmyadmin/:$VPS_OPT/manifest.json" "$BATS_TEST_TMPDIR/pool"
+}
