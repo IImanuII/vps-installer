@@ -60,3 +60,15 @@ setup() {
   grep -qxF 'listen = /run/php/php8.4-fpm-panel.sock' "$BATS_TEST_TMPDIR/pool"
   grep -q "open_basedir\] = /var/www/panel.miosito.it/:$VPS_OPT/phpmyadmin/:$VPS_OPT/manifest.json" "$BATS_TEST_TMPDIR/pool"
 }
+
+@test "configurazione phpMyAdmin e location nginx" {
+  PMA_BLOWFISH=abcdefghijklmnopqrstuvwxyz012345 PMA_CONTROL_PASS=Ctrl123 PANEL_ROOT=/var/www/panel.miosito.it PANEL_DOMAIN=panel.miosito.it
+  render_template "$REPO_ROOT/templates/pma-config.inc.php.tmpl" "$BATS_TEST_TMPDIR/cfg" 640 "$(id -un):$(id -gn)" PMA_BLOWFISH PMA_CONTROL_PASS PANEL_ROOT PANEL_DOMAIN
+  grep -q "\['controlpass'\] = 'Ctrl123';" "$BATS_TEST_TMPDIR/cfg"
+  grep -q "\['AllowRoot'\] = false;" "$BATS_TEST_TMPDIR/cfg"
+  grep -q "TempDir'\] = '/var/www/panel.miosito.it/storage/pma-tmp';" "$BATS_TEST_TMPDIR/cfg"
+  render_template "$REPO_ROOT/templates/nginx-pma.conf.tmpl" "$BATS_TEST_TMPDIR/pma" 644 "$(id -un):$(id -gn)" VPS_OPT PHP_VERSION
+  grep -q 'auth_basic_user_file /etc/nginx/.htpasswd-pma;' "$BATS_TEST_TMPDIR/pma"
+  grep -q 'fastcgi_param SCRIPT_FILENAME $request_filename;' "$BATS_TEST_TMPDIR/pma"
+  grep -q "alias $VPS_OPT/phpmyadmin/;" "$BATS_TEST_TMPDIR/pma"
+}
