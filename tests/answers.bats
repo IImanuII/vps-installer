@@ -5,7 +5,7 @@ setup() {
 
 @test "le risposte sopravvivono a caratteri speciali" {
   ADMIN_USER=manu
-  ADMIN_PASS=$'p@ss $word \'quote\' "dq" \back'
+  ADMIN_PASS=$'p@ss $word \'quote\' "dq" \\back'
   SMTP_PASS='a$b`c'
   ADMIN_PUBKEY='ssh-ed25519 AAAAC3Nza manu@pc'
   answers_save
