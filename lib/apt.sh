@@ -26,6 +26,18 @@ gpg_keyring_install() {
   else
     cp "$src" "$dest.tmp"
   fi
+  # Verifica i byte effettivamente installati, non solo la sorgente.
+  fprs="$(gpg_primary_fprs "$dest.tmp")"
+  if [[ -z "$fprs" ]]; then
+    rm -f "$dest.tmp"
+    die "Keyring prodotto senza chiavi valide per $(basename "$dest")"
+  fi
+  while read -r f; do
+    if ! in_list "$f" "$@"; then
+      rm -f "$dest.tmp"
+      die "Chiave GPG non attesa nel keyring prodotto per $(basename "$dest"): $f"
+    fi
+  done <<<"$fprs"
   chmod 644 "$dest.tmp"
   mv -f "$dest.tmp" "$dest"
 }

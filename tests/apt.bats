@@ -16,7 +16,8 @@ setup() {
 @test "gpg_keyring_install accetta una chiave attesa e la converte in binario" {
   gpg_keyring_install "$BATS_TEST_TMPDIR/key.asc" "$BATS_TEST_TMPDIR/repo.gpg" AAAA "$FPR"
   [ -f "$BATS_TEST_TMPDIR/repo.gpg" ]
-  ! grep -q 'BEGIN PGP' "$BATS_TEST_TMPDIR/repo.gpg"
+  run grep -q 'BEGIN PGP' "$BATS_TEST_TMPDIR/repo.gpg"
+  [ "$status" -ne 0 ]
   run gpg_primary_fprs "$BATS_TEST_TMPDIR/repo.gpg"
   [ "$output" = "$FPR" ]
 }
@@ -31,4 +32,14 @@ setup() {
   echo "<html>errore</html>" >"$BATS_TEST_TMPDIR/bad.asc"
   run gpg_keyring_install "$BATS_TEST_TMPDIR/bad.asc" "$BATS_TEST_TMPDIR/repo.gpg" "$FPR"
   [ "$status" -eq 1 ]
+  [ ! -f "$BATS_TEST_TMPDIR/repo.gpg" ]
+}
+
+@test "gpg_keyring_install rifiuta un file con due chiavi primarie di cui una sola attesa" {
+  gpg --batch --quiet --passphrase '' --quick-gen-key 'Other <other@example.com>' ed25519 sign never
+  gpg --batch --armor --export repo@example.com other@example.com >"$BATS_TEST_TMPDIR/two.asc"
+  run gpg_keyring_install "$BATS_TEST_TMPDIR/two.asc" "$BATS_TEST_TMPDIR/repo.gpg" "$FPR"
+  [ "$status" -eq 1 ]
+  [ ! -f "$BATS_TEST_TMPDIR/repo.gpg" ]
+  [ ! -f "$BATS_TEST_TMPDIR/repo.gpg.tmp" ]
 }
