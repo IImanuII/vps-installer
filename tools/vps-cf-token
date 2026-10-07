@@ -25,8 +25,7 @@ case "${1:-}" in
     valid_cf_token "$token" || json_err "formato del token non valido"
     [[ -n "$zone" ]] || json_err "Cloudflare non è attivo su questa VPS"
     CF_API_TOKEN="$token" cf_find_zone "$zone" >/dev/null || json_err "il token non ha accesso alla zona $zone"
-    printf 'dns_cloudflare_api_token = %s\n' "$token" \
-      | write_file "$VPS_OPT/secrets/cloudflare.ini" 600 root:root
+    cf_write_ini "$token"
     json_ok
     ;;
   test)

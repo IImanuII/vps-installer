@@ -54,3 +54,10 @@ cf_upsert_record() {
 cf_token_from_ini() {
   sed -n 's/^dns_cloudflare_api_token *= *//p' "${1:-$VPS_OPT/secrets/cloudflare.ini}"
 }
+
+# cf_write_ini TOKEN — credenziali per certbot (dns-cloudflare), 600 root.
+cf_write_ini() {
+  install -d -m 700 "$VPS_OPT/secrets"
+  printf 'dns_cloudflare_api_token = %s\n' "$1" \
+    | write_file "$VPS_OPT/secrets/cloudflare.ini" 600 root:root
+}

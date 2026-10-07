@@ -19,6 +19,7 @@ step_main() {
     ufw allow 443/tcp comment https >/dev/null
   fi
   if is_yes "$CF_ENABLED"; then
+    cf_write_ini "$CF_API_TOKEN"
     log "Firewall: IP Cloudflare (real_ip$(is_yes "$CF_LOCK_ORIGIN" && echo ' + blocco origine'))"
     cf_apply_ips "$CF_LOCK_ORIGIN"
   else

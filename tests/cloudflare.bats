@@ -51,3 +51,11 @@ esac'
   run cf_token_from_ini "$BATS_TEST_TMPDIR/cf.ini"
   [ "$output" = "abc_DEF-123" ]
 }
+
+@test "cf_write_ini scrive il token per certbot con permessi 600" {
+  cf_write_ini "$CF_API_TOKEN"
+  grep -qxF "dns_cloudflare_api_token = $CF_API_TOKEN" "$VPS_OPT/secrets/cloudflare.ini"
+  [ "$(stat -c %a "$VPS_OPT/secrets/cloudflare.ini")" = 600 ]
+  [ "$(stat -c %a "$VPS_OPT/secrets")" = 700 ]
+  [ "$(cf_token_from_ini)" = "$CF_API_TOKEN" ]
+}

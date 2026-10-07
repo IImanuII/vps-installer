@@ -10,8 +10,8 @@ step_main() {
   apt_install certbot python3-certbot-dns-cloudflare
   install -D -m 755 "$VPS_TEMPLATES/certbot-reload-nginx.sh" /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
   if is_yes "$CF_ENABLED"; then
-    printf 'dns_cloudflare_api_token = %s\n' "$CF_API_TOKEN" \
-      | write_file "$VPS_OPT/secrets/cloudflare.ini" 600 root:root
+    # Già scritto dallo step 30; riscritto (idempotente) per le riprese.
+    cf_write_ini "$CF_API_TOKEN"
   fi
   if is_yes "$PANEL_ENABLED"; then
     ssl_obtain_cert "$PANEL_DOMAIN"
