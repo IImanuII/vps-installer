@@ -63,3 +63,21 @@ setup() {
   [ "$status" -eq 1 ]
   grep -q "ERRORE: qualcosa" "$VPS_LOG"
 }
+
+@test "env_merge sostituisce le chiavi date e conserva le altre righe" {
+  local f="$BATS_TEST_TMPDIR/.env"
+  printf '# commento\nDB_HOST=vecchio\nAPP_KEY=mia-chiave\nDB_PASS=vecchia\n\nMAIL_FROM=a@b.it\n' >"$f"
+  printf 'DB_HOST=localhost\nDB_PASS=n$u\o"va\nDBADMIN_USER=panel_dbadmin\n' | env_merge "$f" 600 "$(id -un):$(id -gn)"
+  [ "$(cat "$f")" = $'# commento\nDB_HOST=localhost\nAPP_KEY=mia-chiave\nDB_PASS=n$u\o"va\n\nMAIL_FROM=a@b.it\nDBADMIN_USER=panel_dbadmin' ]
+  [ "$(stat -c %a "$f")" = 600 ]
+}
+
+@test "env_merge crea il file se manca ed elimina chiavi duplicate" {
+  local f="$BATS_TEST_TMPDIR/.env"
+  printf 'A=1\n' | env_merge "$f" 640 "$(id -un):$(id -gn)"
+  [ "$(cat "$f")" = "A=1" ]
+  [ "$(stat -c %a "$f")" = 640 ]
+  printf 'A=0\nB=x\nA=00\n' >"$f"
+  printf 'A=2\n' | env_merge "$f" 600 "$(id -un):$(id -gn)"
+  [ "$(cat "$f")" = $'A=2\nB=x' ]
+}

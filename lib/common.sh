@@ -103,3 +103,39 @@ in_list() {
   done
   return 1
 }
+
+# env_merge FILE MODE OWNER:GROUP — righe KEY=VALUE da stdin: sostituisce quelle
+# chiavi in FILE (al loro posto), aggiunge in fondo le nuove e conserva tutto il resto.
+env_merge() {
+  local file="$1" mode="$2" owner="$3" new merged
+  new="$(cat)"
+  if [[ ! -f "$file" ]]; then
+    printf '%s\n' "$new" | write_file "$file" "$mode" "$owner"
+    return
+  fi
+  merged="$(ENV_MERGE_NEW="$new" awk '
+    BEGIN {
+      n = split(ENVIRON["ENV_MERGE_NEW"], lines, "\n")
+      for (i = 1; i <= n; i++) {
+        k = lines[i]
+        if (index(k, "=") < 2) continue
+        sub(/=.*/, "", k)
+        val[k] = lines[i]
+        order[++m] = k
+      }
+    }
+    {
+      k = ""
+      if (index($0, "=") > 1) { k = $0; sub(/=.*/, "", k) }
+      if (k != "" && (k in val)) {
+        if (!(k in done)) print val[k]
+        done[k] = 1
+      } else {
+        print
+      }
+    }
+    END {
+      for (i = 1; i <= m; i++) if (!(order[i] in done)) { print val[order[i]]; done[order[i]] = 1 }
+    }' "$file")" || return 1
+  printf '%s\n' "$merged" | write_file "$file" "$mode" "$owner"
+}

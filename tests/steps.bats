@@ -81,3 +81,45 @@ setup() {
   render_template "$REPO_ROOT/templates/jail-sshd.local.tmpl" "$BATS_TEST_TMPDIR/jail" 644 "$(id -un):$(id -gn)" SSH_PORT SSH_IGNORE_IP
   grep -qE '^ignoreip = 127\.0\.0\.1/8 ::1 ?$' "$BATS_TEST_TMPDIR/jail"
 }
+
+@test "step 30 scrive cloudflare.ini prima di applicare gli IP Cloudflare" {
+  source "$REPO_ROOT/steps/30-firewall.sh"
+  export NGINX_SNIPPETS="$BATS_TEST_TMPDIR/snippets"
+  SSH_PORT=41822 SSH_IGNORE_IP="" CF_ENABLED=yes CF_LOCK_ORIGIN=no CF_API_TOKEN=tok_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+  apt_install() { :; }
+  render_template() { :; }
+  cf_apply_ips() { grep -qxF "dns_cloudflare_api_token = $CF_API_TOKEN" "$VPS_OPT/secrets/cloudflare.ini" && echo ok >"$BATS_TEST_TMPDIR/cf.applied"; }
+  make_stub ufw 'exit 0'
+  make_stub systemctl 'exit 0'
+  step_main
+  [ "$(cat "$BATS_TEST_TMPDIR/cf.applied")" = ok ]
+}
+
+@test "pannello: app/ e config/ 700, radice, public/ e logs/ 750" {
+  source "$REPO_ROOT/steps/85-panel.sh"
+  PANEL_ROOT="$BATS_TEST_TMPDIR/www/panel"
+  export CALLS="$BATS_TEST_TMPDIR/install.calls"
+  make_stub id 'exit 0'
+  make_stub usermod 'exit 0'
+  make_stub install 'echo "$*" >>"$CALLS"'
+  panel_user_and_dirs
+  grep -qxF -- "-d -m 750 -o panel -g panel $PANEL_ROOT $PANEL_ROOT/public $PANEL_ROOT/logs" "$CALLS"
+  grep -qxF -- "-d -m 700 -o panel -g panel $PANEL_ROOT/app $PANEL_ROOT/config" "$CALLS"
+  run grep -E -- "-m 750 .*/(app|config)( |$)" "$CALLS"
+  [ "$status" -ne 0 ]
+}
+
+@test "pannello: il .env conserva le chiavi non dell'installer" {
+  source "$REPO_ROOT/steps/85-panel.sh"
+  PANEL_ROOT="$BATS_TEST_TMPDIR/www/panel"
+  mkdir -p "$PANEL_ROOT/config"
+  printf 'DB_HOST=localhost\nDB_PASS=pass-db\nDBADMIN_PASS=pass-admin\nAPP_SECRET=del-pannello\n' >"$PANEL_ROOT/config/.env"
+  make_stub mariadb 'cat >/dev/null'
+  panel_database
+  local env="$PANEL_ROOT/config/.env"
+  grep -qxF 'APP_SECRET=del-pannello' "$env"
+  grep -qxF 'DB_PASS=pass-db' "$env"
+  grep -qxF 'DBADMIN_PASS=pass-admin' "$env"
+  grep -qxF 'DB_NAME=panel' "$env"
+  [ "$(grep -c . "$env")" -eq 7 ]
+}

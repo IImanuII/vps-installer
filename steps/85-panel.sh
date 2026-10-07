@@ -10,8 +10,10 @@ panel_user_and_dirs() {
     useradd --system --home-dir "$PANEL_ROOT" --no-create-home --shell /usr/sbin/nologin --user-group panel
   fi
   usermod -aG panel www-data
-  install -d -m 750 -o panel -g panel "$PANEL_ROOT" "$PANEL_ROOT/public" "$PANEL_ROOT/app" \
-    "$PANEL_ROOT/config" "$PANEL_ROOT/logs"
+  # www-data (gruppo panel) attraversa la radice e legge public/ e logs/;
+  # codice e configurazione restano solo dell'utente panel.
+  install -d -m 750 -o panel -g panel "$PANEL_ROOT" "$PANEL_ROOT/public" "$PANEL_ROOT/logs"
+  install -d -m 700 -o panel -g panel "$PANEL_ROOT/app" "$PANEL_ROOT/config"
   install -d -m 700 -o panel -g panel "$PANEL_ROOT/storage" "$PANEL_ROOT/storage/sessions" \
     "$PANEL_ROOT/storage/tmp" "$PANEL_ROOT/storage/pma-tmp"
   if [[ ! -e "$PANEL_ROOT/public/index.php" && ! -e "$PANEL_ROOT/public/index.html" ]]; then
@@ -34,7 +36,7 @@ panel_database() {
     echo "FLUSH PRIVILEGES;"
   } | mariadb
   printf 'DB_HOST=localhost\nDB_NAME=panel\nDB_USER=panel\nDB_PASS=%s\nDBADMIN_USER=panel_dbadmin\nDBADMIN_PASS=%s\n' \
-    "$db_pass" "$admin_pass" | write_file "$env" 600 panel:panel
+    "$db_pass" "$admin_pass" | env_merge "$env" 600 panel:panel
 }
 
 panel_php_pool() {
