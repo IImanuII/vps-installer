@@ -28,6 +28,8 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | Percorso | Proprietario / permessi | Contenuto |
 |---|---|---|
 | `/opt/vps/bin/` | `root:root` 755 | script wrapper (sez. 4) |
+| `/opt/vps/lib/` | `root:root` 755 / file 644 | librerie bash usate dagli script wrapper |
+| `/opt/vps/templates/` | `root:root` 755 / file 644 | template di configurazione usati dagli script wrapper |
 | `/opt/vps/manifest.json` | `root:panel` 640 | info non segrete (sez. 3) |
 | `/opt/vps/secrets/` | `root:root` 700 | segreti di sistema |
 | `/opt/vps/secrets/cloudflare.ini` | `root:root` 600 | token API Cloudflare (se attivo) |
@@ -44,10 +46,13 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | `/etc/nginx/snippets/security-headers.conf` | header di sicurezza |
 | `/etc/nginx/snippets/cloudflare-realip.conf` | generato da `vps-cf-ips-update` |
 | `/etc/nginx/snippets/acme.conf` | `location /.well-known/acme-challenge/` → `/var/www/_acme` |
-| `/etc/nginx/.htpasswd-pma` | basic auth phpMyAdmin (bcrypt) |
+| `/etc/nginx/snippets/panel.d/pma.conf` | location `/pma/` nel vhost del pannello |
+| `/var/www/_acme/` | webroot condivisa per le challenge Let's Encrypt (senza Cloudflare) |
+| `/etc/nginx/.htpasswd-pma` | basic auth phpMyAdmin (bcrypt), `root:www-data` 640 |
 | `/etc/php/8.4/fpm/pool.d/panel.conf` | pool del pannello |
 | `/etc/ssh/sshd_config.d/10-vps.conf` | configurazione SSH |
-| `/etc/fail2ban/jail.local` | jail |
+| `/etc/fail2ban/jail.d/vps-sshd.local` | jail SSH |
+| `/etc/fail2ban/jail.d/vps-nginx.local` | jail Nginx (solo senza Cloudflare) |
 | `/etc/sudoers.d/vps-panel` | permessi sudo del pannello |
 | `/etc/msmtprc` | symlink → `/opt/vps/secrets/msmtprc` |
 | `/etc/letsencrypt/` | certificati (gestiti da certbot) |
@@ -126,10 +131,12 @@ Previsti per il pannello (da scrivere con il pannello, stesse regole):
 |---|---|---|
 | `root` | nessuna (`unix_socket`) | tutto, solo da root della macchina |
 | `panel` | `config/.env` | tutto su DB `panel` |
-| `panel_dbadmin` | `config/.env` | `ALL PRIVILEGES ON \`site\_%\`.* WITH GRANT OPTION` + `CREATE USER`: crea DB e utenti dei siti, nient'altro |
-| `pma` | `/opt/vps/phpmyadmin/config.inc.php` | solo DB `phpmyadmin` |
+| `panel_dbadmin` | `config/.env` | `ALL PRIVILEGES ON \`site\_%\`.*`, nessun permesso globale: lavora sui DB dei siti (anche da phpMyAdmin), non può creare o eliminare utenti |
+| `pma` | `/opt/vps/phpmyadmin/config.inc.php` | `SELECT, INSERT, UPDATE, DELETE` solo su DB `phpmyadmin` |
 
 Convenzione: DB e utenti dei siti hanno nome `site_<slug>` (es. `site_miosito_it`).
+
+**Creazione di DB e utenti dei siti:** la fa lo script root `vps-site` (via `unix_socket`), non il pannello con `panel_dbadmin`. Un pannello compromesso quindi non può creare utenti DB né toccare `panel`, `pma` o `root`.
 
 ## 6. Da fare nel pannello (rimandato dall'installer)
 
