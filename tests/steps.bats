@@ -25,3 +25,10 @@ setup() {
   grep -qxF 'PermitRootLogin no' "$BATS_TEST_TMPDIR/sshd"
   grep -qxF 'AllowUsers manu' "$BATS_TEST_TMPDIR/sshd"
 }
+
+@test "jail sshd sulla porta scelta con backend systemd" {
+  SSH_PORT=41822
+  render_template "$REPO_ROOT/templates/jail-sshd.local.tmpl" "$BATS_TEST_TMPDIR/jail" 644 "$(id -un):$(id -gn)" SSH_PORT
+  grep -qE '^port += 41822$' "$BATS_TEST_TMPDIR/jail"
+  grep -qE '^backend += systemd$' "$BATS_TEST_TMPDIR/jail"
+}
