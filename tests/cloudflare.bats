@@ -94,3 +94,53 @@ esac'
   run grep -qE -- "-X (POST|PUT)" "$STUB_LOG"
   [ "$status" -ne 0 ]
 }
+
+@test "cf_dns_conflicts elenca CNAME e A/AAAA che puntano altrove" {
+  local resp='{"success":true,"result":[
+    {"id":"c1","type":"CNAME","name":"panel.miosito.it","content":"miosito.it"},
+    {"id":"a1","type":"A","name":"panel.miosito.it","content":"203.0.113.10"},
+    {"id":"a2","type":"A","name":"panel.miosito.it","content":"198.51.100.7"},
+    {"id":"q1","type":"AAAA","name":"panel.miosito.it","content":"2001:db8::99"},
+    {"id":"t1","type":"TXT","name":"panel.miosito.it","content":"x"}]}'
+  run cf_dns_conflicts "$resp" 203.0.113.10 2001:db8::1
+  [ "${#lines[@]}" -eq 3 ]
+  [[ "$output" == *"CNAME panel.miosito.it → miosito.it"* ]]
+  [[ "$output" == *"A panel.miosito.it → 198.51.100.7"* ]]
+  [[ "$output" == *"AAAA panel.miosito.it → 2001:db8::99"* ]]
+  run cf_dns_conflicts '{"success":true,"result":[{"type":"A","name":"p","content":"203.0.113.10"}]}' 203.0.113.10 ""
+  [ -z "$output" ]
+}
+
+@test "modalità keep: CNAME lasciato, segnalato in CF_DNS_KEPT" {
+  export DNS_EXISTING='{"success":true,"result":[{"id":"c1","type":"CNAME","name":"panel.miosito.it","content":"miosito.it","proxied":true}]}'
+  CF_DNS_KEPT=""
+  cf_upsert_record zone123 A panel.miosito.it 203.0.113.10 keep
+  [[ "$CF_DNS_KEPT" == *"CNAME → miosito.it"* ]]
+  run grep -qE -- "-X (POST|PUT|DELETE)" "$STUB_LOG"
+  [ "$status" -ne 0 ]
+}
+
+@test "modalità keep: A con altro IP non viene toccato" {
+  export DNS_EXISTING='{"success":true,"result":[{"id":"a1","type":"A","name":"panel.miosito.it","content":"198.51.100.7","proxied":true}]}'
+  CF_DNS_KEPT=""
+  cf_upsert_record zone123 A panel.miosito.it 203.0.113.10 keep
+  [[ "$CF_DNS_KEPT" == *"A → 198.51.100.7"* ]]
+  run grep -qE -- "-X (POST|PUT|DELETE)" "$STUB_LOG"
+  [ "$status" -ne 0 ]
+}
+
+@test "modalità replace: il CNAME viene eliminato e si crea il record A" {
+  export DNS_EXISTING='{"success":true,"result":[{"id":"c1","type":"CNAME","name":"panel.miosito.it","content":"miosito.it","proxied":true}]}'
+  cf_upsert_record zone123 A panel.miosito.it 203.0.113.10 replace
+  grep -q -- "-X DELETE.*dns_records/c1" "$STUB_LOG"
+  grep -q -- "-X POST" "$STUB_LOG"
+  [ "$(grep -n -- '-X DELETE' "$STUB_LOG" | cut -d: -f1)" -lt "$(grep -n -- '-X POST' "$STUB_LOG" | cut -d: -f1)" ]
+}
+
+@test "cf_remove_records elimina i record di un tipo" {
+  export DNS_EXISTING='{"success":true,"result":[{"id":"q1","type":"AAAA","name":"panel.miosito.it","content":"2001:db8::99"},{"id":"a1","type":"A","name":"panel.miosito.it","content":"203.0.113.10"}]}'
+  cf_remove_records zone123 panel.miosito.it AAAA
+  grep -q -- "-X DELETE.*dns_records/q1" "$STUB_LOG"
+  run grep -q "dns_records/a1" "$STUB_LOG"
+  [ "$status" -ne 0 ]
+}

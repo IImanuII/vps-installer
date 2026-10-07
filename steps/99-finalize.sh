@@ -168,6 +168,9 @@ finalize_summary_text() {
   if is_yes "$CF_ENABLED"; then
     echo "Cloudflare:   imposta SSL/TLS su \"Full (strict)\" nella dashboard della zona."
   fi
+  if [[ -n "${CF_DNS_NOTE:-}" ]]; then
+    echo "ATTENZIONE:   $CF_DNS_NOTE"
+  fi
   echo "Log:          $VPS_LOG"
   echo "================================================================"
 }

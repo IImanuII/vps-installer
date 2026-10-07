@@ -50,14 +50,36 @@ panel_php_pool() {
   systemctl restart "php$PHP_VERSION-fpm"
 }
 
+# Scelta della procedura guidata sui record già presenti: yes = sostituisci,
+# no = lascia com'è, vuota = risposte delle versioni ≤ 1.0.2.
+panel_dns_mode() {
+  case "${CF_DNS_REPLACE:-}" in
+    yes) echo replace ;;
+    no) echo keep ;;
+    *) echo "" ;;
+  esac
+}
+
 panel_dns() {
-  local v6
+  local v4 v6 mode kept=""
   is_yes "$CF_ENABLED" || return 0
   log "Pannello: record DNS su Cloudflare"
-  cf_upsert_record "$CF_ZONE_ID" A "$PANEL_DOMAIN" "$(server_ipv4)" || die "Record A su Cloudflare non creato"
-  v6="$(server_ipv6)"
+  mode="$(panel_dns_mode)"
+  v4="$(server_ipv4)"
+  CF_DNS_KEPT=""
+  cf_upsert_record "$CF_ZONE_ID" A "$PANEL_DOMAIN" "$v4" "$mode" || die "Record A su Cloudflare non creato"
+  kept="$CF_DNS_KEPT"
+  v6="$(server_ipv6)" || v6=""
   if [[ -n "$v6" ]]; then
-    cf_upsert_record "$CF_ZONE_ID" AAAA "$PANEL_DOMAIN" "$v6" || die "Record AAAA su Cloudflare non creato"
+    CF_DNS_KEPT=""
+    cf_upsert_record "$CF_ZONE_ID" AAAA "$PANEL_DOMAIN" "$v6" "$mode" || die "Record AAAA su Cloudflare non creato"
+    kept="${kept:-$CF_DNS_KEPT}"
+  elif [[ "$mode" == replace ]]; then
+    # Senza IPv6 un AAAA rimasto porterebbe parte del traffico altrove.
+    cf_remove_records "$CF_ZONE_ID" "$PANEL_DOMAIN" AAAA || die "Record AAAA vecchio su Cloudflare non eliminato"
+  fi
+  if [[ -n "$kept" ]]; then
+    summary_set CF_DNS_NOTE "$PANEL_DOMAIN lasciato com'è su Cloudflare ($kept): verifica che punti a questa VPS ($v4)"
   fi
 }
 

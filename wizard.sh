@@ -172,6 +172,27 @@ wizard_dns_warning() {
   fi
 }
 
+# Record già presenti per il dominio del pannello che lo farebbero puntare
+# altrove (CNAME, A/AAAA con altro IP): chiede se sostituirli o lasciarli.
+wizard_dns_records() {
+  local resp conflicts v4 v6 choice
+  # shellcheck disable=SC2034
+  CF_DNS_REPLACE=yes
+  is_yes "$PANEL_ENABLED" || return 0
+  v4="$(server_ipv4)" || v4=""
+  v6="$(server_ipv6)" || v6=""
+  resp="$(CF_API_TOKEN="$CF_API_TOKEN" cf_list_records "$CF_ZONE_ID" "$PANEL_DOMAIN" 2>/dev/null)" || return 0
+  conflicts="$(cf_dns_conflicts "$resp" "$v4" "$v6")"
+  [[ -n "$conflicts" ]] || return 0
+  ask_menu choice "Su Cloudflare $PANEL_DOMAIN ha già questi record:\n\n$conflicts\n\nQuesta VPS: ${v4:-?} ${v6}\nCon i record attuali il pannello NON sarebbe raggiungibile su questa VPS." replace \
+    replace "Sostituisci con A/AAAA verso questa VPS (consigliato)" \
+    keep "Lascia com'è (so che è giusto così)"
+  if [[ "$choice" == keep ]]; then
+    # shellcheck disable=SC2034
+    CF_DNS_REPLACE=no
+  fi
+}
+
 wizard_cloudflare() {
   local zone_domain="${PANEL_DOMAIN:-}" found choice
   ask_yesno CF_ENABLED "Usi Cloudflare per i domini di questa VPS?" yes
@@ -207,6 +228,7 @@ wizard_cloudflare() {
         ;;
     esac
   done
+  wizard_dns_records
   ask_yesno CF_LOCK_ORIGIN "Accettare traffico web (80/443) SOLO dagli IP di Cloudflare?\n\n(consigliato: nasconde la VPS a chi la cerca direttamente)" yes
 }
 

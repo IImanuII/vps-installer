@@ -33,25 +33,76 @@ cf_find_zone() {
   return 1
 }
 
-# cf_upsert_record ZONE_ID TIPO NOME CONTENUTO — record proxato.
-#   Un CNAME già presente con lo stesso nome viene lasciato com'è (creato a mano):
-#   avviso nel log e si prosegue. Un record dello stesso tipo già corretto non
-#   viene toccato; con contenuto diverso viene aggiornato.
-cf_upsert_record() {
-  local zone="$1" type="$2" name="$3" content="$4" body resp existing id
-  resp="$(cf_api GET "/zones/$zone/dns_records?name=$name")"
+# cf_list_records ZONE_ID NOME — risposta JSON con tutti i record del nome.
+cf_list_records() {
+  local resp
+  resp="$(cf_api GET "/zones/$1/dns_records?name=$2")"
   if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$resp"; then
-    log "Cloudflare: impossibile leggere i record DNS di $name: $(jq -c '.errors // empty' <<<"$resp" 2>/dev/null || true)"
+    log "Cloudflare: impossibile leggere i record DNS di $2: $(jq -c '.errors // empty' <<<"$resp" 2>/dev/null || true)"
     return 1
   fi
-  if jq -e '[.result[] | select(.type == "CNAME")] | length > 0' >/dev/null <<<"$resp"; then
-    log "ATTENZIONE: Cloudflare: $name ha già un record CNAME, lo lascio invariato (verifica che porti a questa VPS)."
-    return 0
+  printf '%s\n' "$resp"
+}
+
+# cf_dns_conflicts JSON IPV4 IPV6 — una riga per ogni record che impedisce al
+# nome di puntare a questa VPS: CNAME, A/AAAA con un indirizzo diverso.
+cf_dns_conflicts() {
+  jq -r --arg v4 "$2" --arg v6 "$3" '
+    .result[]
+    | select(.type == "CNAME"
+        or (.type == "A" and .content != $v4)
+        or (.type == "AAAA" and .content != $v6))
+    | "\(.type) \(.name) → \(.content)"' <<<"$1"
+}
+
+cf_delete_record() {
+  local resp
+  resp="$(cf_api DELETE "/zones/$1/dns_records/$2")"
+  if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$resp"; then
+    log "Cloudflare: record $2 non eliminato: $(jq -c '.errors // empty' <<<"$resp" 2>/dev/null || true)"
+    return 1
+  fi
+}
+
+# cf_remove_records ZONE_ID NOME TIPO — elimina tutti i record di quel tipo.
+cf_remove_records() {
+  local resp id
+  resp="$(cf_list_records "$1" "$2")" || return 1
+  for id in $(jq -r --arg t "$3" '.result[] | select(.type == $t) | .id' <<<"$resp"); do
+    cf_delete_record "$1" "$id" || return 1
+  done
+}
+
+# cf_upsert_record ZONE_ID TIPO NOME CONTENUTO [MODALITÀ] — record proxato.
+#   keep:    un CNAME o un record dello stesso tipo con altro contenuto viene
+#            lasciato com'è; la descrizione finisce in CF_DNS_KEPT.
+#   replace: il CNAME viene eliminato, il record dello stesso tipo aggiornato.
+#   vuota (risposte delle versioni ≤ 1.0.2): CNAME lasciato, record aggiornato.
+#   Un record già corretto non viene mai riscritto.
+cf_upsert_record() {
+  local zone="$1" type="$2" name="$3" content="$4" mode="${5:-}" body resp existing id cname
+  resp="$(cf_list_records "$zone" "$name")" || return 1
+  cname="$(jq -c '[.result[] | select(.type == "CNAME")][0] // empty' <<<"$resp")"
+  if [[ -n "$cname" ]]; then
+    if [[ "$mode" == replace ]]; then
+      log "Cloudflare: elimino il CNAME di $name (sostituito da $type verso questa VPS)"
+      cf_delete_record "$zone" "$(jq -r '.id' <<<"$cname")" || return 1
+    else
+      CF_DNS_KEPT="CNAME → $(jq -r '.content' <<<"$cname")"
+      log "ATTENZIONE: Cloudflare: $name ha già un record $CF_DNS_KEPT, lo lascio invariato (verifica che porti a questa VPS)."
+      return 0
+    fi
   fi
   existing="$(jq -c --arg t "$type" '[.result[] | select(.type == $t)][0] // empty' <<<"$resp")"
   if [[ -n "$existing" ]] \
     && jq -e --arg c "$content" '.content == $c and .proxied == true' >/dev/null <<<"$existing"; then
     log "Cloudflare: record $type $name già corretto"
+    return 0
+  fi
+  if [[ -n "$existing" && "$mode" == keep ]] \
+    && jq -e --arg c "$content" '.content != $c' >/dev/null <<<"$existing"; then
+    CF_DNS_KEPT="$type → $(jq -r '.content' <<<"$existing")"
+    log "ATTENZIONE: Cloudflare: $name ha già un record $CF_DNS_KEPT, lo lascio invariato (verifica che porti a questa VPS)."
     return 0
   fi
   id="$(jq -r '.id // empty' <<<"${existing:-null}")"

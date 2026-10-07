@@ -200,7 +200,7 @@ Le risposte vengono salvate in `/root/vps-installer/answers.env` (root, 600).
 - DB `panel` + utente `panel` (permessi solo su `panel`).
 - Utente DB `panel_dbadmin`: tutti i permessi **solo** sui database con prefisso `site_`, nessun permesso globale (niente `CREATE USER`). DB e utenti dei siti li crea lo script root `vps-site` (vedi handoff). Serve per lavorare sui DB dei siti da phpMyAdmin.
 - Su un rilancio le password esistenti in `config/.env` vengono riusate.
-- Record DNS A/AAAA proxati su Cloudflare (se attivo), vhost `/etc/nginx/conf.d/<pannello>.conf` che include `/etc/nginx/snippets/panel.d/*.conf` (lì lo step 90 aggiunge phpMyAdmin).
+- Record DNS A/AAAA proxati su Cloudflare (se attivo). Se per il dominio esistono già un CNAME o un A/AAAA verso un altro IP, la procedura guidata li mostra e chiede se sostituirli (default) o lasciarli com'è; se lasciati, il riepilogo finale lo segnala. Poi vhost `/etc/nginx/conf.d/<pannello>.conf` che include `/etc/nginx/snippets/panel.d/*.conf` (lì lo step 90 aggiunge phpMyAdmin).
 
 ### 90-phpmyadmin
 - Ultima versione letta da `https://www.phpmyadmin.net/home_page/version.json`.
