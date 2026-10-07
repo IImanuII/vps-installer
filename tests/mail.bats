@@ -17,6 +17,7 @@ setup() {
   [ "$(stat -c %a "$f")" = "600" ]
   grep -qxF 'host smtp.gmail.com' "$f"
   grep -qxF 'tls_starttls on' "$f"
+  sed -n '/^defaults$/,/^account/p' "$f" | grep -qxF 'timeout 30'
   grep -qxF 'password "ab\"c\\d$e"' "$f"
   [ "$(readlink "$MSMTPRC_LINK")" = "$f" ]
   grep -qxF 'root: avvisi@gmail.com' "$ALIASES_FILE"
