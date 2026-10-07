@@ -14,14 +14,17 @@ ssh_rollback() {
 
 # Rollback indipendente dal processo: scatta anche se l'installer muore durante l'attesa.
 ssh_watchdog_arm() {
-  local secs=$((${SSH_CONFIRM_TIMEOUT:-600} + 120)) q
-  q="$(printf '%q' "$(ssh_conf_path)")"
+  local secs=$((${SSH_CONFIRM_TIMEOUT:-600} + 120)) conf
+  conf="$(ssh_conf_path)"
+  [[ "$conf" =~ ^[A-Za-z0-9/._-]+$ ]] || return 1
+  ssh_watchdog_cancel
   systemd-run --quiet --unit=vps-ssh-rollback --on-active="${secs}s" \
-    /bin/sh -c "rm -f $q; systemctl reload ssh || systemctl restart ssh" >>"$VPS_LOG" 2>&1
+    /bin/sh -c "rm -f '$conf'; systemctl reload ssh || systemctl restart ssh" >>"$VPS_LOG" 2>&1
 }
 
 ssh_watchdog_cancel() {
   systemctl stop vps-ssh-rollback.timer vps-ssh-rollback.service 2>/dev/null || true
+  systemctl reset-failed vps-ssh-rollback.timer vps-ssh-rollback.service 2>/dev/null || true
 }
 
 ssh_wait_confirmation() {
@@ -97,7 +100,9 @@ finalize_ssh() {
   fi
   trap - HUP INT TERM
   ssh_watchdog_cancel
-  if [[ "$SSH_PORT" != 22 ]]; then
+  if systemctl is-active --quiet vps-ssh-rollback.timer 2>/dev/null; then
+    log "ATTENZIONE: il rollback automatico di SSH è ancora attivo: lascio aperta la porta 22"
+  elif [[ "$SSH_PORT" != 22 ]]; then
     if ! ufw delete allow 22/tcp >/dev/null 2>&1; then
       log "ATTENZIONE: impossibile chiudere la porta 22 nel firewall, fallo a mano"
     fi

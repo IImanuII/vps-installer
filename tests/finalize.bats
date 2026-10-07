@@ -130,3 +130,32 @@ esac'
   [ "$status" -ne 0 ]
   [ ! -e "$SSH_CONF_PATH" ]
 }
+
+@test "finalize_ssh: stop e reset-failed del watchdog prima di systemd-run" {
+  ssh_env
+  run finalize_ssh
+  local stop reset arm
+  stop="$(grep -n '^systemctl stop vps-ssh-rollback' "$CALLS" | head -1 | cut -d: -f1)"
+  reset="$(grep -n '^systemctl reset-failed vps-ssh-rollback' "$CALLS" | head -1 | cut -d: -f1)"
+  arm="$(grep -n '^systemd-run ' "$CALLS" | head -1 | cut -d: -f1)"
+  [ -n "$stop" ] && [ -n "$reset" ] && [ -n "$arm" ]
+  [ "$stop" -lt "$arm" ]
+  [ "$reset" -lt "$arm" ]
+}
+
+@test "finalize_ssh: timer ancora attivo dopo la conferma, porta 22 non chiusa" {
+  ssh_env
+  make_stub systemctl 'echo "systemctl $*" >>'"$CALLS"'; case "$1" in is-enabled) exit 1;; is-active) [ "$3" = vps-ssh-rollback.timer ] && exit 0; exit 1;; reload) printf "  7 1001 manu - pts/1\n  9 1001 manu - pts/2\n" >'"$BATS_TEST_TMPDIR"'/sessions;; esac; exit 0'
+  run finalize_ssh
+  [ "$status" -eq 0 ]
+  run grep -q 'ufw delete' "$CALLS"
+  [ "$status" -ne 0 ]
+}
+
+@test "finalize_ssh: percorso conf con caratteri strani, SSH non attivato" {
+  ssh_env
+  export SSH_CONF_PATH="$BATS_TEST_TMPDIR/it's.conf"
+  run finalize_ssh
+  [ "$status" -ne 0 ]
+  [ ! -e "$SSH_CONF_PATH" ]
+}
