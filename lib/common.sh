@@ -48,7 +48,7 @@ state_mark() {
 
 apt_install() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
-    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+    -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
     "$@" >>"$VPS_LOG" 2>&1
 }
 

@@ -4,9 +4,9 @@
 step_main() {
   log "Sistema: aggiornamento dei pacchetti (può richiedere qualche minuto)"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -q >>"$VPS_LOG" 2>&1
-  apt-get full-upgrade -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold >>"$VPS_LOG" 2>&1
-  apt_install htop git curl unzip 7zip ca-certificates gnupg whiptail jq gettext-base \
+  apt-get update -q -o DPkg::Lock::Timeout=300 >>"$VPS_LOG" 2>&1
+  apt-get full-upgrade -y -q -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold >>"$VPS_LOG" 2>&1
+  apt_install sudo htop git curl unzip 7zip ca-certificates gnupg whiptail jq gettext-base \
     locales chrony unattended-upgrades apt-listchanges tmux openssl cron xz-utils
 
   install -d -m 755 "$VPS_OPT"

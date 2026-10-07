@@ -15,6 +15,9 @@ step_main() {
   install -d -m 700 -o "$ADMIN_USER" -g "$ADMIN_USER" "$home/.ssh"
   touch "$keys"
   if ! grep -qxF -- "$ADMIN_PUBKEY" "$keys"; then
+    if [[ -s "$keys" && -n "$(tail -c1 "$keys")" ]]; then
+      printf '\n' >>"$keys"
+    fi
     printf '%s\n' "$ADMIN_PUBKEY" >>"$keys"
   fi
   chown "$ADMIN_USER:$ADMIN_USER" "$keys"

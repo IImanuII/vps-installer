@@ -45,5 +45,5 @@ gpg_keyring_install() {
 # apt_add_repo NOME KEYRING "deb [signed-by=KEYRING] URL SUITE COMPONENTI"
 apt_add_repo() {
   printf '%s\n' "$3" | write_file "/etc/apt/sources.list.d/$1.list" 644 root:root
-  apt-get update -q >>"$VPS_LOG" 2>&1
+  apt-get update -q -o DPkg::Lock::Timeout=300 >>"$VPS_LOG" 2>&1
 }
