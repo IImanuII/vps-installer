@@ -106,7 +106,7 @@ Forniti dall'installer (v1):
 
 | Script | Uso | Cosa fa |
 |---|---|---|
-| `vps-cf-token` | `set` (token da stdin) / `test` | sostituisce o verifica il token Cloudflare, aggiorna il manifest |
+| `vps-cf-token` | `set` (token da stdin) / `test` | sostituisce o verifica il token Cloudflare (verifica che il token acceda alla zona prima di salvarlo) |
 | `vps-cf-ips-update` | — | scarica gli IP Cloudflare, rigenera `cloudflare-realip.conf` e regole UFW 80/443, `nginx -t` + reload. Anche da cron settimanale |
 | `vps-smtp` | `set` (config JSON da stdin) / `test <email>` / `disable` | scrive `msmtprc`, manda email di prova, aggiorna il manifest |
 | `vps-pma-pass` | `set` (password da stdin) | rigenera `.htpasswd-pma` (bcrypt) |
