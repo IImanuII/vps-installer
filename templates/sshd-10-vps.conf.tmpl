@@ -1,0 +1,10 @@
+# vps-installer: ha la precedenza su 50-cloud-init.conf (in sshd vale il primo valore letto).
+Port ${SSH_PORT}
+PermitRootLogin ${ROOT_LOGIN}
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+X11Forwarding no
+AllowUsers ${SSH_ALLOW_USERS}
+MaxAuthTries 3
+LoginGraceTime 30
