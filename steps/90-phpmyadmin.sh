@@ -34,11 +34,14 @@ pma_configure() {
 
 pma_web_access() {
   local pass
-  if [[ ! -f "$HTPASSWD_PMA" ]]; then
+  # Prima il riepilogo, poi l'htpasswd: dopo un errore o un --reset la password
+  # mostrata alla fine è sempre quella valida.
+  pass="$(summary_get PMA_BASIC_PASS)"
+  if [[ -z "$pass" ]]; then
     pass="$(rand_secret 20)"
-    printf '%s' "$pass" | pma_set_basic_auth "$ADMIN_USER"
     summary_set PMA_BASIC_PASS "$pass"
   fi
+  printf '%s' "$pass" | pma_set_basic_auth "$ADMIN_USER"
   render_template "$VPS_TEMPLATES/nginx-pma.conf.tmpl" "$NGINX_SNIPPETS/panel.d/pma.conf" 644 root:root \
     VPS_OPT PHP_VERSION
   nginx -t >>"$VPS_LOG" 2>&1

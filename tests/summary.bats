@@ -17,3 +17,12 @@ setup() {
   run summary_load
   [ "$status" -eq 0 ]
 }
+
+@test "summary_get legge una chiave senza toccare l'ambiente" {
+  summary_set PMA_BASIC_PASS 'abc$def'
+  unset PMA_BASIC_PASS
+  [ "$(summary_get PMA_BASIC_PASS)" = 'abc$def' ]
+  [ -z "${PMA_BASIC_PASS:-}" ]
+  PANEL_DBADMIN_PASS=dall-ambiente
+  [ "$(summary_get PANEL_DBADMIN_PASS)" = "" ]
+}

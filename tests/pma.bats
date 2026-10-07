@@ -130,3 +130,65 @@ cp "$FIX/$(basename "$url")" "$out"'
   [ "$(cat "$PMA_DIR/index.php")" = nuovo ]
   [ ! -d "$PMA_DIR.old" ]
 }
+
+pma_web_env() {
+  source "$REPO_ROOT/steps/90-phpmyadmin.sh"
+  export HTPASSWD_PMA="$BATS_TEST_TMPDIR/htpasswd" NGINX_SNIPPETS="$BATS_TEST_TMPDIR/snippets"
+  mkdir -p "$NGINX_SNIPPETS/panel.d"
+  ADMIN_USER=manu
+  make_stub htpasswd 'printf "%s:%s\n" "$5" "$(cat)" >"$4"'
+  make_stub nginx 'exit 0'
+  make_stub systemctl 'exit 0'
+}
+
+@test "pma_web_access: senza password nel riepilogo ne genera una e sovrascrive l'htpasswd" {
+  pma_web_env
+  echo 'manu:vecchia-sconosciuta' >"$HTPASSWD_PMA"
+  pma_web_access
+  local pass
+  pass="$(summary_get PMA_BASIC_PASS)"
+  [ "${#pass}" -eq 20 ]
+  [ "$(cat "$HTPASSWD_PMA")" = "manu:$pass" ]
+  [ -f "$NGINX_SNIPPETS/panel.d/pma.conf" ]
+}
+
+@test "pma_web_access: riusa la password già nel riepilogo" {
+  pma_web_env
+  summary_set PMA_BASIC_PASS 'Gia-Salvata-123'
+  pma_web_access
+  [ "$(cat "$HTPASSWD_PMA")" = "manu:Gia-Salvata-123" ]
+  [ "$(grep -c PMA_BASIC_PASS "$VPS_ROOT/summary.env")" -eq 1 ]
+}
+
+@test "pma_web_access: se htpasswd fallisce la password è già nel riepilogo" {
+  pma_web_env
+  make_stub htpasswd 'exit 1'
+  # Come nello step reale: set -e attivo.
+  run bash -c 'set -Eeuo pipefail
+    for f in "$REPO_ROOT"/lib/*.sh; do source "$f"; done
+    source "$REPO_ROOT/steps/90-phpmyadmin.sh"
+    ADMIN_USER=manu pma_web_access'
+  [ "$status" -ne 0 ]
+  [ ! -f "$NGINX_SNIPPETS/panel.d/pma.conf" ]
+  [ -n "$(summary_get PMA_BASIC_PASS)" ]
+}
+
+@test "pma_update_to rimuove la cartella di lavoro anche se il download fallisce" {
+  make_stub curl 'exit 22'
+  run pma_update_to 9.9.9
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"aggiornamento non riuscito"* ]]
+  run compgen -G "$VPS_OPT/.pma.*"
+  [ "$status" -ne 0 ]
+  [ ! -e "$PMA_DIR" ]
+}
+
+@test "pma_update_to installa e rimuove la cartella di lavoro" {
+  make_pma_fixtures
+  PMA_SIGNER_FPRS=("$PMA_FPR")
+  manifest_group() { id -gn; }
+  pma_update_to 9.9.9
+  [ "$(cat "$PMA_DIR/index.php")" = nuovo ]
+  run compgen -G "$VPS_OPT/.pma.*"
+  [ "$status" -ne 0 ]
+}

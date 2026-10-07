@@ -88,7 +88,10 @@ pma_install_tree() {
 pma_update_to() {
   local v="$1" work src
   work="$(mktemp -d "$VPS_OPT/.pma.XXXXXX")"
-  src="$(pma_fetch "$v" "$work")"
+  if ! src="$(pma_fetch "$v" "$work")"; then
+    rm -rf "$work"
+    die "phpMyAdmin $v: aggiornamento non riuscito (dettagli in $VPS_LOG)"
+  fi
   pma_install_tree "$src"
   rm -rf "$work"
 }

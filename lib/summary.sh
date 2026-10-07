@@ -21,3 +21,12 @@ summary_load() {
     source "$f"
   fi
 }
+
+# summary_get CHIAVE — valore salvato nel riepilogo (vuoto se assente).
+summary_get() {
+  (
+    unset "$1"
+    summary_load
+    printf '%s' "${!1:-}"
+  )
+}
