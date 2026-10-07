@@ -75,13 +75,13 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
     "nginx": true, "php": "8.4", "mariadb": true, "redis": true,
     "certbot": true, "phpmyadmin": "5.2.3"
   },
-  "cloudflare": { "enabled": true, "origin_locked": true, "zone": "miosito.it" },
-  "mail": { "configured": false },
+  "cloudflare": { "enabled": true, "origin_locked": true, "zone": "miosito.it", "ips_updated_at": "2026-10-07T15:31:00+02:00" },
+  "mail": { "configured": false, "alert_email": null },
   "panel": {
     "domain": "panel.miosito.it",
     "path": "/var/www/panel.miosito.it",
     "php_socket": "/run/php/php8.4-fpm-panel.sock",
-    "pma_path": "/pma"
+    "pma_path": "/pma/"
   },
   "conventions": {
     "site_root": "/var/www/<dominio>",
