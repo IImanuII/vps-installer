@@ -1,3 +1,5 @@
+bats_require_minimum_version 1.5.0
+
 setup() {
   load test_helper
   setup_common
@@ -59,7 +61,6 @@ setup() {
 
 @test "il comando che fallisce finisce nel log" {
   printf 'step_main() { false_cmd_xyz; }\n' >"$VPS_ROOT/steps/10-a.sh"
-  run run_steps
-  [ "$status" -ne 0 ]
+  run -127 run_steps
   grep -q "false_cmd_xyz" "$VPS_LOG"
 }
