@@ -9,10 +9,23 @@ ssh_conf_path() {
 ssh_rollback() {
   rm -f "$(ssh_conf_path)"
   systemctl reload ssh || systemctl restart ssh || true
+  ssh_watchdog_cancel
+}
+
+# Rollback indipendente dal processo: scatta anche se l'installer muore durante l'attesa.
+ssh_watchdog_arm() {
+  local secs=$((${SSH_CONFIRM_TIMEOUT:-600} + 120)) q
+  q="$(printf '%q' "$(ssh_conf_path)")"
+  systemd-run --quiet --unit=vps-ssh-rollback --on-active="${secs}s" \
+    /bin/sh -c "rm -f $q; systemctl reload ssh || systemctl restart ssh" >>"$VPS_LOG" 2>&1
+}
+
+ssh_watchdog_cancel() {
+  systemctl stop vps-ssh-rollback.timer vps-ssh-rollback.service 2>/dev/null || true
 }
 
 ssh_wait_confirmation() {
-  local before="${1:-}" ip ans tty="${SSH_TTY:-/dev/tty}"
+  local before="${1:-}" ip ans tty="${VPS_SSH_TTY:-/dev/tty}"
   local deadline=$((SECONDS + ${SSH_CONFIRM_TIMEOUT:-600}))
   ip="$(server_ipv4)" || ip="IP_DELLA_VPS"
   [[ -n "$ip" ]] || ip="IP_DELLA_VPS"
@@ -43,8 +56,11 @@ EOT
 }
 
 finalize_ssh() {
-  local conf before socket=no
+  local conf before socket=no tty="${VPS_SSH_TTY:-/dev/tty}"
   conf="$(ssh_conf_path)"
+  if ! { : <"$tty"; } 2>/dev/null; then
+    die "Terminale non disponibile per il test di accesso SSH: configurazione non attivata."
+  fi
   if systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null; then
     socket=yes
   fi
@@ -61,23 +77,26 @@ finalize_ssh() {
     rm -f "$conf"
     die "Configurazione SSH non valida: ripristinata la precedente."
   fi
-  if [[ ! -r "${SSH_TTY:-/dev/tty}" ]]; then
-    rm -f "$conf"
-    die "Terminale non disponibile per il test di accesso SSH: configurazione non attivata."
-  fi
   before="$(admin_session_ids "$ADMIN_USER")"
+  if ! ssh_watchdog_arm; then
+    rm -f "$conf"
+    die "Impossibile armare il rollback automatico di SSH: configurazione non attivata."
+  fi
   if ! systemctl reload ssh; then
     rm -f "$conf"
     systemctl reload ssh || systemctl restart ssh || true
+    ssh_watchdog_cancel
     die "Ricarica di SSH fallita: configurazione ripristinata."
   fi
+  trap 'ssh_rollback; exit 129' HUP
   trap 'ssh_rollback; exit 130' INT TERM
   if ! ssh_wait_confirmation "$before"; then
-    trap - INT TERM
+    trap - HUP INT TERM
     ssh_rollback
     die "Accesso non confermato: SSH ripristinato (porta 22 ancora aperta). Controlla chiave e porta, poi riprendi con: sudo bash $VPS_ROOT/run.sh"
   fi
-  trap - INT TERM
+  trap - HUP INT TERM
+  ssh_watchdog_cancel
   if [[ "$SSH_PORT" != 22 ]]; then
     if ! ufw delete allow 22/tcp >/dev/null 2>&1; then
       log "ATTENZIONE: impossibile chiudere la porta 22 nel firewall, fallo a mano"

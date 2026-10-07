@@ -30,14 +30,15 @@ setup() {
 }
 
 ssh_env() {
-  export SSH_CONF_PATH="$BATS_TEST_TMPDIR/10-vps.conf" SSH_TTY="$BATS_TEST_TMPDIR/tty"
+  export SSH_CONF_PATH="$BATS_TEST_TMPDIR/10-vps.conf" VPS_SSH_TTY="$BATS_TEST_TMPDIR/tty"
   export SSH_CONFIRM_TIMEOUT=2 SSH_READ_TIMEOUT=1
   CALLS="$BATS_TEST_TMPDIR/calls"
   : >"$CALLS"
-  echo "OK" >"$SSH_TTY"
+  echo "OK" >"$VPS_SSH_TTY"
   echo "conf" >"$VPS_ROOT/sshd-10-vps.conf"
   make_stub systemctl 'echo "systemctl $*" >>'"$CALLS"'; case "$1" in is-enabled|is-active) exit 1;; esac; exit 0'
   make_stub sshd 'exit 0'
+  make_stub systemd-run 'echo "systemd-run $*" >>'"$CALLS"
   make_stub ufw 'echo "ufw $*" >>'"$CALLS"
   make_stub loginctl 'case "$1" in
 list-sessions) cat '"$BATS_TEST_TMPDIR"'/sessions ;;
@@ -72,6 +73,7 @@ esac'
 
 @test "finalize_ssh: timeout senza nuova sessione, conf rimossa e porta 22 intatta" {
   ssh_env
+  : >"$VPS_SSH_TTY"
   run finalize_ssh
   [ "$status" -ne 0 ]
   [ ! -e "$SSH_CONF_PATH" ]
@@ -94,4 +96,37 @@ esac'
   [ "$status" -eq 0 ]
   [ -e "$SSH_CONF_PATH" ]
   grep -qF 'ufw delete allow 22/tcp' "$CALLS"
+}
+
+@test "finalize_ssh: watchdog armato prima del reload e annullato alla conferma" {
+  ssh_env
+  make_stub systemctl 'echo "systemctl $*" >>'"$CALLS"'; case "$1" in is-enabled|is-active) exit 1;; reload) printf "  7 1001 manu - pts/1\n  9 1001 manu - pts/2\n" >'"$BATS_TEST_TMPDIR"'/sessions;; esac; exit 0'
+  run finalize_ssh
+  [ "$status" -eq 0 ]
+  local arm reload stop
+  arm="$(grep -n '^systemd-run .*--unit=vps-ssh-rollback' "$CALLS" | head -1 | cut -d: -f1)"
+  reload="$(grep -n '^systemctl reload ssh' "$CALLS" | head -1 | cut -d: -f1)"
+  stop="$(grep -n '^systemctl stop vps-ssh-rollback' "$CALLS" | tail -1 | cut -d: -f1)"
+  [ -n "$arm" ] && [ -n "$reload" ] && [ -n "$stop" ]
+  [ "$arm" -lt "$reload" ]
+  [ "$reload" -lt "$stop" ]
+  grep -qF -- "--on-active=122s" "$CALLS"
+}
+
+@test "finalize_ssh: systemd-run fallito, SSH non attivato" {
+  ssh_env
+  make_stub systemd-run 'exit 1'
+  run finalize_ssh
+  [ "$status" -ne 0 ]
+  [ ! -e "$SSH_CONF_PATH" ]
+  run grep -q '^systemctl reload ssh' "$CALLS"
+  [ "$status" -ne 0 ]
+}
+
+@test "finalize_ssh: tty non apribile, nessuna conf installata" {
+  ssh_env
+  export VPS_SSH_TTY="$BATS_TEST_TMPDIR/nonexistent/tty"
+  run finalize_ssh
+  [ "$status" -ne 0 ]
+  [ ! -e "$SSH_CONF_PATH" ]
 }
