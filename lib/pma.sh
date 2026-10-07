@@ -25,8 +25,10 @@ pma_installed_version() {
   done
 }
 
+# Vuoto (exit 0) se config.inc.php non esiste ancora (prima installazione).
 pma_controlpass_from_config() {
-  sed -nE "s/.*\['controlpass'\] = '([A-Za-z0-9]+)'.*/\1/p" "$PMA_DIR/config.inc.php" 2>/dev/null | head -n 1
+  [[ -f "$PMA_DIR/config.inc.php" ]] || return 0
+  sed -nE "s/.*\['controlpass'\] = '([A-Za-z0-9]+)'.*/\1/p" "$PMA_DIR/config.inc.php" | head -n 1
 }
 
 # pma_verify_sig FILE ASC KEYRING — 0 se firmato da uno dei PMA_SIGNER_FPRS.

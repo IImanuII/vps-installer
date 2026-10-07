@@ -192,3 +192,9 @@ pma_web_env() {
   run compgen -G "$VPS_OPT/.pma.*"
   [ "$status" -ne 0 ]
 }
+
+@test "pma_controlpass_from_config senza config non fallisce in modalità rigida" {
+  run bash -c "set -Eeuo pipefail; export VPS_OPT='$VPS_OPT' VPS_LOG='$VPS_LOG' PMA_DIR='$BATS_TEST_TMPDIR/nessuno'; for f in '$REPO_ROOT'/lib/*.sh; do source \"\$f\"; done; p=\"\$(pma_controlpass_from_config)\"; echo \"[\$p]\""
+  [ "$status" -eq 0 ]
+  [ "$output" = "[]" ]
+}
