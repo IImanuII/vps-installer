@@ -35,7 +35,9 @@ ask_input() {
       return 0
     fi
     wt --msgbox "$err" 12 78 || true
-    def="$val"
+    if [[ "$var" != ADMIN_PUBKEY ]]; then
+      def="$val"
+    fi
   done
 }
 
@@ -160,14 +162,19 @@ wizard_panel() {
   fi
 }
 
+wizard_dns_warning() {
+  local ip
+  ip="$(server_ipv4)" || ip=""
+  if [[ -n "$ip" ]] && is_yes "$PANEL_ENABLED" && ! dns_points_here "$PANEL_DOMAIN" "$ip"; then
+    wt --msgbox "Attenzione: $PANEL_DOMAIN non punta ancora a $ip.\n\nCrea il record DNS A prima che inizi lo step SSL, altrimenti l'installazione si fermerà lì (potrai riprenderla)." 14 78 || true
+  fi
+}
+
 wizard_cloudflare() {
-  local zone_domain="${PANEL_DOMAIN:-}" found ip
+  local zone_domain="${PANEL_DOMAIN:-}" found choice
   ask_yesno CF_ENABLED "Usi Cloudflare per i domini di questa VPS?" yes
   if ! is_yes "$CF_ENABLED"; then
-    ip="$(server_ipv4)"
-    if is_yes "$PANEL_ENABLED" && ! dns_points_here "$PANEL_DOMAIN" "$ip"; then
-      wt --msgbox "Attenzione: $PANEL_DOMAIN non punta ancora a $ip.\n\nCrea il record DNS A prima che inizi lo step SSL, altrimenti l'installazione si fermerà lì (potrai riprenderla)." 14 78 || true
-    fi
+    wizard_dns_warning
     return 0
   fi
   if [[ -z "$zone_domain" ]]; then
@@ -176,13 +183,27 @@ wizard_cloudflare() {
   while true; do
     ask_secret CF_API_TOKEN "API token Cloudflare\n(permesso Zone > DNS > Edit sulla zona di $zone_domain):" valid_cf_token \
       "Formato del token non valido."
-    if found="$(CF_API_TOKEN="$CF_API_TOKEN" cf_find_zone "$zone_domain")"; then
+    if found="$(CF_API_TOKEN="$CF_API_TOKEN" cf_find_zone "$zone_domain" 2>/dev/null)"; then
       # shellcheck disable=SC2034
       CF_ZONE_ID="${found%% *}"
       CF_ZONE="${found#* }"
       break
     fi
-    wt --msgbox "Il token non è valido oppure non ha accesso alla zona di $zone_domain. Riprova." 10 78 || true
+    ask_menu choice "Il token non è valido oppure non ha accesso alla zona di $zone_domain." retry \
+      retry "Riprova con un altro token" \
+      domain "Cambia dominio della zona" \
+      skip "Continua senza Cloudflare"
+    case "$choice" in
+      domain)
+        ask_input zone_domain "Dominio principale gestito su Cloudflare (es. miosito.it):" "$zone_domain" valid_domain "Dominio non valido."
+        ;;
+      skip)
+        # shellcheck disable=SC2034
+        CF_ENABLED=no CF_API_TOKEN="" CF_ZONE="" CF_ZONE_ID=""
+        wizard_dns_warning
+        return 0
+        ;;
+    esac
   done
   ask_yesno CF_LOCK_ORIGIN "Accettare traffico web (80/443) SOLO dagli IP di Cloudflare?\n\n(consigliato: nasconde la VPS a chi la cerca direttamente)" yes
 }
@@ -236,6 +257,8 @@ wizard_summary() {
 main() {
   enable_error_trap
   ((EUID == 0)) || die "Esegui come root"
+  [[ -t 0 ]] || die "La procedura guidata richiede un terminale interattivo."
+  command -v whiptail >/dev/null 2>&1 || die "whiptail non è installato (apt install whiptail)."
   wizard_preflight
   while true; do
     wizard_defaults
