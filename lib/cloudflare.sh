@@ -34,12 +34,29 @@ cf_find_zone() {
 }
 
 # cf_upsert_record ZONE_ID TIPO NOME CONTENUTO — record proxato.
+#   Un CNAME già presente con lo stesso nome viene lasciato com'è (creato a mano):
+#   avviso nel log e si prosegue. Un record dello stesso tipo già corretto non
+#   viene toccato; con contenuto diverso viene aggiornato.
 cf_upsert_record() {
-  local zone="$1" type="$2" name="$3" content="$4" body resp id
+  local zone="$1" type="$2" name="$3" content="$4" body resp existing id
+  resp="$(cf_api GET "/zones/$zone/dns_records?name=$name")"
+  if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$resp"; then
+    log "Cloudflare: impossibile leggere i record DNS di $name: $(jq -c '.errors // empty' <<<"$resp" 2>/dev/null || true)"
+    return 1
+  fi
+  if jq -e '[.result[] | select(.type == "CNAME")] | length > 0' >/dev/null <<<"$resp"; then
+    log "ATTENZIONE: Cloudflare: $name ha già un record CNAME, lo lascio invariato (verifica che porti a questa VPS)."
+    return 0
+  fi
+  existing="$(jq -c --arg t "$type" '[.result[] | select(.type == $t)][0] // empty' <<<"$resp")"
+  if [[ -n "$existing" ]] \
+    && jq -e --arg c "$content" '.content == $c and .proxied == true' >/dev/null <<<"$existing"; then
+    log "Cloudflare: record $type $name già corretto"
+    return 0
+  fi
+  id="$(jq -r '.id // empty' <<<"${existing:-null}")"
   body="$(jq -nc --arg t "$type" --arg n "$name" --arg c "$content" \
     '{type: $t, name: $n, content: $c, ttl: 1, proxied: true}')"
-  resp="$(cf_api GET "/zones/$zone/dns_records?type=$type&name=$name")"
-  id="$(jq -r '.result[0].id // empty' <<<"$resp")"
   if [[ -n "$id" ]]; then
     resp="$(cf_api PUT "/zones/$zone/dns_records/$id" "$body")"
   else

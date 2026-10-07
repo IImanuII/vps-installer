@@ -9,7 +9,8 @@ url="${*: -1}"
 case "$url" in
   *"name=panel.miosito.it&"*) echo "{\"success\":true,\"result\":[]}" ;;
   *"name=miosito.it&"*) echo "{\"success\":true,\"result\":[{\"id\":\"zone123\",\"name\":\"miosito.it\"}]}" ;;
-  *"dns_records?type=A"*) echo "{\"success\":true,\"result\":[]}" ;;
+  *"dns_records?name="*) echo "${DNS_EXISTING:-{\"success\":true,\"result\":[]\}}" ;;
+  *"dns_records/"*) echo "{\"success\":true,\"result\":{\"id\":\"a1\"}}" ;;
   *"dns_records") echo "{\"success\":true,\"result\":{\"id\":\"rec1\"}}" ;;
   *) echo "{\"success\":false,\"result\":[],\"errors\":[{\"message\":\"boh\"}]}" ;;
 esac'
@@ -58,4 +59,38 @@ esac'
   [ "$(stat -c %a "$VPS_OPT/secrets/cloudflare.ini")" = 600 ]
   [ "$(stat -c %a "$VPS_OPT/secrets")" = 700 ]
   [ "$(cf_token_from_ini)" = "$CF_API_TOKEN" ]
+}
+
+# Stub dei record esistenti: imposta DNS_EXISTING con la risposta della GET.
+@test "cf_upsert_record lascia invariato un CNAME esistente e prosegue" {
+  export DNS_EXISTING='{"success":true,"result":[{"id":"c1","type":"CNAME","name":"panel.miosito.it","content":"altro.miosito.it","proxied":true}]}'
+  run cf_upsert_record zone123 A panel.miosito.it 203.0.113.10
+  [ "$status" -eq 0 ]
+  run grep -qE -- "-X (POST|PUT)" "$STUB_LOG"
+  [ "$status" -ne 0 ]
+  grep -q "CNAME" "$VPS_LOG"
+}
+
+@test "cf_upsert_record non modifica un record A già corretto" {
+  export DNS_EXISTING='{"success":true,"result":[{"id":"a1","type":"A","name":"panel.miosito.it","content":"203.0.113.10","proxied":true}]}'
+  run cf_upsert_record zone123 A panel.miosito.it 203.0.113.10
+  [ "$status" -eq 0 ]
+  run grep -qE -- "-X (POST|PUT)" "$STUB_LOG"
+  [ "$status" -ne 0 ]
+}
+
+@test "cf_upsert_record aggiorna un record A con IP diverso" {
+  export DNS_EXISTING='{"success":true,"result":[{"id":"a1","type":"A","name":"panel.miosito.it","content":"198.51.100.7","proxied":false}]}'
+  run cf_upsert_record zone123 A panel.miosito.it 203.0.113.10
+  [ "$status" -eq 0 ]
+  grep -q -- "-X PUT" "$STUB_LOG"
+  grep -q "dns_records/a1" "$STUB_LOG"
+}
+
+@test "cf_upsert_record fallisce se non riesce a leggere i record" {
+  export DNS_EXISTING='{"success":false,"result":[],"errors":[{"message":"no"}]}'
+  run cf_upsert_record zone123 A panel.miosito.it 203.0.113.10
+  [ "$status" -eq 1 ]
+  run grep -qE -- "-X (POST|PUT)" "$STUB_LOG"
+  [ "$status" -ne 0 ]
 }
