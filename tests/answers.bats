@@ -39,3 +39,33 @@ setup() {
   run answers_load "$BATS_TEST_TMPDIR/nessuno.env"
   [ "$status" -eq 1 ]
 }
+
+@test "SSH_IGNORE_IP: derivato da SSH_CLIENT se manca, vuoto altrimenti" {
+  unset SSH_IGNORE_IP
+  SSH_CLIENT='203.0.113.7 51234 22' answers_derive
+  [ "$SSH_IGNORE_IP" = 203.0.113.7 ]
+  unset SSH_IGNORE_IP SSH_CLIENT
+  answers_derive
+  [ "$SSH_IGNORE_IP" = "" ]
+  [[ -v SSH_IGNORE_IP ]]
+}
+
+@test "SSH_IGNORE_IP: il valore salvato vince, quelli non validi sono scartati" {
+  SSH_IGNORE_IP=2001:db8::1 SSH_CLIENT='203.0.113.7 51234 22'
+  answers_derive
+  [ "$SSH_IGNORE_IP" = 2001:db8::1 ]
+  unset SSH_IGNORE_IP
+  SSH_CLIENT='1.2.3.4;rm 51234 22' answers_derive
+  [ "$SSH_IGNORE_IP" = "" ]
+  SSH_IGNORE_IP=$'1.2.3.4\n[sshd]'
+  SSH_CLIENT=''
+  answers_derive
+  [ "$SSH_IGNORE_IP" = "" ]
+}
+
+@test "SSH_IGNORE_IP viene salvato in answers.env" {
+  SSH_IGNORE_IP=203.0.113.7 answers_save
+  unset SSH_IGNORE_IP SSH_CLIENT
+  answers_load
+  [ "$SSH_IGNORE_IP" = 203.0.113.7 ]
+}

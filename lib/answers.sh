@@ -4,7 +4,7 @@
 ANSWER_VARS=(
   HOSTNAME_NEW TIMEZONE LOCALE
   ADMIN_USER ADMIN_PASS ADMIN_PUBKEY
-  SSH_PORT ROOT_LOGIN
+  SSH_PORT ROOT_LOGIN SSH_IGNORE_IP
   WANT_NGINX WANT_PHP WANT_MARIADB WANT_REDIS WANT_CERTBOT WANT_PMA
   PANEL_ENABLED PANEL_DOMAIN
   CF_ENABLED CF_API_TOKEN CF_ZONE CF_ZONE_ID CF_LOCK_ORIGIN
@@ -35,5 +35,22 @@ answers_derive() {
   else
     SSH_ALLOW_USERS="${ADMIN_USER:-}"
   fi
-  export PANEL_ROOT SSH_ALLOW_USERS
+  # IP da non bannare in fail2ban: quello salvato dalla procedura guidata o,
+  # se manca, quello da cui è collegato ora l'utente. Solo se è un IP.
+  if [[ -z "${SSH_IGNORE_IP:-}" ]]; then
+    SSH_IGNORE_IP="$(ssh_client_ip)"
+  fi
+  if ! [[ "$SSH_IGNORE_IP" =~ ^[0-9A-Fa-f:.]*$ ]]; then
+    SSH_IGNORE_IP=""
+  fi
+  export PANEL_ROOT SSH_ALLOW_USERS SSH_IGNORE_IP
+}
+
+# ssh_client_ip — IP del client SSH (da SSH_CLIENT), vuoto se ignoto o non valido.
+ssh_client_ip() {
+  local ip="${SSH_CLIENT:-}"
+  ip="${ip%% *}"
+  if [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ && "$ip" == *[.:]* ]]; then
+    printf '%s' "$ip"
+  fi
 }

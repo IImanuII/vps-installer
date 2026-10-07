@@ -28,7 +28,7 @@ setup() {
   run ssl_obtain_cert panel.miosito.it
   [ "$status" -eq 1 ]
   [[ "$output" == *"non punta a 203.0.113.10"* ]]
-  [[ "$output" == *"run.sh"* ]]
+  [[ "$output" == *"sudo bash install.sh"* ]]
   [ ! -f "$CERTBOT_LOG" ]
 }
 

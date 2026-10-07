@@ -11,7 +11,7 @@ ssl_obtain_cert() {
   else
     ip="$(server_ipv4)"
     if ! dns_points_here "$d" "$ip"; then
-      die "Il dominio $d non punta a $ip. Crea il record DNS A ($d -> $ip), attendi la propagazione e riprendi con: sudo bash $VPS_ROOT/run.sh"
+      die "Il dominio $d non punta a $ip. Crea il record DNS A ($d -> $ip), attendi la propagazione e riprendi con: sudo bash install.sh (dalla home da cui l'hai lanciato)"
     fi
     args+=(--webroot -w /var/www/_acme)
   fi

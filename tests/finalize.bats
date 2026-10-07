@@ -76,6 +76,10 @@ esac'
   : >"$VPS_SSH_TTY"
   run finalize_ssh
   [ "$status" -ne 0 ]
+  [[ "$output" == *"sudo bash install.sh"* ]]
+  [[ "$output" != *"run.sh"* ]]
+  grep -qF "ssh -p 41822 -i ~/.ssh/<tua-chiave> -o IdentitiesOnly=yes manu@203.0.113.10" "$VPS_SSH_TTY"
+  grep -qF "Too many authentication failures" "$VPS_SSH_TTY"
   [ ! -e "$SSH_CONF_PATH" ]
   run grep -q 'ufw delete' "$CALLS"
   [ "$status" -ne 0 ]
@@ -158,4 +162,20 @@ esac'
   run finalize_ssh
   [ "$status" -ne 0 ]
   [ ! -e "$SSH_CONF_PATH" ]
+}
+
+@test "pulizia: cancella VPS_ROOT solo se ha il marcatore .release" {
+  export VPS_TTY="$BATS_TEST_TMPDIR/tty-invio" CALLS="$BATS_TEST_TMPDIR/calls"
+  echo >"$VPS_TTY"
+  make_stub systemctl 'echo "systemctl $*" >>"$CALLS"'
+  echo segreto >"$VPS_ROOT/answers.env"
+  run finalize_cleanup_and_reboot
+  [ "$status" -eq 0 ]
+  [ -f "$VPS_ROOT/answers.env" ]
+  grep -q "non la cancello" "$VPS_LOG"
+  grep -qxF "systemctl reboot" "$CALLS"
+  echo local:abc >"$VPS_ROOT/.release"
+  run finalize_cleanup_and_reboot
+  [ "$status" -eq 0 ]
+  [ ! -e "$VPS_ROOT" ]
 }

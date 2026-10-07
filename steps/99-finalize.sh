@@ -37,7 +37,10 @@ ssh_wait_confirmation() {
 =================== TEST ACCESSO SSH ===================
 Lascia aperta QUESTA finestra. Aprine una NUOVA e accedi con:
 
-    ssh -p $SSH_PORT $ADMIN_USER@$ip
+    ssh -p $SSH_PORT -i ~/.ssh/<tua-chiave> -o IdentitiesOnly=yes $ADMIN_USER@$ip
+
+(-i e IdentitiesOnly fanno usare solo quella chiave: evitano l'errore
+"Too many authentication failures" se sul tuo PC hai più chiavi SSH.)
 
 Quando sei dentro, torna qui e scrivi OK.
 Hai 10 minuti, poi la configurazione SSH viene ripristinata.
@@ -96,7 +99,7 @@ finalize_ssh() {
   if ! ssh_wait_confirmation "$before"; then
     trap - HUP INT TERM
     ssh_rollback
-    die "Accesso non confermato: SSH ripristinato (porta 22 ancora aperta). Controlla chiave e porta, poi riprendi con: sudo bash $VPS_ROOT/run.sh"
+    die "Accesso non confermato: SSH ripristinato (porta 22 ancora aperta). Controlla chiave e porta, poi riprendi con: sudo bash install.sh (dalla home da cui l'hai lanciato)"
   fi
   trap - HUP INT TERM
   ssh_watchdog_cancel
@@ -170,12 +173,17 @@ finalize_summary_text() {
 }
 
 finalize_cleanup_and_reboot() {
-  read -r -p "Premi Invio per cancellare i file dell'installer e riavviare..." _ </dev/tty || true
+  read -r -p "Premi Invio per cancellare i file dell'installer e riavviare..." _ <"${VPS_TTY:-/dev/tty}" || true
   log "Pulizia dei file dell'installer e riavvio"
   if [[ -n "${VPS_BOOTSTRAP:-}" && -f "$VPS_BOOTSTRAP" ]]; then
     rm -f "$VPS_BOOTSTRAP"
   fi
-  rm -rf "$VPS_ROOT"
+  # Cancella solo una cartella che è sicuramente dell'installer.
+  if [[ "$VPS_ROOT" == /root/vps-installer || -f "$VPS_ROOT/.release" ]]; then
+    rm -rf "$VPS_ROOT"
+  else
+    log "ATTENZIONE: $VPS_ROOT non sembra la cartella dell'installer (manca .release): non la cancello"
+  fi
   systemctl reboot
 }
 

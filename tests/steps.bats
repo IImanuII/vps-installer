@@ -27,8 +27,8 @@ setup() {
 }
 
 @test "jail sshd sulla porta scelta con backend systemd" {
-  SSH_PORT=41822
-  render_template "$REPO_ROOT/templates/jail-sshd.local.tmpl" "$BATS_TEST_TMPDIR/jail" 644 "$(id -un):$(id -gn)" SSH_PORT
+  SSH_PORT=41822 SSH_IGNORE_IP=""
+  render_template "$REPO_ROOT/templates/jail-sshd.local.tmpl" "$BATS_TEST_TMPDIR/jail" 644 "$(id -un):$(id -gn)" SSH_PORT SSH_IGNORE_IP
   grep -qE '^port += 41822$' "$BATS_TEST_TMPDIR/jail"
   grep -qE '^backend += systemd$' "$BATS_TEST_TMPDIR/jail"
 }
@@ -71,4 +71,13 @@ setup() {
   grep -q 'auth_basic_user_file /etc/nginx/.htpasswd-pma;' "$BATS_TEST_TMPDIR/pma"
   grep -q 'fastcgi_param SCRIPT_FILENAME $request_filename;' "$BATS_TEST_TMPDIR/pma"
   grep -q "alias $VPS_OPT/phpmyadmin/;" "$BATS_TEST_TMPDIR/pma"
+}
+
+@test "jail sshd: ignoreip con e senza IP del client" {
+  SSH_PORT=41822 SSH_IGNORE_IP=203.0.113.7
+  render_template "$REPO_ROOT/templates/jail-sshd.local.tmpl" "$BATS_TEST_TMPDIR/jail" 644 "$(id -un):$(id -gn)" SSH_PORT SSH_IGNORE_IP
+  grep -qxF 'ignoreip = 127.0.0.1/8 ::1 203.0.113.7' "$BATS_TEST_TMPDIR/jail"
+  SSH_IGNORE_IP=""
+  render_template "$REPO_ROOT/templates/jail-sshd.local.tmpl" "$BATS_TEST_TMPDIR/jail" 644 "$(id -un):$(id -gn)" SSH_PORT SSH_IGNORE_IP
+  grep -qE '^ignoreip = 127\.0\.0\.1/8 ::1 ?$' "$BATS_TEST_TMPDIR/jail"
 }

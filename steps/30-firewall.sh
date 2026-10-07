@@ -27,7 +27,8 @@ step_main() {
   ufw --force enable >/dev/null
 
   log "Firewall: fail2ban per SSH sulla porta $SSH_PORT"
-  render_template "$VPS_TEMPLATES/jail-sshd.local.tmpl" /etc/fail2ban/jail.d/vps-sshd.local 644 root:root SSH_PORT
+  render_template "$VPS_TEMPLATES/jail-sshd.local.tmpl" /etc/fail2ban/jail.d/vps-sshd.local 644 root:root \
+    SSH_PORT SSH_IGNORE_IP
   systemctl enable fail2ban >>"$VPS_LOG" 2>&1
   systemctl restart fail2ban
 }

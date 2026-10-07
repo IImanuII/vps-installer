@@ -101,6 +101,8 @@ wizard_defaults() {
   # shellcheck disable=SC2034
   WANT_NGINX=no WANT_PHP=no WANT_MARIADB=no WANT_REDIS=no WANT_CERTBOT=no WANT_PMA=no
   PANEL_ENABLED=no CF_ENABLED=no CF_LOCK_ORIGIN=no MAIL_ENABLED=no ROOT_LOGIN=no
+  # shellcheck disable=SC2034
+  SSH_IGNORE_IP="$(ssh_client_ip)"
 }
 
 wizard_preflight() {

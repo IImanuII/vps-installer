@@ -55,3 +55,11 @@ exit 1'
   run grep -c PRIVATE-SECRET "$BATS_TEST_TMPDIR/argv"
   [ "$output" = 0 ]
 }
+
+@test "wizard_defaults prende l'IP del client SSH" {
+  source "$REPO_ROOT/wizard.sh"
+  SSH_CLIENT='198.51.100.9 50000 22' wizard_defaults
+  [ "$SSH_IGNORE_IP" = 198.51.100.9 ]
+  SSH_CLIENT= wizard_defaults
+  [ "$SSH_IGNORE_IP" = "" ]
+}
