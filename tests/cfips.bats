@@ -75,3 +75,25 @@ esac'
   cf_apply_ips yes
   grep -q "allow proto tcp from 173.245.48.0/20 to any port 80,443 comment cloudflare" "$BATS_TEST_TMPDIR/ufw.log"
 }
+
+@test "cf_fetch_ips scarta reti troppo ampie e /0" {
+  make_stub curl '
+case "${*: -1}" in
+  *ips-v4) printf "0.0.0.0/0\n1.0.0.0/7\n2.0.0.0/8\n173.245.48.0/20\n103.21.244.0/22\n103.22.200.0/22\n103.31.4.0/22\n141.101.64.0/18\n108.162.192.0/18\n190.93.240.0/20\n9.9.9.9/33\n" ;;
+  *ips-v6) printf "::/0\n2000::/3\n2400::/11\n2400:cb00::/32\n2606:4700::/12\n" ;;
+esac'
+  run cf_fetch_ips
+  [ "$status" -eq 0 ]
+  [ "${#lines[@]}" -eq 10 ]
+  [[ "$output" == *"2.0.0.0/8"* ]]
+  [[ "$output" == *"2606:4700::/12"* ]]
+  for bad in 0.0.0.0/0 1.0.0.0/7 9.9.9.9/33 ::/0 2000::/3 2400::/11; do
+    [[ $'\n'"$output"$'\n' != *$'\n'"$bad"$'\n'* ]] || { echo "accettata $bad"; return 1; }
+  done
+}
+
+@test "cf_fetch_ips fallisce se restano troppo poche reti valide" {
+  make_stub curl 'printf "0.0.0.0/0\n::/0\n1.0.0.0/1\n1.0.0.0/2\n1.0.0.0/3\n1.0.0.0/4\n1.0.0.0/5\n1.0.0.0/6\n1.0.0.0/7\n2000::/3\n2000::/4\n"'
+  run cf_fetch_ips
+  [ "$status" -eq 1 ]
+}

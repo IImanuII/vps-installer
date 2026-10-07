@@ -7,7 +7,9 @@ cf_fetch_ips() {
   local v4 v6 out
   v4="$(curl -fsS --max-time 30 "$CF_IPS_URL/ips-v4")" || return 1
   v6="$(curl -fsS --max-time 30 "$CF_IPS_URL/ips-v6")" || return 1
-  out="$(printf '%s\n%s\n' "$v4" "$v6" | grep -E '^[0-9a-fA-F:.]+/[0-9]{1,3}$' || true)"
+  # Scarta righe strane e reti troppo ampie (< /8 per IPv4, < /12 per IPv6, /0).
+  out="$(printf '%s\n%s\n' "$v4" "$v6" | grep -E '^[0-9a-fA-F:.]+/[0-9]{1,3}$' \
+    | awk -F/ '($1 ~ /:/ && $2 >= 12 && $2 <= 128) || ($1 !~ /:/ && $2 >= 8 && $2 <= 32)' || true)"
   (($(grep -c . <<<"$out") >= 10)) || return 1
   printf '%s\n' "$out"
 }
