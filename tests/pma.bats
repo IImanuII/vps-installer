@@ -67,3 +67,66 @@ setup() {
   run pma_verify_sig "$BATS_TEST_TMPDIR/pma.tar.xz" "$BATS_TEST_TMPDIR/pma.tar.xz.asc" "$BATS_TEST_TMPDIR/keyring"
   [ "$status" -ne 0 ]
 }
+
+# Prepara fixture in $FIX: archivio tar.xz, .sha256, .asc e keyring per la versione 9.9.9.
+make_pma_fixtures() {
+  export GNUPGHOME="$BATS_TEST_TMPDIR/gnupg"
+  mkdir -m 700 "$GNUPGHOME"
+  gpg --batch --quiet --passphrase '' --quick-gen-key 'PMA Test <pma@example.com>' ed25519 sign never
+  PMA_FPR="$(gpg --batch --with-colons --list-keys pma@example.com | awk -F: '$1=="fpr"{print $10; exit}')"
+  FIX="$BATS_TEST_TMPDIR/fix"
+  W="$BATS_TEST_TMPDIR/work"
+  mkdir -p "$FIX" "$W" "$BATS_TEST_TMPDIR/src/phpMyAdmin-9.9.9-all-languages"
+  echo nuovo >"$BATS_TEST_TMPDIR/src/phpMyAdmin-9.9.9-all-languages/index.php"
+  tar -cJf "$FIX/phpMyAdmin-9.9.9-all-languages.tar.xz" -C "$BATS_TEST_TMPDIR/src" phpMyAdmin-9.9.9-all-languages
+  (cd "$FIX" && sha256sum phpMyAdmin-9.9.9-all-languages.tar.xz >phpMyAdmin-9.9.9-all-languages.tar.xz.sha256)
+  gpg --batch --quiet --armor --detach-sign -o "$FIX/phpMyAdmin-9.9.9-all-languages.tar.xz.asc" "$FIX/phpMyAdmin-9.9.9-all-languages.tar.xz"
+  gpg --batch --export pma@example.com >"$FIX/phpmyadmin.keyring"
+  export FIX
+  make_stub curl 'out=; url=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift ;;
+    http*) url="$1" ;;
+  esac
+  shift
+done
+cp "$FIX/$(basename "$url")" "$out"'
+}
+
+@test "pma_fetch estrae un archivio integro e firmato dal firmatario atteso" {
+  make_pma_fixtures
+  PMA_SIGNER_FPRS=("$PMA_FPR")
+  run pma_fetch 9.9.9 "$W"
+  [ "$status" -eq 0 ]
+  [ -f "$W/phpMyAdmin-9.9.9-all-languages/index.php" ]
+}
+
+@test "pma_fetch rifiuta un archivio manomesso o con sha256 sbagliato" {
+  make_pma_fixtures
+  PMA_SIGNER_FPRS=("$PMA_FPR")
+  echo manomesso >>"$FIX/phpMyAdmin-9.9.9-all-languages.tar.xz"
+  run pma_fetch 9.9.9 "$W"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"SHA256"* ]]
+  [ ! -e "$W/phpMyAdmin-9.9.9-all-languages" ]
+}
+
+@test "pma_fetch rifiuta una firma di un firmatario non fidato anche con sha256 valido" {
+  make_pma_fixtures
+  PMA_SIGNER_FPRS=(0000000000000000000000000000000000000000)
+  run pma_fetch 9.9.9 "$W"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"firma GPG"* ]]
+  [ ! -e "$W/phpMyAdmin-9.9.9-all-languages" ]
+}
+
+@test "pma_install_tree ripristina PMA_DIR.old se PMA_DIR manca" {
+  mkdir -p "$PMA_DIR.old" "$VPS_OPT/new"
+  echo vecchia >"$PMA_DIR.old/config.inc.php"
+  echo nuovo >"$VPS_OPT/new/index.php"
+  pma_install_tree "$VPS_OPT/new"
+  [ "$(cat "$PMA_DIR/config.inc.php")" = vecchia ]
+  [ "$(cat "$PMA_DIR/index.php")" = nuovo ]
+  [ ! -d "$PMA_DIR.old" ]
+}

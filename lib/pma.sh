@@ -36,10 +36,14 @@ pma_verify_sig() {
   gpg --homedir "$gh" --batch --quiet --import "$3" 2>>"$VPS_LOG" || true
   status="$(gpg --homedir "$gh" --batch --status-fd 1 --verify "$2" "$1" 2>>"$VPS_LOG" || true)"
   rm -rf "$gh"
+  grep -qE '^\[GNUPG:\] (REVKEYSIG|EXPKEYSIG|BADSIG) ' <<<"$status" && return 1
+  grep -qE '^\[GNUPG:\] GOODSIG ' <<<"$status" || return 1
+  # Ultimo campo di VALIDSIG = fingerprint della chiave primaria.
+  local primary
+  primary="$(awk '$1=="[GNUPG:]" && $2=="VALIDSIG" {print $NF; exit}' <<<"$status")"
+  [[ -n "$primary" ]] || return 1
   for f in "${PMA_SIGNER_FPRS[@]}"; do
-    if grep -qE "^\[GNUPG:\] VALIDSIG .*\b$f\b" <<<"$status"; then
-      return 0
-    fi
+    [[ -n "$f" && "$f" == "$primary" ]] && return 0
   done
   return 1
 }
@@ -50,19 +54,23 @@ pma_fetch() {
   base="$PMA_BASE_URL/phpMyAdmin/$v"
   f="phpMyAdmin-$v-all-languages.tar.xz"
   log "phpMyAdmin: scarico la versione $v"
-  curl -fsS --max-time 300 -o "$w/$f" "$base/$f"
-  curl -fsS --max-time 30 -o "$w/$f.asc" "$base/$f.asc"
-  curl -fsS --max-time 30 -o "$w/$f.sha256" "$base/$f.sha256"
-  curl -fsS --max-time 30 -o "$w/keyring" "$PMA_BASE_URL/phpmyadmin.keyring"
+  curl -fsS --max-time 300 -o "$w/$f" "$base/$f" || die "phpMyAdmin $v: download dell'archivio non riuscito"
+  curl -fsS --max-time 30 -o "$w/$f.asc" "$base/$f.asc" || die "phpMyAdmin $v: download della firma non riuscito"
+  curl -fsS --max-time 30 -o "$w/$f.sha256" "$base/$f.sha256" || die "phpMyAdmin $v: download dello SHA256 non riuscito"
+  curl -fsS --max-time 30 -o "$w/keyring" "$PMA_BASE_URL/phpmyadmin.keyring" || die "phpMyAdmin $v: download del keyring non riuscito"
   (cd "$w" && sha256sum -c --status "$f.sha256") || die "phpMyAdmin $v: SHA256 non valido"
   pma_verify_sig "$w/$f" "$w/$f.asc" "$w/keyring" || die "phpMyAdmin $v: firma GPG non valida"
-  tar -xJf "$w/$f" -C "$w"
+  tar -xJf "$w/$f" -C "$w" || die "phpMyAdmin $v: estrazione non riuscita"
   printf '%s\n' "$w/phpMyAdmin-$v-all-languages"
 }
 
 # pma_install_tree SRC — sostituisce PMA_DIR conservando config.inc.php.
 pma_install_tree() {
   local src="$1" old="$PMA_DIR.old"
+  # Recupero da un'interruzione precedente: non perdere l'unica copia.
+  if [[ ! -d "$PMA_DIR" && -d "$old" ]]; then
+    mv "$old" "$PMA_DIR"
+  fi
   if [[ -f "$PMA_DIR/config.inc.php" ]]; then
     cp -p "$PMA_DIR/config.inc.php" "$src/config.inc.php"
   fi
@@ -87,7 +95,7 @@ pma_update_to() {
 
 # pma_set_basic_auth UTENTE — password da stdin, hash bcrypt.
 pma_set_basic_auth() {
-  htpasswd -B -i -c "$HTPASSWD_PMA" "$1" >>"$VPS_LOG" 2>&1
+  (umask 027 && htpasswd -B -i -c "$HTPASSWD_PMA" "$1" >>"$VPS_LOG" 2>&1)
   own root:www-data "$HTPASSWD_PMA"
   chmod 640 "$HTPASSWD_PMA"
 }
