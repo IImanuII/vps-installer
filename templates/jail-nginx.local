@@ -1,0 +1,14 @@
+# vps-installer (solo senza Cloudflare)
+[nginx-limit-req]
+enabled  = true
+port     = http,https
+logpath  = /var/log/nginx/*error.log
+backend  = auto
+maxretry = 10
+
+[nginx-botsearch]
+enabled  = true
+port     = http,https
+logpath  = /var/log/nginx/*error.log
+backend  = auto
+maxretry = 5

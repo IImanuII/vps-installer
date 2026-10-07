@@ -32,3 +32,17 @@ setup() {
   grep -qE '^port += 41822$' "$BATS_TEST_TMPDIR/jail"
   grep -qE '^backend += systemd$' "$BATS_TEST_TMPDIR/jail"
 }
+
+@test "nginx.conf: default server 444, reject handshake, real_ip incluso, utente www-data" {
+  local f="$REPO_ROOT/templates/nginx.conf"
+  grep -qxF 'user www-data;' "$f"
+  grep -q 'return 444;' "$f"
+  grep -q 'ssl_reject_handshake on;' "$f"
+  grep -q 'include /etc/nginx/snippets/cloudflare-realip.conf;' "$f"
+  grep -q 'limit_req_zone $binary_remote_addr zone=req_limit_per_ip' "$f"
+  grep -q 'X-Content-Type-Options "nosniff"' "$REPO_ROOT/templates/nginx-security-headers.conf"
+  run grep -qi 'X-Xss-Protection' "$REPO_ROOT/templates/nginx-security-headers.conf"
+  [ "$status" -ne 0 ]
+  run grep -q 'ssl_stapling' "$REPO_ROOT/templates/nginx-ssl-params.conf"
+  [ "$status" -ne 0 ]
+}
