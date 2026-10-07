@@ -1,0 +1,5 @@
+external-sources=true
+# Le librerie sono caricate con un ciclo (SC1090/SC1091) e le risposte
+# della procedura guidata arrivano da answers.env (SC2154). I filtri jq e i
+# template nginx usano $ tra apici singoli di proposito (SC2016).
+disable=SC1090,SC1091,SC2154,SC2016
