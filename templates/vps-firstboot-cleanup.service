@@ -1,0 +1,10 @@
+[Unit]
+Description=vps-installer: rimozione dell'utente debian di OVH
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'pkill -KILL -u debian || true; userdel -r debian || true; rm -f /etc/sudoers.d/90-cloud-init-users; systemctl disable vps-firstboot-cleanup.service; rm -f /etc/systemd/system/vps-firstboot-cleanup.service; systemctl daemon-reload'
+
+[Install]
+WantedBy=multi-user.target
