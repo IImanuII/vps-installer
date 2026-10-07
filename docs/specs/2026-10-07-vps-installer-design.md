@@ -173,7 +173,7 @@ Le risposte vengono salvate in `/root/vps-installer/answers.env` (root, 600).
 
 ### 75-mail
 - Solo se configurata: `msmtp` + `msmtp-mta` (fornisce `sendmail`), configurazione in `/opt/vps/secrets/msmtprc` (root, 600) con symlink `/etc/msmtprc`.
-- Alias `root` → destinatario avvisi, così fail2ban, unattended-upgrades e cron mandano mail.
+- Alias `root` → destinatario avvisi, così unattended-upgrades, certbot e cron mandano mail. Le notifiche email di fail2ban non sono attive in v1 (eventualmente dal pannello).
 - Altrimenti: installa solo `msmtp` + `msmtp-mta` senza configurazione (il pannello la aggiunge dopo).
 
 ### 80-ssl
