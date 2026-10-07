@@ -1,0 +1,36 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq bats shellcheck jq gettext-base openssh-client gpg rsync
+      - run: bash tests/run.sh
+      - name: Versione coerente
+        run: |
+          v="$(sed -n 's/^VPS_INSTALLER_VERSION="\(.*\)"$/\1/p' lib/common.sh)"
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "Tag $GITHUB_REF_NAME diverso da VPS_INSTALLER_VERSION=$v"; exit 1; }
+      - name: Build
+        run: |
+          set -euo pipefail
+          V="$GITHUB_REF_NAME"
+          mkdir dist
+          git archive --format=tar.gz --prefix=vps-installer/ -o "dist/vps-installer-$V.tar.gz" HEAD
+          SHA="$(sha256sum "dist/vps-installer-$V.tar.gz" | cut -d' ' -f1)"
+          sed -e "s/__VERSION__/$V/" -e "s/__TARBALL_SHA256__/$SHA/" -e "s#__REPO__#$GITHUB_REPOSITORY#" install.sh > dist/install.sh
+          ISHA="$(sha256sum dist/install.sh | cut -d' ' -f1)"
+          {
+            echo "Comando di installazione (su una VPS Debian 13 appena creata, come utente debian):"
+            echo
+            echo '```bash'
+            echo "curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$V/install.sh -o install.sh && echo \"$ISHA  install.sh\" | sha256sum -c - && sudo bash install.sh"
+            echo '```'
+          } > notes.md
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md
+        env:
+          GH_TOKEN: ${{ github.token }}
