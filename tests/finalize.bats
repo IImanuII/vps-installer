@@ -28,3 +28,70 @@ setup() {
   finalize_summary_text >/dev/null
   ! grep -q 'Pma-Segreta-1' "$VPS_LOG" 2>/dev/null
 }
+
+ssh_env() {
+  export SSH_CONF_PATH="$BATS_TEST_TMPDIR/10-vps.conf" SSH_TTY="$BATS_TEST_TMPDIR/tty"
+  export SSH_CONFIRM_TIMEOUT=2 SSH_READ_TIMEOUT=1
+  CALLS="$BATS_TEST_TMPDIR/calls"
+  : >"$CALLS"
+  echo "OK" >"$SSH_TTY"
+  echo "conf" >"$VPS_ROOT/sshd-10-vps.conf"
+  make_stub systemctl 'echo "systemctl $*" >>'"$CALLS"'; case "$1" in is-enabled|is-active) exit 1;; esac; exit 0'
+  make_stub sshd 'exit 0'
+  make_stub ufw 'echo "ufw $*" >>'"$CALLS"
+  make_stub loginctl 'case "$1" in
+list-sessions) cat '"$BATS_TEST_TMPDIR"'/sessions ;;
+show-session) echo user ;;
+esac'
+  printf '  7 1001 manu - pts/1\n' >"$BATS_TEST_TMPDIR/sessions"
+}
+
+@test "finalize_ssh: sshd -t fallito, conf rimossa e errore" {
+  ssh_env
+  make_stub sshd 'exit 1'
+  run finalize_ssh
+  [ "$status" -ne 0 ]
+  [ ! -e "$SSH_CONF_PATH" ]
+}
+
+@test "finalize_ssh: reload fallito, conf rimossa" {
+  ssh_env
+  make_stub systemctl 'echo "systemctl $*" >>'"$CALLS"'; case "$1" in is-enabled|is-active) exit 1;; reload) exit 1;; esac; exit 0'
+  run finalize_ssh
+  [ "$status" -ne 0 ]
+  [ ! -e "$SSH_CONF_PATH" ]
+}
+
+@test "finalize_ssh: enable ssh.service fallito, ssh.socket ripristinato" {
+  ssh_env
+  make_stub systemctl 'echo "systemctl $*" >>'"$CALLS"'; case "$1" in is-enabled) exit 0;; enable) [ "$3" = ssh.service ] && exit 1;; esac; exit 0'
+  run finalize_ssh
+  [ "$status" -ne 0 ]
+  grep -qF 'systemctl enable --now ssh.socket' "$CALLS"
+}
+
+@test "finalize_ssh: timeout senza nuova sessione, conf rimossa e porta 22 intatta" {
+  ssh_env
+  run finalize_ssh
+  [ "$status" -ne 0 ]
+  [ ! -e "$SSH_CONF_PATH" ]
+  run grep -q 'ufw delete' "$CALLS"
+  [ "$status" -ne 0 ]
+}
+
+@test "finalize_ssh: confermo con la sola vecchia sessione, non confermato" {
+  ssh_env
+  run finalize_ssh
+  [ "$status" -ne 0 ]
+  run grep -q 'ufw delete' "$CALLS"
+  [ "$status" -ne 0 ]
+}
+
+@test "finalize_ssh: nuova sessione, confermato e porta 22 chiusa" {
+  ssh_env
+  make_stub systemctl 'echo "systemctl $*" >>'"$CALLS"'; case "$1" in is-enabled|is-active) exit 1;; reload) printf "  7 1001 manu - pts/1\n  9 1001 manu - pts/2\n" >'"$BATS_TEST_TMPDIR"'/sessions;; esac; exit 0'
+  run finalize_ssh
+  [ "$status" -eq 0 ]
+  [ -e "$SSH_CONF_PATH" ]
+  grep -qF 'ufw delete allow 22/tcp' "$CALLS"
+}

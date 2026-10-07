@@ -4,7 +4,7 @@ After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'pkill -KILL -u debian || true; userdel -r debian || true; rm -f /etc/sudoers.d/90-cloud-init-users; systemctl disable vps-firstboot-cleanup.service; rm -f /etc/systemd/system/vps-firstboot-cleanup.service; systemctl daemon-reload'
+ExecStart=/bin/sh -c 'pkill -KILL -u debian || true; userdel -r debian || true; if id debian >/dev/null 2>&1; then logger -t vps-installer "utente debian ancora presente: riprovo al prossimo avvio"; exit 0; fi; rm -f /etc/sudoers.d/90-cloud-init-users; systemctl disable vps-firstboot-cleanup.service; rm -f /etc/systemd/system/vps-firstboot-cleanup.service; systemctl daemon-reload'
 
 [Install]
 WantedBy=multi-user.target
