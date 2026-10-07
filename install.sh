@@ -20,14 +20,38 @@ EOF
 }
 
 bootstrap_deps() {
+  local try
   echo "Preparo gli strumenti di base..."
-  apt-get update -q >/dev/null
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+  for try in 1 2 3; do
+    if apt-get -o DPkg::Lock::Timeout=300 update -q >/dev/null; then
+      break
+    fi
+    if ((try == 3)); then
+      echo "apt-get update non riuscito dopo 3 tentativi: controlla la rete e riprova." >&2
+      return 1
+    fi
+    echo "apt-get update non riuscito, riprovo tra ${APT_RETRY_SLEEP:-10} secondi..." >&2
+    sleep "${APT_RETRY_SLEEP:-10}"
+  done
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -q \
     tmux whiptail jq curl gettext-base openssl ca-certificates >/dev/null
 }
 
+# release_id ARCHIVIO_LOCALE — identifica la release da installare
+# ("local:<sha256>" con --local, lo SHA256 della release, vuoto se ignota).
+release_id() {
+  if [[ -n "$1" ]]; then
+    printf 'local:%s\n' "$(sha256sum "$1" | cut -d' ' -f1)"
+  elif [[ "$TARBALL_SHA256" != __* ]]; then
+    printf '%s\n' "$TARBALL_SHA256"
+  fi
+}
+
+# fetch_release ARCHIVIO_LOCALE [DEST] — scarica/verifica ed estrae in DEST,
+# scrivendo il marcatore .release.
 fetch_release() {
-  local tar="$1" tmp=""
+  local tar="$1" dest="${2:-$VPS_DEST}" tmp="" id
+  id="$(release_id "$tar")"
   if [[ -z "$tar" ]]; then
     if [[ "$TARBALL_SHA256" == __* ]]; then
       echo "Questo install.sh non proviene da una release: usa --local archivio.tar.gz" >&2
@@ -35,18 +59,56 @@ fetch_release() {
     fi
     tmp="$(mktemp -d)"
     tar="$tmp/vps-installer.tar.gz"
-    curl -fsSL --max-time 120 -o "$tar" "$RELEASE_BASE_URL/$VPS_VERSION/vps-installer-$VPS_VERSION.tar.gz"
+    curl -fsSL --max-time 120 -o "$tar" "$RELEASE_BASE_URL/$VPS_VERSION/vps-installer-$VPS_VERSION.tar.gz" \
+      || { rm -rf "$tmp"; echo "Download della release non riuscito." >&2; return 1; }
     if ! echo "$TARBALL_SHA256  $tar" | sha256sum -c - >/dev/null 2>&1; then
       rm -rf "$tmp"
       echo "Hash dell'archivio non valido: interrompo." >&2
       return 1
     fi
   fi
-  install -d -m 700 "$VPS_DEST"
-  tar -xzf "$tar" -C "$VPS_DEST" --strip-components=1 --no-same-owner
+  install -d -m 700 "$dest"
+  tar -xzf "$tar" -C "$dest" --strip-components=1 --no-same-owner || { rm -rf "$tmp"; return 1; }
+  printf '%s\n' "$id" >"$dest/.release"
   if [[ -n "$tmp" ]]; then
     rm -rf "$tmp"
   fi
+}
+
+# File di lavoro da conservare quando si sostituisce una release vecchia.
+RUNTIME_FILES=(answers.env state summary.env sshd-10-vps.conf)
+
+# ensure_release ARCHIVIO_LOCALE — estrae la release in VPS_DEST; se c'è già una
+# release diversa (o senza marcatore) la sostituisce conservando i file di lavoro.
+ensure_release() {
+  local tar="$1" want have="" new old f
+  if [[ ! -f "$VPS_DEST/run.sh" ]]; then
+    fetch_release "$tar"
+    return
+  fi
+  want="$(release_id "$tar")"
+  if [[ -f "$VPS_DEST/.release" ]]; then
+    have="$(<"$VPS_DEST/.release")"
+  fi
+  if [[ -z "$want" || "$want" == "$have" ]]; then
+    return 0
+  fi
+  echo "Trovata una versione diversa dell'installer in $VPS_DEST: la aggiorno."
+  new="$(mktemp -d "$VPS_DEST.new.XXXXXX")"
+  if ! fetch_release "$tar" "$new"; then
+    rm -rf "$new"
+    return 1
+  fi
+  for f in "${RUNTIME_FILES[@]}"; do
+    if [[ -e "$VPS_DEST/$f" ]]; then
+      cp -p "$VPS_DEST/$f" "$new/$f"
+    fi
+  done
+  old="$VPS_DEST.old.$$"
+  rm -rf "$old"
+  mv "$VPS_DEST" "$old"
+  mv "$new" "$VPS_DEST"
+  rm -rf "$old"
 }
 
 main() {
@@ -71,9 +133,7 @@ main() {
     sleep 2
     exec tmux new-session -A -s vps-installer bash "$self" "${orig_args[@]}"
   fi
-  if [[ ! -f "$VPS_DEST/run.sh" ]]; then
-    fetch_release "$local_tar"
-  fi
+  ensure_release "$local_tar"
   export VPS_BOOTSTRAP="$self"
   bash "$VPS_DEST/run.sh" "${run_args[@]}" || {
     echo
