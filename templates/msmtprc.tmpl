@@ -1,0 +1,15 @@
+# Generato da vps-installer / vps-smtp: non modificare a mano.
+defaults
+auth on
+tls on
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+logfile /var/log/msmtp.log
+aliases /etc/aliases
+
+account default
+host ${SMTP_HOST}
+port ${SMTP_PORT}
+tls_starttls ${SMTP_TLS_STARTTLS}
+from ${SMTP_FROM}
+user ${SMTP_USER}
+password "${SMTP_PASS_ESC}"
