@@ -220,13 +220,15 @@ setup() {
   [[ "$(cat "$SITE_ERROR_FILE")" == *"PHP-FPM"* ]]
 }
 
-@test "site_logrotate_add: settimanale, 8 copie, come utente del sito" {
+@test "site_logrotate_add: settimanale, 8 copie, ruotato da root" {
   site_reg_new blog.miosito.it php no no
   site_logrotate_add blog.miosito.it
   f="$LOGROTATE_D/vps-site-site_blog_miosito_it"
   grep -q "^$SITES_WWW/blog.miosito.it/logs/\*.log {" "$f"
   grep -qx '    rotate 8' "$f"
-  grep -qx '    su site_blog_miosito_it site_blog_miosito_it' "$f"
+  # Niente "su": nginx (root) crea i log di proprietà di root e il sito non potrebbe troncarli.
+  run grep -c '^ *su ' "$f"
+  [ "$output" = 0 ]
   site_logrotate_remove blog.miosito.it
   [ ! -e "$f" ]
 }
