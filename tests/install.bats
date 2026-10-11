@@ -143,3 +143,49 @@ local_id() {
   run grep -q install "$CALLS"
   [ "$status" -ne 0 ]
 }
+
+@test "--reset insieme a --tools-only: errore d'uso, uscita 1" {
+  run main --reset --tools-only
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--reset"*"--tools-only"* ]]
+}
+
+@test "tools_only_done: cancella la cartella dell'installer e aspetta Invio" {
+  mkdir -p "$VPS_DEST"
+  echo x >"$VPS_DEST/run.sh"
+  run tools_only_done </dev/null
+  [ "$status" -eq 0 ]
+  [ ! -e "$VPS_DEST" ]
+  [[ "$output" == *"Script di /opt/vps aggiornati"* ]]
+  # read -p non stampa il prompt senza terminale: si controlla che ci sia
+  declare -f tools_only_done | grep -q "read -r -p .Premi Invio"
+}
+
+@test "tools_only_done: un'installazione completa non terminata resta dov'è" {
+  mkdir -p "$VPS_DEST"
+  printf '10-system\n20-user-ssh\n' >"$VPS_DEST/state"
+  echo 'ADMIN_USER=manu' >"$VPS_DEST/answers.env"
+  run tools_only_done </dev/null
+  [ "$status" -eq 0 ]
+  [ -f "$VPS_DEST/state" ]
+  [ -f "$VPS_DEST/answers.env" ]
+  [[ "$output" == *"non terminata"* ]]
+}
+
+@test "tools_only_done: con lo step finale già fatto la cartella si cancella" {
+  mkdir -p "$VPS_DEST"
+  printf '95-vps-tools\n99-finalize\n' >"$VPS_DEST/state"
+  run tools_only_done </dev/null
+  [ "$status" -eq 0 ]
+  [ ! -e "$VPS_DEST" ]
+}
+
+@test "run_failed con --tools-only: niente segreti di answers.env né 'riprendere'" {
+  run run_failed 1 /root/install.sh </dev/null
+  [[ "$output" != *"answers.env"* ]]
+  [[ "$output" != *"riprendere"* ]]
+  [[ "$output" == *"--tools-only"* ]]
+  run run_failed 0 /root/install.sh </dev/null
+  [[ "$output" == *"answers.env"* ]]
+  [[ "$output" == *"riprendere"* ]]
+}

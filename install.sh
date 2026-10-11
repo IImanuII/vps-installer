@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # vps-installer — bootstrap: scarica la release, la verifica e avvia l'installazione.
-# Uso: sudo bash install.sh [--reset] [--local archivio.tar.gz]
+# Uso: sudo bash install.sh [--reset | --tools-only] [--local archivio.tar.gz]
 # (set -Eeuo pipefail è in main: il file viene anche caricato dai test.)
 
 VPS_VERSION="__VERSION__"
@@ -112,6 +112,33 @@ ensure_release() {
   rm -rf "$old"
 }
 
+# run_failed TOOLS_ONLY SELF — messaggio quando run.sh fallisce, poi attende Invio
+# (la finestra tmux si chiude appena lo script termina).
+run_failed() {
+  echo
+  if (($1)); then
+    echo "Aggiornamento degli script (--tools-only) non riuscito. Dettagli: /var/log/vps-installer.log"
+  else
+    echo "Installazione interrotta. Dettagli: /var/log/vps-installer.log"
+    echo "Per riprendere: sudo bash $2"
+    echo "ATTENZIONE: $VPS_DEST/answers.env contiene segreti finché l'installazione non termina."
+  fi
+  read -r -p "Premi Invio per chiudere." _ || true
+}
+
+# tools_only_done — dopo --tools-only la cartella dell'installer non serve più,
+# a meno che contenga un'installazione completa non terminata (da riprendere).
+tools_only_done() {
+  if [[ -f "$VPS_DEST/answers.env" ]] \
+    || { [[ -f "$VPS_DEST/state" ]] && ! grep -qxF 99-finalize "$VPS_DEST/state"; }; then
+    echo "Lascio $VPS_DEST: contiene un'installazione completa non terminata (riprendila con sudo bash install.sh)."
+  else
+    rm -rf "$VPS_DEST"
+  fi
+  echo "Script di /opt/vps aggiornati. Per il pannello: sudo vps-panel-install (prima volta) o sudo vps-panel-update."
+  read -r -p "Premi Invio per chiudere." _ || true
+}
+
 main() {
   set -Eeuo pipefail
   local self orig_args=("$@") local_tar="" run_args=() tools_only=0
@@ -125,6 +152,11 @@ main() {
       *) echo "Opzione sconosciuta: $1" >&2; usage; exit 1 ;;
     esac
   done
+  if ((tools_only)) && [[ " ${run_args[*]} " == *" --reset "* ]]; then
+    echo "--reset e --tools-only non si usano insieme." >&2
+    usage
+    exit 1
+  fi
   if ((EUID != 0)); then
     echo "Esegui con: sudo bash $self" >&2
     exit 1
@@ -138,16 +170,11 @@ main() {
   ensure_release "$local_tar"
   export VPS_BOOTSTRAP="$self"
   bash "$VPS_DEST/run.sh" "${run_args[@]}" || {
-    echo
-    echo "Installazione interrotta. Dettagli: /var/log/vps-installer.log"
-    echo "Per riprendere: sudo bash $self"
-    echo "ATTENZIONE: $VPS_DEST/answers.env contiene segreti finché l'installazione non termina."
-    read -r -p "Premi Invio per chiudere." _ || true
+    run_failed "$tools_only" "$self"
     exit 1
   }
   if ((tools_only)); then
-    rm -rf "$VPS_DEST"
-    echo "Script di /opt/vps aggiornati. Per il pannello: sudo vps-panel-install (prima volta) o sudo vps-panel-update."
+    tools_only_done
   fi
 }
 
