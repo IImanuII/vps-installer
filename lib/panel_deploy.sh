@@ -28,7 +28,9 @@ pd_load() {
 }
 
 pd_git() {
-  GIT_SSH_COMMAND="ssh -i '$PD_KEY' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$PD_KNOWN_HOSTS'"     git --git-dir="$PD_GIT_DIR" --work-tree="$PANEL_ROOT"     -c safe.directory="$PANEL_ROOT" -c advice.detachedHead=false "$@"
+  GIT_SSH_COMMAND="ssh -i '$PD_KEY' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$PD_KNOWN_HOSTS'" \
+    git --git-dir="$PD_GIT_DIR" --work-tree="$PANEL_ROOT" \
+    -c safe.directory="$PANEL_ROOT" -c advice.detachedHead=false "$@"
 }
 
 # pd_repo_init — crea (se manca) la git dir fuori dalla radice e imposta origin.
@@ -83,30 +85,24 @@ pd_ver_gt() {
 }
 
 # pd_checkout TAG — codice al rilascio TAG; config/.env, logs/ e storage/ sono
-# ignorati da git e restano come sono. Solo i file tracciati e le loro cartelle
-# tornano a panel (chown -h, mai -R: non si segue nessun link simbolico).
+# ignorati da git e restano come sono. Tutto torna a panel.
+# chown -R -P -h sull'intera radice è la forma sicura: coreutils scende con
+# fchownat su descrittori di directory e non segue mai i link simbolici, mentre
+# un giro per percorso potrebbe essere eluso scambiando una cartella con un link.
 pd_checkout() {
-  local f d
   pd_git checkout -q -f "$1" || return 1
   [[ "${VPS_NO_CHOWN:-}" == 1 ]] && return 0
-  declare -A seen=()
-  while IFS= read -r -d '' f; do
-    chown -h panel:panel "$PANEL_ROOT/$f" || return 1
-    d="$(dirname "$f")"
-    while [[ "$d" != . && -z "${seen[$d]:-}" ]]; do
-      seen[$d]=1
-      chown -h panel:panel "$PANEL_ROOT/$d" || return 1
-      d="$(dirname "$d")"
-    done
-  done < <(pd_git ls-files -z)
+  chown -R -P -h panel:panel -- "$PANEL_ROOT" || return 1
 }
 
 # pd_env_merge TOKEN — APP_KEY solo se manca (cambiarla renderebbe illeggibili i
 # segreti cifrati), TELEGRAM_BOT_TOKEN se TOKEN non è vuoto.
 pd_env_merge() {
-  local lines=""
+  local lines="" key
   if [[ -z "$(env_get "$PD_ENV" APP_KEY)" ]]; then
-    lines+="APP_KEY=$(openssl rand -base64 32)"$'\n'
+    key="$(openssl rand -base64 32)" || return 1
+    [[ -n "$key" ]] || return 1
+    lines+="APP_KEY=$key"$'\n'
   fi
   if [[ -n "$1" ]]; then
     lines+="TELEGRAM_BOT_TOKEN=$1"$'\n'

@@ -126,9 +126,9 @@ setup() {
   ln -s /etc/passwd "$P/trappola"
   pd_checkout v1.1.0
   [ -L "$P/trappola" ]
-  # il blocco chown usa -h e non -R (nei test è saltato: VPS_NO_CHOWN=1)
-  grep -q 'chown -h' "$REPO_ROOT/lib/panel_deploy.sh"
-  ! grep -q 'chown -R\|own -R' "$REPO_ROOT/lib/panel_deploy.sh"
+  # il blocco chown è -R -P -h sull'intera radice, senza giro per percorso (nei test è saltato: VPS_NO_CHOWN=1)
+  grep -q 'chown -R -P -h' "$REPO_ROOT/lib/panel_deploy.sh"
+  ! grep -q 'ls-files' "$REPO_ROOT/lib/panel_deploy.sh"
 }
 
 @test "pd_key_ensure: cartella 700, rigenera .pub mancante" {
@@ -138,4 +138,12 @@ setup() {
   rm "$PD_KEY.pub"
   pd_key_ensure
   [ "$(cut -d' ' -f1,2 "$PD_KEY.pub")" = "$first" ]
+}
+
+@test "pd_env_merge: se openssl fallisce niente APP_KEY vuoto" {
+  make_stub openssl 'exit 1'
+  pd_load
+  run pd_env_merge ""
+  [ "$status" -ne 0 ]
+  ! grep -q '^APP_KEY=' "$PD_ENV"
 }
