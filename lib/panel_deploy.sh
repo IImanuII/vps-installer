@@ -1,7 +1,9 @@
 # shellcheck shell=bash
 # Installazione e aggiornamento di Plancia (vps-panel-install, vps-panel-update).
-# Git lavora in place nella radice del pannello, come root, con una deploy key
-# di sola lettura che l'utente panel non può leggere; i file restano di panel.
+# Git lavora come root con una deploy key di sola lettura che l'utente panel non
+# può leggere. La git dir sta FUORI dalla radice del pannello (PD_GIT_DIR,
+# root:root 700): il work tree è di panel, quindi hook e config di una .git
+# dentro la radice sarebbero codice di panel eseguito da root.
 # Ogni funzione può essere chiamata in un `if`: dove errexit non vale, ogni
 # comando che può fallire ha il suo `|| return 1`.
 
