@@ -455,6 +455,11 @@ site_job_create() {
     pass="$(cat "$SITES_RUN/$slug.pass" 2>/dev/null || true)"
     rm -f "$SITES_RUN/$slug.pass"
   fi
+  if [[ "$(site_reg_get "$d" .db)" == true && -z "$pass" ]]; then
+    site_reg_update "$d" '.state = "error"'
+    site_job "$d" create db "password del database mancante"
+    return 1
+  fi
   [[ "$type" != php ]] || steps+=(php)
   steps+=(cert nginx)
   [[ "$(site_reg_get "$d" .db)" != true ]] || steps+=(db)
@@ -476,14 +481,17 @@ site_job_create() {
 # site_archive DOMINIO — file e dump del sito in SITES_BACKUPS (root 600). Se
 # qualcosa non va non resta un archivio a metà e si restituisce errore.
 site_archive() {
-  local d="$1" slug base ok=1
+  local d="$1" slug base ok=1 rc=0
   slug="$(site_reg_get "$d" .slug)"
   base="$SITES_BACKUPS/$d-$(date +%Y%m%d-%H%M%S)"
   install -d -m 700 "$SITES_BACKUPS" || return 1
+  # tar esce 1 se un file cambia mentre lo legge (i log di un sito vivo
+  # crescono): l'archivio è buono. Solo 2 o più è un errore vero.
   (
     umask 077
-    tar -czf "$base.tar.gz" -C "$SITES_WWW" "$d"
-  ) >>"$VPS_LOG" 2>&1 || ok=0
+    tar --warning=no-file-changed -czf "$base.tar.gz" -C "$SITES_WWW" "$d"
+  ) >>"$VPS_LOG" 2>&1 || rc=$?
+  ((rc <= 1)) || ok=0
   if ((ok)) && [[ "$(site_reg_get "$d" .db)" == true ]]; then
     (
       umask 077
@@ -532,6 +540,8 @@ site_prune() {
 site_abort() {
   if [[ "$2" == create ]]; then
     site_reg_update "$1" '.state = "error"'
+    # la password del database non deve sopravvivere a un lavoro che non è partito
+    rm -f "$SITES_RUN/$(site_reg_get "$1" .slug).pass"
   else
     site_reg_update "$1" '.state = (.prev_state // "active")'
   fi
@@ -541,7 +551,7 @@ site_abort() {
 # site_run OP DOMINIO — il lavoro in background (unità systemd), uno alla volta
 # su tutta la macchina: gli altri aspettano il lucchetto fino a 10 minuti.
 site_run() {
-  local op="$1" d="$2" rc=0
+  local op="$1" d="$2" rc=0 state
   if ! valid_domain "$d" || ! site_reg_exists "$d"; then
     log "vps-site _run: sito sconosciuto: $d"
     return 1
@@ -554,6 +564,13 @@ site_run() {
   if ! flock -w "${SITES_LOCK_WAIT:-600}" 9; then
     exec 9>&-
     site_abort "$d" "$op" "la coda dei lavori è ferma da troppo tempo: riprova"
+    return 1
+  fi
+  # Un doppione o un _run fuori posto non deve disfare un sito che funziona.
+  state="$(site_reg_get "$d" .state)"
+  if [[ "$op" == create && "$state" != creating ]] || [[ "$op" == delete && "$state" != deleting ]]; then
+    exec 9>&-
+    log "vps-site _run: $d è in stato $state, $op ignorato"
     return 1
   fi
   if ! site_cf_token; then
@@ -579,18 +596,37 @@ site_run() {
 # potrebbe non esserci ancora. Il primo minuto non si guarda: tra la scrittura
 # del registro e l'avvio dell'unità passa qualche istante.
 site_refresh() {
-  local d="$1" state op ts slug
+  local d="$1" rc=0
+  [[ "$(site_reg_get "$d" .state)" == creating || "$(site_reg_get "$d" .state)" == deleting ]] || return 0
+  # Se il lucchetto globale è occupato un lavoro è in corso o in coda: non si
+  # tocca nulla. Evita di scambiare per morto un lavoro che sta finendo.
+  exec 8>"$SITES_LOCK" || return 0
+  if flock -n 8; then
+    site_refresh_locked "$d" || rc=$?
+  fi
+  exec 8>&-
+  return "$rc"
+}
+
+site_refresh_locked() {
+  local d="$1" state op ts slug step
   state="$(site_reg_get "$d" .state)"
   [[ "$state" == creating || "$state" == deleting ]] || return 0
   ts="$(site_reg_get "$d" '.job.ts // 0')"
   (($(date +%s) - ts > 60)) || return 0
   op="$(site_reg_get "$d" .job.op)"
   slug="$(site_reg_get "$d" .slug)"
+  step="$(site_reg_get "$d" .job.step)"
   if systemctl is-active --quiet "vps-site-$slug-$op.service"; then
     return 0
   fi
   if [[ "$state" == creating ]]; then
     site_abort "$d" create "operazione interrotta: elimina il sito per pulire i resti"
+  elif [[ "$step" == remove ]]; then
+    # l'archivio c'è già e la rimozione è a metà: tornare indietro porterebbe
+    # a riarchiviare una cartella che non esiste più. Errore: riprovare salta l'archivio.
+    site_reg_update "$d" '.state = "error"'
+    site_job "$d" delete remove "eliminazione interrotta: elimina di nuovo per pulire i resti"
   else
     site_abort "$d" delete "eliminazione interrotta: riprova"
   fi
@@ -608,5 +644,14 @@ site_list_json() {
   for f in "${files[@]}"; do
     site_refresh "$(basename "$f" .json)"
   done
+  # un lavoro può aver cancellato un registro nel frattempo
+  files=()
+  for f in "$SITES_DIR"/*.json; do
+    [[ -f "$f" ]] && files+=("$f")
+  done
+  if ((${#files[@]} == 0)); then
+    echo '[]'
+    return
+  fi
   jq -s 'sort_by(.domain)' "${files[@]}"
 }

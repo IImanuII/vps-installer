@@ -475,3 +475,72 @@ nuovo() { # DOMINIO TIPO WWW DB [PASSWORD]
   [ ! -e "$SITES_BACKUPS/vecchio.miosito.it-20260101-000000.tar.gz" ]
   [ -e "$SITES_BACKUPS/nuovo.miosito.it-20261011-000000.tar.gz" ]
 }
+
+# --- Fix round 1 ---
+
+@test "site_archive: tar che esce 1 (file cambiato) è un successo" {
+  nuovo blog.miosito.it static no no
+  site_run create blog.miosito.it
+  site_reg_update blog.miosito.it '.prev_state = .state | .state = "deleting"'
+  make_stub tar 'p=""; for a; do [ "$p" = -czf ] && echo x >"$a"; p=$a; done; exit 1'
+  site_run delete blog.miosito.it
+  run ! site_reg_exists blog.miosito.it
+  [ ! -e "$SITES_WWW/blog.miosito.it" ]
+}
+
+@test "site_refresh: eliminazione interrotta in remove va in errore, in archive torna com'era" {
+  nuovo blog.miosito.it static no no
+  site_reg_update blog.miosito.it '.state = "active" | .prev_state = .state | .state = "deleting" | .job.op = "delete" | .job.ts = 1 | .job.step = "remove"'
+  export STUB_RC_systemctl=3
+  site_refresh blog.miosito.it
+  [ "$(site_reg_get blog.miosito.it .state)" = error ]
+  [[ "$(site_reg_get blog.miosito.it .job.error)" == *"elimina di nuovo"* ]]
+  site_reg_update blog.miosito.it '.state = "deleting" | .prev_state = "active" | .job.step = "archive" | .job.ts = 1'
+  site_refresh blog.miosito.it
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+}
+
+@test "site_run: create su un sito attivo non tocca nulla" {
+  nuovo blog.miosito.it static no no
+  site_run create blog.miosito.it
+  : >"$BATS_TEST_TMPDIR/cf.log"
+  run site_run create blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  [ -d "$SITES_WWW/blog.miosito.it/public" ]
+  run grep -c DELETE "$BATS_TEST_TMPDIR/cf.log"
+  [ "$output" = 0 ]
+}
+
+@test "site_refresh: lucchetto occupato, un lavoro è vivo e non si tocca" {
+  nuovo blog.miosito.it static no no
+  site_reg_update blog.miosito.it '.job.ts = 1'
+  export STUB_RC_systemctl=3
+  flock "$SITES_LOCK" sleep 5 >/dev/null 2>&1 &
+  pid=$!
+  sleep 0.3
+  site_refresh blog.miosito.it
+  kill "$pid" 2>/dev/null || true
+  [ "$(site_reg_get blog.miosito.it .state)" = creating ]
+}
+
+@test "site_abort create cancella il file della password" {
+  nuovo blog.miosito.it static no yes 'Password-di-prova-123'
+  export SITES_LOCK_WAIT=1
+  flock "$SITES_LOCK" sleep 5 >/dev/null 2>&1 &
+  pid=$!
+  sleep 0.3
+  run site_run create blog.miosito.it
+  kill "$pid" 2>/dev/null || true
+  [ ! -e "$SITES_RUN/site_blog_miosito_it.pass" ]
+}
+
+@test "site_job_create: database senza password, errore prima di ogni passo" {
+  nuovo blog.miosito.it static no yes
+  run site_run create blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = error ]
+  [[ "$(site_reg_get blog.miosito.it .job.error)" == *"password del database mancante"* ]]
+  run ! grep -qs POST "$BATS_TEST_TMPDIR/cf.log"
+  run ! grep -qs certbot "$CALLS"
+}
