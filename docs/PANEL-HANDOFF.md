@@ -28,6 +28,7 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | Percorso | Proprietario / permessi | Contenuto |
 |---|---|---|
 | `/opt/vps/bin/` | `root:root` 755 | script wrapper (sez. 4) |
+| `/usr/local/sbin/vps-panel-install`, `/usr/local/sbin/vps-panel-update` | link simbolici di root | puntano a `/opt/vps/bin/`: così `sudo vps-panel-install` li trova (`/opt/vps/bin` non è nel `secure_path` di sudo) |
 | `/opt/vps/lib/` | `root:root` 755 / file 644 | librerie bash usate dagli script wrapper |
 | `/opt/vps/templates/` | `root:root` 755 / file 644 | template di configurazione usati dagli script wrapper |
 | `/opt/vps/manifest.json` | `root:panel` 640 | info non segrete (sez. 3) |

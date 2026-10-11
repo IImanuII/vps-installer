@@ -10,6 +10,7 @@ setup_common() {
   export VPS_STATE="$VPS_ROOT/state"
   export VPS_ANSWERS="$VPS_ROOT/answers.env"
   export VPS_TEMPLATES="$REPO_ROOT/templates"
+  export VPS_SBIN="$BATS_TEST_TMPDIR/sbin"
   export VPS_NO_CHOWN=1
   mkdir -p "$VPS_ROOT" "$VPS_OPT"
   local f
