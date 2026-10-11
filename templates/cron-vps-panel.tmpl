@@ -1,0 +1,4 @@
+# vps-installer: manutenzione notturna di Plancia (registri, tabelle di servizio)
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 3 * * * panel /usr/bin/php ${PANEL_ROOT}/app/cron/maintenance.php >/dev/null 2>&1

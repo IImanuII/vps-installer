@@ -128,3 +128,102 @@ pd_as_panel() {
     runuser -u panel -- "$@"
   fi
 }
+
+# pd_schema TAG — schema.sql del rilascio TAG, letto dagli oggetti git (root):
+# mai dalla radice del pannello, che è scrivibile da panel.
+pd_schema() {
+  local db
+  db="$(pd_db_name)" || return 1
+  (set -o pipefail; pd_git show "refs/tags/${1:?tag mancante}:install/schema.sql" | mariadb "$db") || return 1
+}
+
+# pd_migrations DA A — install/migrations/X.Y.Z.sql con DA < X.Y.Z ≤ A, in ordine,
+# lette dagli oggetti git del tag A (con o senza v).
+pd_migrations() {
+  local from="${1#v}" to="${2#v}" db f v names
+  db="$(pd_db_name)" || return 1
+  names="$(pd_git ls-tree --name-only "refs/tags/v$to" install/migrations/ 2>/dev/null)" || return 1
+  while IFS= read -r f; do
+    f="$(basename "$f")"
+    v="${f%.sql}"
+    [[ "$f" == "$v.sql" && "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+    if pd_ver_gt "$v" "$from" && ! pd_ver_gt "$v" "$to"; then
+      log "Plancia: migrazione $v"
+      (set -o pipefail; pd_git show "refs/tags/v$to:install/migrations/$f" | mariadb "$db") || return 1
+    fi
+  done < <(printf '%s\n' "$names" | sort -V)
+}
+
+# pd_dump TAG — dump gzip del database del pannello; stampa il percorso.
+pd_dump() {
+  local db f
+  db="$(pd_db_name)" || return 1
+  install -d -m 700 "$PD_BACKUPS" || return 1
+  f="$PD_BACKUPS/${1:-senza-tag}-$(date +%Y%m%d-%H%M%S).sql.gz"
+  (
+    set -o pipefail
+    umask 077
+    mariadb-dump --single-transaction --routines --events "$db" | gzip >"$f"
+  ) || { rm -f "$f"; return 1; }
+  find "$PD_BACKUPS" -maxdepth 1 -name '*.sql.gz' -printf '%T@ %p\n' | sort -rn | tail -n +6 \
+    | cut -d' ' -f2- | xargs -r rm -f --
+  printf '%s\n' "$f"
+}
+
+# pd_restore FILE — il database torna esattamente al dump (anche le tabelle create dopo spariscono).
+pd_restore() {
+  local db
+  db="$(pd_db_name)" || return 1
+  mariadb -e "DROP DATABASE IF EXISTS \`$db\`; CREATE DATABASE \`$db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" || return 1
+  (set -o pipefail; gunzip -c "$1" | mariadb "$db") || return 1
+}
+
+pd_reload_php() {
+  systemctl reload "php$PHP_VERSION-fpm" >>"$VPS_LOG" 2>&1 || return 1
+}
+
+pd_php_lint() {
+  find "$PANEL_ROOT/app" "$PANEL_ROOT/public" -name '*.php' -print0 2>/dev/null \
+    | xargs -0 -r -n 1 -P 4 "$PD_PHP" -l >>"$VPS_LOG" 2>&1 || return 1
+}
+
+# pd_health — /health del pannello in locale (Cloudflare e DNS non c'entrano).
+pd_health() {
+  local url="${PD_HEALTH_URL:-https://$PANEL_DOMAIN/health}"
+  local resolve="${PD_CURL_RESOLVE-$PANEL_DOMAIN:443:127.0.0.1}" body
+  for _ in 1 2 3; do
+    body="$(curl -skf --max-time 5 ${resolve:+--resolve "$resolve"} "$url" 2>/dev/null)" && [[ "$body" == OK ]] && return 0
+    sleep "${PD_HEALTH_SLEEP:-2}"
+  done
+  return 1
+}
+
+# pd_super_admin_exists — 0 sì, 1 no, 2 database o prefisso non leggibili.
+pd_super_admin_exists() {
+  local db prefix n
+  db="$(pd_db_name)" || return 2
+  prefix="$(env_get "$PD_ENV" DB_PREFIX)"
+  prefix="${prefix:-vp_}"
+  [[ "$prefix" =~ ^[a-z0-9_]{0,20}$ ]] || return 2
+  n="$(mariadb -N -B -e "SELECT COUNT(*) FROM \`${prefix}users\` WHERE role = 'super_admin'" "$db")" || return 2
+  [[ "$n" =~ ^[0-9]+$ ]] || return 2
+  ((n > 0)) || return 1
+}
+
+# pd_telegram_ok TOKEN — formato, poi getMe. Il token passa a curl su stdin
+# (file di configurazione), mai come argomento: gli argomenti si vedono in ps.
+pd_telegram_ok() {
+  [[ "$1" =~ ^[0-9]{5,15}:[A-Za-z0-9_-]{30,60}$ ]] || return 1
+  [[ "${PD_SKIP_TELEGRAM_CHECK:-0}" == 1 ]] && return 0
+  printf 'url = "https://api.telegram.org/bot%s/getMe"\n' "$1" \
+    | curl -sf --max-time 10 -K - 2>/dev/null | jq -e '.ok == true' >/dev/null 2>&1 || return 1
+}
+
+pd_cron_install() {
+  render_template "$VPS_TEMPLATES/cron-vps-panel.tmpl" "$PD_CRON" 644 root:root PANEL_ROOT
+}
+
+pd_manifest() {
+  manifest_set '.panel.version = $v | .panel.deployed_at = $t | .panel.repo = $r' \
+    --arg v "${1#v}" --arg t "$(date -Iseconds)" --arg r "$PANEL_REPO"
+}

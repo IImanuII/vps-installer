@@ -147,3 +147,129 @@ setup() {
   [ "$status" -ne 0 ]
   ! grep -q '^APP_KEY=' "$PD_ENV"
 }
+
+@test "pd_schema legge schema.sql dal tag, non dalla radice del pannello" {
+  pd_test_installed v1.0.0
+  echo '-- manomesso' >"$P/install/schema.sql"
+  pd_schema v1.0.0
+  grep -qx -- '-- schema' "$BATS_TEST_TMPDIR/mariadb.sql"
+  ! grep -q manomesso "$BATS_TEST_TMPDIR/mariadb.sql"
+  grep -qx panel "$BATS_TEST_TMPDIR/mariadb.args"
+}
+
+@test "pd_schema fallisce se il tag non esiste" {
+  pd_test_installed v1.0.0
+  run pd_schema v9.9.9
+  [ "$status" -eq 1 ]
+}
+
+@test "pd_migrations: solo l'intervallo (DA, A], in ordine di versione" {
+  printf -- '-- migrazione 1.2.0\n' >"$PD_WORK/install/migrations/1.2.0.sql"
+  printf -- '-- migrazione 1.0.0\n' >"$PD_WORK/install/migrations/1.0.0.sql"
+  printf 'non sql\n' >"$PD_WORK/install/migrations/note.txt"
+  pd_test_tag v1.10.0 install/migrations/1.10.0.sql '-- migrazione 1.10.0'
+  pd_test_tag v1.11.0
+  pd_test_installed v1.11.0
+  pd_migrations v1.0.0 v1.10.0
+  run cat "$BATS_TEST_TMPDIR/mariadb.sql"
+  [ "${lines[0]}" = "-- migrazione 1.1.0" ]
+  [ "${lines[1]}" = "-- migrazione 1.2.0" ]
+  [ "${lines[2]}" = "-- migrazione 1.10.0" ]
+  [ "${#lines[@]}" -eq 3 ]
+}
+
+@test "pd_migrations ignora i file manomessi nella radice del pannello" {
+  pd_test_installed v1.1.0
+  mkdir -p "$P/install/migrations"
+  echo '-- falsa 1.5.0' >"$P/install/migrations/1.5.0.sql"
+  echo '-- manomessa 1.1.0' >"$P/install/migrations/1.1.0.sql"
+  pd_migrations v1.0.0 v1.1.0
+  grep -qx -- '-- migrazione 1.1.0' "$BATS_TEST_TMPDIR/mariadb.sql"
+  ! grep -q -e falsa -e manomessa "$BATS_TEST_TMPDIR/mariadb.sql"
+}
+
+@test "pd_migrations si ferma alla prima che fallisce" {
+  pd_test_installed v1.1.0
+  MARIADB_RC=1 run pd_migrations v1.0.0 v1.1.0
+  [ "$status" -eq 1 ]
+}
+
+@test "pd_dump scrive un gzip 600 e tiene gli ultimi 5" {
+  pd_test_installed v1.0.0
+  mkdir -p "$PD_BACKUPS"
+  for i in 1 2 3 4 5 6; do
+    : >"$PD_BACKUPS/vecchio-$i.sql.gz"
+    touch -d "2020-01-0$i" "$PD_BACKUPS/vecchio-$i.sql.gz"
+  done
+  f="$(pd_dump v1.0.0)"
+  [ -f "$f" ]
+  [[ "$(basename "$f")" == v1.0.0-*.sql.gz ]]
+  [ "$(stat -c %a "$f")" = 600 ]
+  [ "$(stat -c %a "$PD_BACKUPS")" = 700 ]
+  gunzip -c "$f" | grep -q -- '-- dump'
+  [ "$(find "$PD_BACKUPS" -name '*.sql.gz' | wc -l)" -eq 5 ]
+  [ ! -f "$PD_BACKUPS/vecchio-1.sql.gz" ]
+  [ ! -f "$PD_BACKUPS/vecchio-2.sql.gz" ]
+}
+
+@test "pd_restore ricrea il database e carica il dump" {
+  pd_test_installed v1.0.0
+  printf -- '-- contenuto\n' | gzip >"$BATS_TEST_TMPDIR/d.sql.gz"
+  pd_restore "$BATS_TEST_TMPDIR/d.sql.gz"
+  grep -q 'DROP DATABASE IF EXISTS `panel`' "$BATS_TEST_TMPDIR/mariadb.args"
+  grep -qx -- '-- contenuto' "$BATS_TEST_TMPDIR/mariadb.sql"
+}
+
+@test "pd_health: OK passa, altrimenti tre tentativi e fallisce" {
+  pd_load
+  pd_health
+  rm -f "$BATS_TEST_TMPDIR/curl.calls"
+  CURL_RC=22 run pd_health
+  [ "$status" -eq 1 ]
+  [ "$(wc -l <"$BATS_TEST_TMPDIR/curl.calls")" -eq 3 ]
+  CURL_OUT=NO run pd_health
+  [ "$status" -eq 1 ]
+}
+
+@test "pd_php_lint fallisce se un file non compila" {
+  pd_test_installed v1.0.0
+  pd_php_lint
+  PHP_LINT_RC=255 run pd_php_lint
+  [ "$status" -ne 0 ]
+}
+
+@test "pd_super_admin_exists: sì, no, prefisso non valido" {
+  pd_load
+  MARIADB_OUT=1 pd_super_admin_exists
+  MARIADB_OUT=0 run pd_super_admin_exists
+  [ "$status" -eq 1 ]
+  grep -q 'vp_users' "$BATS_TEST_TMPDIR/mariadb.args"
+  printf 'DB_PREFIX=x`;\n' >>"$PD_ENV"
+  run pd_super_admin_exists
+  [ "$status" -eq 2 ]
+}
+
+@test "pd_telegram_ok rifiuta un formato sbagliato senza chiamare Telegram" {
+  PD_SKIP_TELEGRAM_CHECK=0 run pd_telegram_ok "corto"
+  [ "$status" -eq 1 ]
+  [ ! -f "$BATS_TEST_TMPDIR/curl.calls" ]
+}
+
+@test "pd_telegram_ok: il token non finisce negli argomenti di curl" {
+  make_stub curl 'printf "%s\n" "$*" >"$BATS_TEST_TMPDIR/curl.argv"; cat >"$BATS_TEST_TMPDIR/curl.stdin"; echo "{\"ok\":true}"'
+  PD_SKIP_TELEGRAM_CHECK=0 pd_telegram_ok "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  ! grep -q AAAAAAAA "$BATS_TEST_TMPDIR/curl.argv"
+  grep -q 'bot123456:AAAAAAAA' "$BATS_TEST_TMPDIR/curl.stdin"
+}
+
+@test "pd_cron_install e pd_manifest" {
+  pd_load
+  pd_cron_install
+  grep -q "^0 3 \* \* \* panel /usr/bin/php $P/app/cron/maintenance.php" "$PD_CRON"
+  [ "$(stat -c %a "$PD_CRON")" = 644 ]
+  pd_manifest v2.1.0
+  [ "$(jq -r .panel.version "$VPS_OPT/manifest.json")" = 2.1.0 ]
+  [ "$(jq -r .panel.repo "$VPS_OPT/manifest.json")" = "$PANEL_REPO" ]
+  [ "$(jq -r .panel.deployed_at "$VPS_OPT/manifest.json")" != null ]
+  [ "$(jq -r .panel.domain "$VPS_OPT/manifest.json")" = panel.test ]
+}
