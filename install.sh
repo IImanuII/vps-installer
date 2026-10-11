@@ -112,8 +112,22 @@ ensure_release() {
   rm -rf "$old"
 }
 
-# run_failed TOOLS_ONLY SELF — messaggio quando run.sh fallisce, poi attende Invio
-# (la finestra tmux si chiude appena lo script termina).
+# start_mode TOOLS_ONLY — come partire fuori da tmux: "tmux" per l'installazione
+# completa (sopravvive a una connessione caduta), "direct" per --tools-only (pochi
+# secondi, nessuna domanda: funziona anche con ssh host 'sudo bash install.sh
+# --tools-only'), "noterm" se l'installazione completa non ha un terminale.
+start_mode() {
+  if (($1)); then
+    echo direct
+  elif [[ -t 0 && -t 1 ]]; then
+    echo tmux
+  else
+    echo noterm
+  fi
+}
+
+# run_failed TOOLS_ONLY SELF — messaggio quando run.sh fallisce; l'installazione
+# completa poi attende Invio (la finestra tmux si chiude appena lo script termina).
 run_failed() {
   echo
   if (($1)); then
@@ -122,12 +136,13 @@ run_failed() {
     echo "Installazione interrotta. Dettagli: /var/log/vps-installer.log"
     echo "Per riprendere: sudo bash $2"
     echo "ATTENZIONE: $VPS_DEST/answers.env contiene segreti finché l'installazione non termina."
+    read -r -p "Premi Invio per chiudere." _ || true
   fi
-  read -r -p "Premi Invio per chiudere." _ || true
 }
 
 # tools_only_done — dopo --tools-only la cartella dell'installer non serve più,
 # a meno che contenga un'installazione completa non terminata (da riprendere).
+# Niente "Premi Invio": --tools-only non gira in tmux.
 tools_only_done() {
   if [[ -f "$VPS_DEST/answers.env" ]] \
     || { [[ -f "$VPS_DEST/state" ]] && ! grep -qxF 99-finalize "$VPS_DEST/state"; }; then
@@ -136,7 +151,6 @@ tools_only_done() {
     rm -rf "$VPS_DEST"
   fi
   echo "Script di /opt/vps aggiornati. Per il pannello: sudo vps-panel-install (prima volta) o sudo vps-panel-update."
-  read -r -p "Premi Invio per chiudere." _ || true
 }
 
 main() {
@@ -162,10 +176,19 @@ main() {
     exit 1
   fi
   if [[ -z "${TMUX:-}" ]]; then
-    bootstrap_deps
-    echo "Avvio dentro tmux. Se la connessione cade: sudo tmux attach -t vps-installer"
-    sleep 2
-    exec tmux new-session -A -s vps-installer bash "$self" "${orig_args[@]}"
+    case "$(start_mode "$tools_only")" in
+      noterm)
+        echo "L'installazione fa domande e vuole un terminale: collegati con ssh e rilancia sudo bash $self" >&2
+        exit 1
+        ;;
+      tmux)
+        bootstrap_deps
+        echo "Avvio dentro tmux. Se la connessione cade: sudo tmux attach -t vps-installer"
+        sleep 2
+        exec tmux new-session -A -s vps-installer bash "$self" "${orig_args[@]}"
+        ;;
+      direct) bootstrap_deps ;;
+    esac
   fi
   ensure_release "$local_tar"
   export VPS_BOOTSTRAP="$self"

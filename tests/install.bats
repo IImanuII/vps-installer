@@ -150,15 +150,40 @@ local_id() {
   [[ "$output" == *"--reset"*"--tools-only"* ]]
 }
 
-@test "tools_only_done: cancella la cartella dell'installer e aspetta Invio" {
+@test "tools_only_done: cancella la cartella dell'installer, niente Invio" {
   mkdir -p "$VPS_DEST"
   echo x >"$VPS_DEST/run.sh"
   run tools_only_done </dev/null
   [ "$status" -eq 0 ]
   [ ! -e "$VPS_DEST" ]
   [[ "$output" == *"Script di /opt/vps aggiornati"* ]]
-  # read -p non stampa il prompt senza terminale: si controlla che ci sia
-  declare -f tools_only_done | grep -q "read -r -p .Premi Invio"
+  # read -p non stampa il prompt senza terminale: si controlla che manchi
+  ! declare -f tools_only_done | grep -q "read "
+}
+
+@test "start_mode: --tools-only parte diretto anche senza terminale" {
+  run start_mode 1 </dev/null
+  [ "$output" = direct ]
+}
+
+@test "start_mode: installazione completa senza terminale" {
+  run start_mode 0 </dev/null
+  [ "$output" = noterm ]
+}
+
+@test "start_mode: installazione completa con terminale va in tmux" {
+  command -v script >/dev/null || skip "script(1) assente"
+  run script -qec "bash -c 'source \"$BATS_TEST_DIRNAME/../install.sh\"; start_mode 0'" /dev/null
+  [[ "$output" == *tmux* ]]
+}
+
+@test "main senza terminale: niente tmux, errore chiaro (solo come root)" {
+  ((EUID == 0)) || skip "main controlla di essere root"
+  make_stub tmux 'echo TMUX_CHIAMATO'
+  run main </dev/null
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"vuole un terminale"* ]]
+  [[ "$output" != *TMUX_CHIAMATO* ]]
 }
 
 @test "tools_only_done: un'installazione completa non terminata resta dov'è" {
@@ -185,6 +210,7 @@ local_id() {
   [[ "$output" != *"answers.env"* ]]
   [[ "$output" != *"riprendere"* ]]
   [[ "$output" == *"--tools-only"* ]]
+  ! declare -f run_failed | sed -n '/if ((\$1))/,/else/p' | grep -q "read "
   run run_failed 0 /root/install.sh </dev/null
   [[ "$output" == *"answers.env"* ]]
   [[ "$output" == *"riprendere"* ]]
