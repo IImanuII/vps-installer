@@ -14,6 +14,7 @@ setup() {
   jq -n '{installer_version:"1.0.3", admin_user:"manu", panel:{domain:"p.test", path:"/var/www/p.test", version:"2.1.0"}}' >"$VPS_OPT/manifest.json"
   opt_tools_only
   [ -x "$VPS_OPT/bin/vps-panel-install" ]
+  [ -x "$VPS_OPT/bin/vps-panel-update" ]
   [ -f "$VPS_OPT/lib/panel_deploy.sh" ]
   [ -f "$VPS_OPT/templates/github-known-hosts" ]
   [ "$(jq -r .installer_version "$VPS_OPT/manifest.json")" = "$VPS_INSTALLER_VERSION" ]

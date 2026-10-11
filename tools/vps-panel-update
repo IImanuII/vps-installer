@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# vps-panel-update [--ref vX.Y.Z] — porta Plancia all'ultimo rilascio (o a uno preciso).
+# Prima un dump del database; se un passo fallisce torna alla versione di prima,
+# codice e database. Uscita: 0 ok o già aggiornata, 1 errore (versione di prima
+# ripristinata o nessuna modifica), 2 ritorno indietro fallito.
+# Sotto sudo l'ambiente del chiamante non deve influenzare lo script.
+if [[ -n "${SUDO_USER:-}" ]]; then
+  VPS_OPT=/opt/vps
+  VPS_LIB=$VPS_OPT/lib
+  VPS_TEMPLATES=$VPS_OPT/templates
+  VPS_LOG=/var/log/vps-tools.log
+  unset PANEL_REPO PD_REPO_WEB PD_KEY PD_GIT_DIR PD_KNOWN_HOSTS PD_BACKUPS PD_CRON PD_LOCK PD_PHP PD_AS_PANEL \
+    PD_HEALTH_URL PD_CURL_RESOLVE PD_HEALTH_SLEEP PD_SKIP_TELEGRAM_CHECK PD_TEST VPS_NO_CHOWN
+  [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
+  chmod 640 "$VPS_LOG"
+fi
+: "${VPS_OPT:=/opt/vps}" "${VPS_LOG:=/var/log/vps-tools.log}"
+: "${VPS_TEMPLATES:=$VPS_OPT/templates}"
+for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
+  # shellcheck source=/dev/null
+  source "$_lib"
+done
+
+say() {
+  printf '%s\n' "$*"
+  log "$*" 2>/dev/null
+}
+
+STAGE=""
+TOUCHED_DB=0
+
+# apply CUR TARGET — ogni passo imposta STAGE; ritorna 1 al primo che fallisce.
+apply() {
+  STAGE="checkout di $2"
+  pd_checkout "$2" || return 1
+  if pd_ver_gt "${2#v}" "${1#v}"; then
+    STAGE="schema.sql"
+    TOUCHED_DB=1
+    pd_schema "$2" || return 1
+    STAGE="migrazioni"
+    pd_migrations "$1" "$2" || return 1
+  else
+    say "ATTENZIONE: $2 è più vecchia di $1: cambio solo il codice, lo schema del database resta quello di $1."
+  fi
+  STAGE="controllo della sintassi PHP"
+  pd_php_lint || return 1
+  STAGE="reload di PHP-FPM"
+  pd_reload_php || return 1
+  STAGE="/health"
+  pd_health || return 1
+}
+
+main() {
+  local ref="" cur target dump ver ok=1
+  enable_error_trap
+  while (($#)); do
+    case "$1" in
+      --ref) [[ -n "${2:-}" ]] || die "--ref vuole un rilascio vX.Y.Z"; ref="$2"; shift 2 ;;
+      -h | --help) echo "Uso: sudo vps-panel-update [--ref vX.Y.Z]"; exit 0 ;;
+      *) die "Opzione sconosciuta: $1" ;;
+    esac
+  done
+  ((EUID == 0)) || [[ "${PD_TEST:-}" == 1 ]] || die "Esegui con: sudo vps-panel-update"
+  pd_load
+  exec 9>"$PD_LOCK" || die "Lock $PD_LOCK non apribile"
+  flock -n 9 || die "Un altro aggiornamento è in corso"
+  ver="$(jq -r '.panel.version // empty' "$(manifest_path)")" || die "Manifest non leggibile"
+  [[ -n "$ver" ]] || die "Plancia non è installata: usa sudo vps-panel-install"
+  if [[ -e "$PD_GIT_DIR" || -L "$PD_GIT_DIR" ]]; then
+    pd_repo_ok || die "repository git non sicuro: $PD_GIT_DIR (deve essere una cartella di root, non scrivibile da altri)"
+  else
+    die "Plancia non è installata (manca $PD_GIT_DIR): usa sudo vps-panel-install"
+  fi
+
+  pd_git fetch -q --tags origin 2>>"$VPS_LOG" || die "Download dei rilasci non riuscito"
+  cur="$(pd_current_tag)" || die "Versione attuale non leggibile"
+  [[ "$cur" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Il checkout attuale non è un rilascio vX.Y.Z: sistemalo a mano"
+  if [[ -n "$ref" ]]; then
+    [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--ref deve essere nella forma vX.Y.Z"
+    pd_git rev-parse -q --verify "refs/tags/$ref" >/dev/null || die "Il rilascio $ref non esiste"
+    target="$ref"
+  else
+    target="$(pd_latest_tag)" || die "Elenco dei rilasci non leggibile"
+    [[ -n "$target" ]] || die "Nessun rilascio vX.Y.Z nel repository"
+  fi
+  if [[ "$target" == "$cur" ]]; then
+    say "Già aggiornata ($cur)."
+    exit 0
+  fi
+
+  dump="$(pd_dump "$cur")" || die "Backup del database non riuscito: nessuna modifica fatta"
+  say "Plancia: $cur → $target (backup: $dump)"
+  if ! apply "$cur" "$target"; then
+    log "Aggiornamento a $target fallito durante: $STAGE. Torno a $cur."
+    pd_checkout "$cur" || ok=0
+    if ((TOUCHED_DB)); then
+      pd_restore "$dump" || ok=0
+    fi
+    pd_reload_php || ok=0
+    if ((ok)); then
+      die "Aggiornamento a $target fallito ($STAGE): ripristinata $cur. Backup del database: $dump"
+    fi
+    log "ERRORE: aggiornamento a $target fallito ($STAGE) e ritorno a $cur NON riuscito. Backup del database: $dump"
+    exit 2
+  fi
+  pd_manifest "$target" || die "Manifest non aggiornato: il codice è già a $target (backup del database: $dump)"
+  say "Plancia aggiornata: $cur → $target"
+}
+
+main "$@"
