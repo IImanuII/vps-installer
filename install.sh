@@ -13,7 +13,7 @@ usage() {
   cat <<'EOF'
 Uso: sudo bash install.sh [opzioni]
   --reset           ricomincia dalla procedura guidata
-  --tools-only      aggiorna solo gli script di /opt/vps (VPS già installata)
+  --tools-only      aggiorna solo gli script di /opt/vps (VPS giÃ  installata)
   --local FILE      usa un archivio locale invece di scaricarlo
   -h, --help        mostra questo aiuto
 Se la connessione cade: ricollegati e lancia  sudo tmux attach -t vps-installer
