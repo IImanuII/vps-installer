@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# vps-panel-install — prima installazione di Plancia nella radice del pannello.
+# Interattivo: lo lancia l'amministratore con sudo, non il pannello. Si può
+# rilanciare dopo un'interruzione: ogni passo salta ciò che è già fatto.
+# Sotto sudo l'ambiente del chiamante non deve influenzare lo script.
+if [[ -n "${SUDO_USER:-}" ]]; then
+  VPS_OPT=/opt/vps
+  VPS_LIB=$VPS_OPT/lib
+  VPS_TEMPLATES=$VPS_OPT/templates
+  VPS_LOG=/var/log/vps-tools.log
+  unset PANEL_REPO PD_REPO_WEB PD_KEY PD_GIT_DIR PD_KNOWN_HOSTS PD_BACKUPS PD_CRON PD_LOCK PD_PHP PD_AS_PANEL \
+    PD_HEALTH_URL PD_CURL_RESOLVE PD_HEALTH_SLEEP PD_SKIP_TELEGRAM_CHECK PD_TEST VPS_NO_CHOWN
+  [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
+  chmod 640 "$VPS_LOG"
+fi
+: "${VPS_OPT:=/opt/vps}" "${VPS_LOG:=/var/log/vps-tools.log}"
+: "${VPS_TEMPLATES:=$VPS_OPT/templates}"
+for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
+  # shellcheck source=/dev/null
+  source "$_lib"
+done
+
+say() {
+  printf '%s\n' "$*"
+  log "$*" 2>/dev/null
+}
+
+# ask VAR PROMPT [silent] — una riga da stdin; EOF = uscita con errore.
+ask() {
+  local __v
+  if [[ "${3:-}" == silent ]]; then
+    IFS= read -r -s -p "$2" __v || { echo; die "Input interrotto"; }
+    echo
+  else
+    IFS= read -r -p "$2" __v || die "Input interrotto"
+  fi
+  printf -v "$1" '%s' "$(trim "$__v")"
+}
+
+install_key() {
+  # shellcheck disable=SC2034 # invio riceve la riga, il valore non serve
+  local n invio
+  pd_key_ensure || die "Deploy key non creata"
+  if pd_git ls-remote "$PANEL_REPO" >/dev/null 2>>"$VPS_LOG"; then
+    return 0
+  fi
+  for n in 1 2 3 4 5; do
+    cat <<EOT
+
+Aggiungi questa deploy key al repository, SENZA "Allow write access":
+  $PD_REPO_WEB/settings/keys/new
+  Titolo: $(hostname)
+  Chiave: $(cat "$PD_KEY.pub")
+
+EOT
+    ask invio "Premi Invio quando l'hai aggiunta... "
+    if pd_git ls-remote "$PANEL_REPO" >/dev/null 2>>"$VPS_LOG"; then
+      return 0
+    fi
+    say "GitHub non accetta ancora la chiave (tentativo $n di 5)."
+  done
+  die "Deploy key non accettata: rilancia sudo vps-panel-install dopo averla aggiunta"
+}
+
+install_token() {
+  local n t
+  TOKEN=""
+  [[ -z "$(env_get "$PD_ENV" TELEGRAM_BOT_TOKEN)" ]] || return 0
+  for n in 1 2 3; do
+    ask t "Token del bot Telegram (da @BotFather): " silent
+    if pd_telegram_ok "$t"; then
+      TOKEN="$t"
+      return 0
+    fi
+    say "Token non valido o rifiutato da Telegram (tentativo $n di 3)."
+  done
+  die "Token Telegram non valido"
+}
+
+# La git dir sta fuori dalla radice del pannello (PD_GIT_DIR, di root): se esiste
+# già deve essere sicura prima che root ci lavori.
+install_code() {
+  if [[ -e "$PD_GIT_DIR" || -L "$PD_GIT_DIR" ]]; then
+    pd_repo_ok || die "repository git non sicuro: $PD_GIT_DIR (deve essere una cartella di root, non scrivibile da altri)"
+  fi
+  pd_repo_init || die "Repository git non inizializzato in $PD_GIT_DIR"
+  pd_git fetch -q --tags origin 2>>"$VPS_LOG" || die "Download del codice non riuscito"
+  TAG="$(pd_latest_tag)"
+  [[ -n "$TAG" ]] || die "Nessun rilascio vX.Y.Z nel repository"
+  say "Plancia: scarico $TAG"
+  pd_checkout "$TAG" || die "Checkout di $TAG non riuscito"
+  rm -f "$PANEL_ROOT/public/index.html"
+}
+
+install_admin() {
+  local rc=0 n u id p p2 cli="$PANEL_ROOT/app/cli/create-admin.php"
+  pd_super_admin_exists || rc=$?
+  if ((rc == 0)); then
+    say "Super admin già presente: salto."
+    return 0
+  fi
+  ((rc == 1)) || die "Non riesco a leggere gli utenti dal database"
+  for n in 1 2 3 4 5; do
+    ask u "Username del super_admin: "
+    ask id "Il tuo id Telegram (numerico, lo dice @userinfobot): "
+    ask p "Password (almeno 12 caratteri, maiuscola, cifra, carattere speciale): " silent
+    ask p2 "Ripeti la password: " silent
+    if [[ "$p" != "$p2" ]]; then
+      say "Le password non coincidono (tentativo $n di 5)."
+      continue
+    fi
+    if printf '%s\n' "$p" | pd_as_panel "$PD_PHP" "$cli" --dry-run --username="$u" --telegram-id="$id"; then
+      printf '%s\n' "$p" | pd_as_panel "$PD_PHP" "$cli" --username="$u" --telegram-id="$id" \
+        || die "Super admin non creato"
+      return 0
+    fi
+    say "Dati non validi (tentativo $n di 5)."
+  done
+  die "Super admin non creato: troppi tentativi"
+}
+
+main() {
+  local c v
+  enable_error_trap
+  case "${1:-}" in
+    -h | --help) echo "Uso: sudo vps-panel-install   (prima installazione di Plancia)"; exit 0 ;;
+    "") ;;
+    *) die "Opzione sconosciuta: $1" ;;
+  esac
+  ((EUID == 0)) || [[ "${PD_TEST:-}" == 1 ]] || die "Esegui con: sudo vps-panel-install"
+  pd_load
+  for c in git curl jq mariadb mariadb-dump ssh-keygen "$PD_PHP"; do
+    command -v "$c" >/dev/null 2>&1 || die "Manca il comando $c"
+  done
+  v="$(jq -r '.panel.version // empty' "$(manifest_path)")"
+  [[ -z "$v" ]] || die "Plancia è già installata (v$v): usa sudo vps-panel-update"
+
+  install_key
+  install_token
+  install_code
+  pd_env_merge "$TOKEN" || die ".env non aggiornato"
+  TOKEN=""
+  pd_schema "$TAG" || die "Schema del database non applicato"
+  install_admin
+  pd_cron_install
+  pd_reload_php || die "Reload di PHP-FPM non riuscito"
+  pd_health || die "Il pannello non risponde su /health: guarda $PANEL_ROOT/logs/ e $VPS_LOG"
+  pd_manifest "$TAG"
+  say "Plancia $TAG installata: https://$PANEL_DOMAIN/login"
+}
+
+main "$@"
