@@ -60,4 +60,5 @@ vuole un terminale.
   l'archivio e il comando con l'hash.
 - Spec: [`docs/specs/2026-10-07-vps-installer-design.md`](docs/specs/2026-10-07-vps-installer-design.md)
 - End-to-end del pannello (WSL, root): `sudo bash tests/e2e/panel-e2e.sh <percorso vps-panel>`.
+- End-to-end dei siti (WSL, root): `sudo bash tests/e2e/site-e2e.sh`.
 - Spec v1.1: [docs/specs/2026-10-11-vps-installer-v1.1-design.md](docs/specs/2026-10-11-vps-installer-v1.1-design.md)
