@@ -166,3 +166,67 @@ setup() {
   [ "$status" -eq 1 ]
   [[ "$(cat "$SITE_ERROR_FILE")" == *"Let's Encrypt"* ]]
 }
+
+@test "site_user_add: utente di sistema, admin nel gruppo, cartelle, ACL, segnaposto" {
+  site_reg_new blog.miosito.it php no no
+  site_user_add blog.miosito.it
+  r="$SITES_WWW/blog.miosito.it"
+  grep -q '^groupadd --system site_blog_miosito_it' "$CALLS"
+  grep -q "^useradd --system --gid site_blog_miosito_it --home-dir $r --no-create-home --shell /usr/sbin/nologin site_blog_miosito_it" "$CALLS"
+  grep -q '^gpasswd -a manu site_blog_miosito_it' "$CALLS"
+  [ "$(stat -c %a "$r")" = 2750 ]
+  [ "$(stat -c %a "$r/logs")" = 2750 ]
+  [ "$(stat -c %a "$r/public")" = 2770 ]
+  [ "$(stat -c %a "$r/tmp")" = 2770 ]
+  grep -q "^setfacl -m u:www-data:x $r\$" "$CALLS"
+  grep -q "^setfacl -m u:www-data:rX -m d:u:www-data:rX $r/public" "$CALLS"
+  grep -q "^setfacl -m d:g::rwX $r/public $r/tmp" "$CALLS"
+  grep -q '<h1>blog.miosito.it</h1>' "$r/public/index.html"
+}
+
+@test "site_user_remove toglie utente, gruppo e radice; rifiuta uno slug estraneo" {
+  site_reg_new blog.miosito.it php no no
+  site_user_add blog.miosito.it
+  make_stub id 'exit 0'
+  make_stub getent 'exit 0'
+  hash -r  # bash ricorda il percorso di id/getent già usati: senza, lo stub non vale
+  site_user_remove blog.miosito.it
+  grep -q '^userdel site_blog_miosito_it' "$CALLS"
+  grep -q '^groupdel site_blog_miosito_it' "$CALLS"
+  [ ! -e "$SITES_WWW/blog.miosito.it" ]
+
+  site_reg_new altro.miosito.it php no no
+  site_reg_update altro.miosito.it '.slug = "root"'
+  run site_user_remove altro.miosito.it
+  [ "$status" -eq 1 ]
+}
+
+@test "site_pool_add scrive il pool del sito e ricarica PHP-FPM" {
+  site_reg_new blog.miosito.it php no no
+  site_pool_add blog.miosito.it
+  f="$PHP_POOL_D/site_blog_miosito_it.conf"
+  grep -qx '\[site_blog_miosito_it\]' "$f"
+  grep -qx "listen = /run/php/php$PHP_VERSION-fpm-site_blog_miosito_it.sock" "$f"
+  grep -qx "php_admin_value\[open_basedir\] = $SITES_WWW/blog.miosito.it/" "$f"
+  grep -q "^systemctl reload php$PHP_VERSION-fpm" "$CALLS"
+}
+
+@test "site_pool_add: configurazione rifiutata da php-fpm -t non resta" {
+  site_reg_new blog.miosito.it php no no
+  export "STUB_RC_php_fpm${PHP_VERSION//./_}=1" SITE_ERROR_FILE="$BATS_TEST_TMPDIR/err"
+  run site_pool_add blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ ! -e "$PHP_POOL_D/site_blog_miosito_it.conf" ]
+  [[ "$(cat "$SITE_ERROR_FILE")" == *"PHP-FPM"* ]]
+}
+
+@test "site_logrotate_add: settimanale, 8 copie, come utente del sito" {
+  site_reg_new blog.miosito.it php no no
+  site_logrotate_add blog.miosito.it
+  f="$LOGROTATE_D/vps-site-site_blog_miosito_it"
+  grep -q "^$SITES_WWW/blog.miosito.it/logs/\*.log {" "$f"
+  grep -qx '    rotate 8' "$f"
+  grep -qx '    su site_blog_miosito_it site_blog_miosito_it' "$f"
+  site_logrotate_remove blog.miosito.it
+  [ ! -e "$f" ]
+}

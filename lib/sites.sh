@@ -202,3 +202,84 @@ site_cert_issue() {
 site_cert_remove() {
   certbot delete -n --cert-name "$1" >>"$VPS_LOG" 2>&1 || true
 }
+
+# site_user_add DOMINIO — utente e gruppo del sito, cartelle e ACL.
+# L'admin entra nel gruppo (scrive via SFTP con il proprio utente); www-data no:
+# attraversa la radice e legge solo public/, grazie alle ACL.
+site_user_add() {
+  local d="$1" slug root admin
+  slug="$(site_reg_get "$d" .slug)"
+  root="$(site_root "$d")"
+  getent group "$slug" >/dev/null 2>&1 || groupadd --system "$slug" || return 1
+  id -u "$slug" >/dev/null 2>&1 \
+    || useradd --system --gid "$slug" --home-dir "$root" --no-create-home --shell /usr/sbin/nologin "$slug" \
+    || return 1
+  admin="$(jq -r '.admin_user // empty' "$(manifest_path)")"
+  if [[ -n "$admin" ]]; then
+    gpasswd -a "$admin" "$slug" >/dev/null || return 1
+  fi
+  install -d -m 2750 "$root" "$root/logs" || return 1
+  install -d -m 2770 "$root/public" "$root/tmp" || return 1
+  own "$slug:$slug" "$root" "$root/logs" "$root/public" "$root/tmp" || return 1
+  setfacl -m u:www-data:x "$root" || return 1
+  setfacl -m u:www-data:rX -m d:u:www-data:rX "$root/public" || return 1
+  # I file creati da PHP restano modificabili dall'admin e viceversa.
+  setfacl -m d:g::rwX "$root/public" "$root/tmp" || return 1
+  # shellcheck disable=SC2016
+  SITE_DOMAIN="$d" envsubst '${SITE_DOMAIN}' <"$VPS_TEMPLATES/site-placeholder.html.tmpl" \
+    | write_file "$root/public/index.html" 664 "$slug:$slug"
+}
+
+# site_user_remove DOMINIO — utente, gruppo e radice; ciò che manca già si salta.
+site_user_remove() {
+  local d="$1" slug root
+  slug="$(site_reg_get "$d" .slug)"
+  root="$(site_root "$d")"
+  # Mai un rm -rf su un percorso che non sia la radice di un sito di vps-site.
+  [[ -n "$d" && "$slug" == site_* && "$root" == "$SITES_WWW/$d" ]] || return 1
+  if id -u "$slug" >/dev/null 2>&1; then
+    userdel "$slug" >>"$VPS_LOG" 2>&1 || return 1
+  fi
+  if getent group "$slug" >/dev/null 2>&1; then
+    groupdel "$slug" >>"$VPS_LOG" 2>&1 || return 1
+  fi
+  rm -rf --one-file-system -- "$root"
+}
+
+site_pool_file() {
+  printf '%s/%s.conf' "$PHP_POOL_D" "$(site_reg_get "$1" .slug)"
+}
+
+# site_pool_add DOMINIO — pool PHP-FPM del sito (utente del sito, open_basedir sulla radice).
+site_pool_add() {
+  local d="$1" f
+  f="$(site_pool_file "$d")"
+  SITE_DOMAIN="$d" SITE_SLUG="$(site_reg_get "$d" .slug)" SITE_ROOT="$(site_root "$d")" \
+    render_template "$VPS_TEMPLATES/php-pool-site.conf.tmpl" "$f" 644 root:root \
+    SITE_DOMAIN SITE_SLUG SITE_ROOT PHP_VERSION || return 1
+  if ! "php-fpm$PHP_VERSION" -t >>"$VPS_LOG" 2>&1; then
+    rm -f "$f"
+    site_fail "configurazione PHP-FPM del sito non valida (dettagli in $VPS_LOG)"
+    return 1
+  fi
+  systemctl reload "php$PHP_VERSION-fpm" || site_fail "PHP-FPM non si è ricaricato"
+}
+
+site_pool_remove() {
+  local f
+  f="$(site_pool_file "$1")"
+  [[ -f "$f" ]] || return 0
+  rm -f "$f"
+  systemctl reload "php$PHP_VERSION-fpm" || log "ATTENZIONE: PHP-FPM non ricaricato dopo la rimozione del pool di $1"
+}
+
+site_logrotate_add() {
+  local slug
+  slug="$(site_reg_get "$1" .slug)"
+  SITE_SLUG="$slug" SITE_ROOT="$(site_root "$1")" \
+    render_template "$VPS_TEMPLATES/logrotate-site.tmpl" "$LOGROTATE_D/vps-site-$slug" 644 root:root SITE_SLUG SITE_ROOT
+}
+
+site_logrotate_remove() {
+  rm -f "$LOGROTATE_D/vps-site-$(site_reg_get "$1" .slug)"
+}

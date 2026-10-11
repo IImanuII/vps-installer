@@ -1,0 +1,19 @@
+; vps-site: ${SITE_DOMAIN} — file generato, non modificarlo a mano
+[${SITE_SLUG}]
+user = ${SITE_SLUG}
+group = ${SITE_SLUG}
+listen = /run/php/php${PHP_VERSION}-fpm-${SITE_SLUG}.sock
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+pm = ondemand
+pm.max_children = 5
+pm.process_idle_timeout = 30s
+pm.max_requests = 500
+php_admin_value[open_basedir] = ${SITE_ROOT}/
+php_admin_value[session.save_path] = ${SITE_ROOT}/tmp
+php_admin_value[upload_tmp_dir] = ${SITE_ROOT}/tmp
+php_admin_value[sys_temp_dir] = ${SITE_ROOT}/tmp
+php_admin_value[error_log] = ${SITE_ROOT}/logs/php-error.log
+php_admin_flag[log_errors] = on
+php_admin_flag[display_errors] = off
