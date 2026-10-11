@@ -54,7 +54,7 @@ apply() {
 }
 
 main() {
-  local ref="" cur head target dump ver ok=1
+  local ref="" cur head target dump ver tags head_c cur_c target_c ok=1 interrupted=0 note=""
   enable_error_trap
   while (($#)); do
     case "$1" in
@@ -78,11 +78,15 @@ main() {
   pd_git fetch -q --tags origin 2>>"$VPS_LOG" || die "Download dei rilasci non riuscito"
   cur="v$ver"
   [[ "$cur" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Versione nel manifest non valida: $ver"
-  pd_git rev-parse -q --verify "refs/tags/$cur" >/dev/null || die "Il rilascio $cur del manifest non esiste nel repository"
-  head="$(pd_current_tag)" || die "Versione attuale non leggibile"
-  [[ "$head" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Il checkout attuale non è un rilascio vX.Y.Z: sistemalo a mano"
-  if [[ "$head" != "$cur" ]]; then
-    say "ATTENZIONE: checkout ($head) diverso dal manifest ($cur): aggiornamento precedente interrotto, riparto da $cur."
+  cur_c="$(pd_git rev-parse -q --verify "refs/tags/$cur^{commit}")" || die "Il rilascio $cur del manifest non esiste nel repository"
+  # Confronto per commit, non per nome: più tag sullo stesso commit sono normali.
+  head_c="$(pd_git rev-parse -q --verify 'HEAD^{commit}')" || die "Versione attuale non leggibile"
+  tags="$(pd_git tag --points-at HEAD)" || die "Versione attuale non leggibile"
+  grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$' <<<"$tags" || die "Il checkout attuale non è un rilascio vX.Y.Z: sistemalo a mano"
+  if [[ "$head_c" != "$cur_c" ]]; then
+    interrupted=1
+    head="$(pd_current_tag)"
+    say "ATTENZIONE: checkout (${head:-$head_c}) diverso dal manifest ($cur): aggiornamento precedente interrotto, riparto da $cur."
   fi
   if [[ -n "$ref" ]]; then
     [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--ref deve essere nella forma vX.Y.Z"
@@ -92,12 +96,16 @@ main() {
     target="$(pd_latest_tag)" || die "Elenco dei rilasci non leggibile"
     [[ -n "$target" ]] || die "Nessun rilascio vX.Y.Z nel repository"
   fi
-  if [[ "$target" == "$cur" && "$head" == "$cur" ]]; then
+  target_c="$(pd_git rev-parse -q --verify "refs/tags/$target^{commit}")" || die "Il rilascio $target non esiste"
+  if [[ "$target_c" == "$cur_c" && "$head_c" == "$cur_c" ]]; then
     say "Già aggiornata ($cur)."
     exit 0
   fi
 
   dump="$(pd_dump "$cur")" || die "Backup del database non riuscito: nessuna modifica fatta"
+  if ((interrupted)); then
+    note=" ATTENZIONE: il backup è stato fatto dopo l'aggiornamento interrotto, quindi il database può contenere già una parte delle migrazioni più recenti di $cur."
+  fi
   say "Plancia: $cur → $target (backup: $dump)"
   trap "" HUP
   if ! apply "$cur" "$target"; then
@@ -108,9 +116,9 @@ main() {
     fi
     pd_reload_php || ok=0
     if ((ok)); then
-      die "Aggiornamento a $target fallito ($STAGE): ripristinata $cur. Backup del database: $dump"
+      die "Aggiornamento a $target fallito ($STAGE): ripristinata $cur. Backup del database: $dump.$note"
     fi
-    log "ERRORE: aggiornamento a $target fallito ($STAGE) e ritorno a $cur NON riuscito. Backup del database: $dump" || :
+    log "ERRORE: aggiornamento a $target fallito ($STAGE) e ritorno a $cur NON riuscito. Backup del database: $dump.$note" || :
     exit 2
   fi
   trap - HUP

@@ -133,6 +133,38 @@ tag_now() { git --git-dir="$PD_GIT_DIR" describe --tags --exact-match; }
   [ "$(jq -r .panel.version "$VPS_OPT/manifest.json")" = 1.1.0 ]
 }
 
+@test "più tag sullo stesso commit: niente falso 'interrotto', niente rifiuto" {
+  pd_test_installed v1.0.0
+  # tag annotati: git describe li preferisce a v1.0.0 (leggero)
+  git -C "$PD_WORK" tag -a stable -m stable v1.0.0
+  git -C "$PD_WORK" tag -a v0.9.0 -m v0.9.0 v1.0.0
+  git -C "$PD_WORK" push -q "$PANEL_REPO" --tags
+  run bash "$T"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"interrotto"* ]]
+  [[ "$output" == *"v1.0.0 → v1.1.0"* ]]
+  [ "$(jq -r .panel.version "$VPS_OPT/manifest.json")" = 1.1.0 ]
+}
+
+@test "già aggiornata anche se il commit ha più tag" {
+  pd_test_installed v1.1.0
+  git -C "$PD_WORK" tag -a v1.0.9 -m v1.0.9 v1.1.0
+  git -C "$PD_WORK" push -q "$PANEL_REPO" --tags
+  run bash "$T"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Già aggiornata"* ]]
+  [ ! -d "$PD_BACKUPS" ]
+}
+
+@test "riparazione di un aggiornamento interrotto che fallisce: avvisa del database parzialmente migrato" {
+  pd_test_installed v1.0.0
+  pd_checkout v1.1.0
+  CURL_RC=22 run bash "$T"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"una parte delle migrazioni più recenti di v1.0.0"* ]]
+  [ "$(jq -r .panel.version "$VPS_OPT/manifest.json")" = 1.0.0 ]
+}
+
 @test "versione del manifest sconosciuta: errore, niente modifiche" {
   pd_test_installed v1.0.0
   manifest_set '.panel.version = $v' --arg v 7.7.7
