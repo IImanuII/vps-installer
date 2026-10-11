@@ -26,15 +26,18 @@ say() {
 }
 
 # ask VAR PROMPT [silent] — una riga da stdin; EOF = uscita con errore.
+# In modo silent (password, token) il valore resta com'è, spazi compresi: si
+# toglie solo un \r finale. Le altre risposte sono ripulite dagli spazi.
 ask() {
   local __v
   if [[ "${3:-}" == silent ]]; then
     IFS= read -r -s -p "$2" __v || { echo; die "Input interrotto"; }
     echo
+    printf -v "$1" '%s' "${__v%$'\r'}"
   else
     IFS= read -r -p "$2" __v || die "Input interrotto"
+    printf -v "$1" '%s' "$(trim "$__v")"
   fi
-  printf -v "$1" '%s' "$(trim "$__v")"
 }
 
 install_key() {
@@ -68,6 +71,7 @@ install_token() {
   [[ -z "$(env_get "$PD_ENV" TELEGRAM_BOT_TOKEN)" ]] || return 0
   for n in 1 2 3; do
     ask t "Token del bot Telegram (da @BotFather): " silent
+    t="$(trim "$t")" # un token non ha spazi: quelli di un copia-incolla si tolgono
     if pd_telegram_ok "$t"; then
       TOKEN="$t"
       return 0

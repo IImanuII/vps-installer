@@ -28,6 +28,12 @@ answers() { printf '%s\n' "$TOKEN" manu 123456789 'Una-Password-12!' 'Una-Passwo
   ! grep -q AAAAAAAAAAAA "$VPS_LOG"
 }
 
+@test "password con spazi in testa e in coda: arriva a create-admin com'è" {
+  run bash -c "printf '%s\n' '$TOKEN ' manu 123456789 '  Una-Password-12! ' '  Una-Password-12! ' | bash '$T'"
+  [ "$status" -eq 0 ]
+  grep -qx '  Una-Password-12! ' "$BATS_TEST_TMPDIR/php.stdin"
+}
+
 @test "rifiuta se Plancia è già installata" {
   manifest_set '.panel.version = "1.0.0"'
   run bash "$T" </dev/null
