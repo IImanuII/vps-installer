@@ -1,7 +1,7 @@
 # VPS Installer v1.1 — Installazione e aggiornamento di Plancia
 
 - **Data:** 2026-10-11
-- **Stato:** in revisione
+- **Stato:** implementata (v1.1.0)
 - **Versioni:** `vps-installer` 1.0.3 → **1.1.0**, Plancia (`vps-panel`) 2.0.0 → **2.1.0**
 - **Contratto con il pannello:** [`../PANEL-HANDOFF.md`](../PANEL-HANDOFF.md) (aggiornato da questo lavoro)
 - **Spec precedenti:** [`2026-10-07-vps-installer-design.md`](2026-10-07-vps-installer-design.md), `vps-panel/Documenti/PIANO/2026-10-07-vps-sp1-pulizia-design.md`
@@ -201,3 +201,20 @@ login Telegram → checklist "Verifica manuale" del README di deploy. Esito anno
 3. `vps-panel-install`, `vps-panel-update`, template, `--tools-only`, manifest.
 4. End-to-end in WSL.
 5. Documenti (`PANEL-HANDOFF`, README, `collaudo-v1.0.0.md`), release v1.1.0.
+
+## Modifiche in implementazione
+
+Rispetto al testo sopra, per sicurezza e robustezza:
+
+- **Repository git fuori dalla radice del pannello:** la git dir è `/opt/vps/panel.git` (`root:root` 700),
+  non `/var/www/<pannello>/.git`. Con un `.git` di proprietà di `panel`, un pannello compromesso potrebbe
+  piazzare hook o `core.fsmonitor`/`core.sshCommand` e far eseguire codice come root al successivo
+  aggiornamento. Non esiste alcun `.git` nella radice del pannello.
+- **SQL dagli oggetti git del tag:** `schema.sql` e le migrazioni si leggono con `git show TAG:...` dal
+  repository di root, non dai file della radice (scrivibili dal pannello).
+- **Proprietà dei file:** dopo il checkout, `chown -R -P -h panel:panel` sulla radice del pannello
+  (non segue i link simbolici).
+- **Versione di partenza dal manifest:** `vps-panel-update` parte dalla versione scritta nel manifest,
+  quindi un aggiornamento interrotto (codice già al bersaglio, manifest vecchio) si ripara rilanciandolo.
+- **Template cron:** si chiama `templates/cron-vps-panel.tmpl` (i template con `${VAR}` richiedono
+  l'estensione `.tmpl`).

@@ -21,7 +21,7 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | `/var/www/<pannello>/app/` | `panel:panel` | codice |
 | `/var/www/<pannello>/config/.env` | `panel:panel` 600 | credenziali DB `panel` e `panel_dbadmin` |
 | `/var/www/<pannello>/storage/` | `panel:panel` 700 | sessioni, cache, `pma-tmp/` |
-| `/var/www/<pannello>/logs/` | `panel:panel` 750 | log applicativi |
+| `/var/www/<pannello>/logs/` | `panel:panel` 750 | log applicativi di Plancia e php-error.log del pool |
 
 ### Di root (`/opt/vps`)
 
@@ -34,6 +34,9 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | `/opt/vps/secrets/` | `root:root` 700 | segreti di sistema |
 | `/opt/vps/secrets/cloudflare.ini` | `root:root` 600 | token API Cloudflare (se attivo) |
 | `/opt/vps/secrets/msmtprc` | `root:root` 600 | configurazione SMTP (se configurata) |
+| `/opt/vps/secrets/panel-deploy-key` | `root:root` 600 | deploy key GitHub di sola lettura per IImanuII/vps-panel |
+| `/opt/vps/panel.git/` | `root:root` 700 | repository git di Plancia, fuori dalla radice del pannello: il pannello non può modificarlo |
+| `/opt/vps/backups/panel/` | `root:root` 700 / file 600 | dump del DB del pannello prima di ogni aggiornamento (ultimi 5) |
 | `/opt/vps/phpmyadmin/` | `root:panel` 750 / file 640 | phpMyAdmin |
 
 ### File di sistema (posizioni obbligate)
@@ -57,13 +60,14 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | `/etc/msmtprc` | symlink → `/opt/vps/secrets/msmtprc` |
 | `/etc/letsencrypt/` | certificati (gestiti da certbot) |
 | `/etc/cron.d/vps` | cron degli script `/opt/vps/bin` |
+| `/etc/cron.d/vps-panel` | manutenzione notturna di Plancia (utente panel) |
 | `/var/log/vps-installer.log` | log installazione (senza segreti) |
 
 ## 3. `manifest.json`
 
 ```json
 {
-  "installer_version": "1.0.0",
+  "installer_version": "1.1.0",
   "installed_at": "2026-10-07T15:30:00+02:00",
   "hostname": "vps-01",
   "ipv4": "203.0.113.10",
@@ -81,7 +85,10 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
     "domain": "panel.miosito.it",
     "path": "/var/www/panel.miosito.it",
     "php_socket": "/run/php/php8.4-fpm-panel.sock",
-    "pma_path": "/pma/"
+    "pma_path": "/pma/",
+    "version": "2.1.0",
+    "deployed_at": "2026-10-11T18:00:00+02:00",
+    "repo": "git@github.com:IImanuII/vps-panel.git"
   },
   "conventions": {
     "site_root": "/var/www/<dominio>",
@@ -90,6 +97,8 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
   }
 }
 ```
+
+`version`, `deployed_at`, `repo` li scrivono `vps-panel-install`/`vps-panel-update`; una riscrittura del manifest da parte dell'installer li conserva.
 
 Il pannello **non** modifica il manifest direttamente: quando cambia lo stato (es. email configurata) lo aggiorna lo script wrapper corrispondente.
 
@@ -112,6 +121,16 @@ Forniti dall'installer (v1):
 | `vps-pma-pass` | `set` (password da stdin) | rigenera `.htpasswd-pma` (bcrypt) |
 | `vps-pma-update` | — | scarica l'ultima phpMyAdmin, verifica GPG + SHA256, sostituisce mantenendo `config.inc.php` |
 | `vps-status` | — | stato servizi, versioni, disco, RAM, aggiornamenti disponibili (sostituisce gli script di health check) |
+
+Forniti dall'installer v1.1, **eseguiti dall'amministratore** (non dal pannello, non in sudoers):
+
+| Script | Uso | Cosa fa |
+|---|---|---|
+| `vps-panel-install` | interattivo | deploy key, token Telegram, checkout dell'ultimo tag `vX.Y.Z`, `APP_KEY` se manca, `schema.sql`, primo super_admin, `/etc/cron.d/vps-panel`, controllo `/health` |
+| `vps-panel-update` | `[--ref vX.Y.Z]` | parte dalla versione del manifest (riprende un aggiornamento interrotto), dump del DB, checkout, `schema.sql` + `install/migrations/X.Y.Z.sql` letti dal tag e non dai file del pannello, `php -l`, reload PHP-FPM, `/health`; se fallisce torna alla versione di prima (codice e DB) |
+
+Regole per il pannello: i rilasci sono tag annotati `vX.Y.Z`; le modifiche allo schema di
+un'installazione esistente vanno in `install/migrations/X.Y.Z.sql`, idempotenti.
 
 Previsti per il pannello (da scrivere con il pannello, stesse regole):
 

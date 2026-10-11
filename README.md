@@ -32,6 +32,22 @@ Se non ce l'hai: `ssh-keygen -t ed25519` sul tuo PC.
 Restano solo i file descritti in [`docs/PANEL-HANDOFF.md`](docs/PANEL-HANDOFF.md),
 il contratto con il pannello di gestione.
 
+## Installare il pannello (Plancia)
+
+Il pannello sta in un repository privato: serve una deploy key, che lo script crea e stampa.
+
+```bash
+sudo vps-panel-install     # la prima volta
+sudo vps-panel-update      # poi, per ogni nuovo rilascio
+```
+
+Su una VPS installata con una versione precedente alla 1.1, prima:
+
+```bash
+curl -fsSLO https://github.com/IImanuII/vps-installer/releases/download/v1.1.0/install.sh
+sudo bash install.sh --tools-only
+```
+
 ## Sviluppo
 
 - Test: `bash tests/run.sh` (da Windows: `wsl -d Debian -- bash tests/run.sh`).
@@ -39,3 +55,5 @@ il contratto con il pannello di gestione.
   `git tag vX.Y.Z && git push --tags`. La GitHub Action pubblica `install.sh`,
   l'archivio e il comando con l'hash.
 - Spec: [`docs/specs/2026-10-07-vps-installer-design.md`](docs/specs/2026-10-07-vps-installer-design.md)
+- End-to-end del pannello (WSL, root): `sudo bash tests/e2e/panel-e2e.sh <percorso vps-panel>`.
+- Spec v1.1: [docs/specs/2026-10-11-vps-installer-v1.1-design.md](docs/specs/2026-10-11-vps-installer-v1.1-design.md)
