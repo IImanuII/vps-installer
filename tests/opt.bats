@@ -2,6 +2,12 @@ setup() {
   load test_helper
   setup_common
   VPS_ROOT="$REPO_ROOT"
+  # Mai toccare /etc, /opt/vps/sites ecc. veri: tutto nel tmp del test.
+  export SUDOERS_D="$BATS_TEST_TMPDIR/sudoers.d" CRON_D="$BATS_TEST_TMPDIR/cron.d"
+  export SITES_DIR="$BATS_TEST_TMPDIR/sites" SITES_BACKUPS="$BATS_TEST_TMPDIR/backups/sites" SITES_WWW="$BATS_TEST_TMPDIR/www"
+  mkdir -p "$SUDOERS_D" "$CRON_D" "$SITES_WWW"
+  make_stub visudo 'exit 0'
+  make_stub dpkg 'exit 0'
 }
 
 @test "opt_tools_only rifiuta una macchina mai installata" {
@@ -38,4 +44,54 @@ setup() {
 @test "install.sh e run.sh conoscono --tools-only" {
   grep -q -- '--tools-only' "$REPO_ROOT/install.sh"
   grep -q -- '--tools-only' "$REPO_ROOT/run.sh"
+}
+
+sys_setup() {
+  jq -n '{panel:{domain:"panel.miosito.it"}, cloudflare:{enabled:true}}' >"$VPS_OPT/manifest.json"
+}
+
+@test "opt_system_files: sudoers con vps-site, cron con _prune, cartelle e manutenzione" {
+  sys_setup
+  opt_system_files
+  grep -q '/opt/vps/bin/vps-site' "$SUDOERS_D/vps-panel"
+  [ "$(stat -c %a "$SUDOERS_D/vps-panel")" = 440 ]
+  grep -q 'vps-site _prune' "$CRON_D/vps"
+  [ "$(stat -c %a "$SITES_DIR")" = 750 ]
+  [ "$(stat -c %a "$SITES_BACKUPS")" = 700 ]
+  grep -q 'manutenzione' "$SITES_WWW/_maintenance/_maintenance.html"
+}
+
+@test "opt_system_files senza pannello né Cloudflare toglie sudoers e cron" {
+  sys_setup
+  echo x >"$SUDOERS_D/vps-panel"
+  echo x >"$CRON_D/vps"
+  jq -n '{panel:null, cloudflare:{enabled:false}}' >"$VPS_OPT/manifest.json"
+  opt_system_files
+  [ ! -e "$SUDOERS_D/vps-panel" ]
+  [ ! -e "$CRON_D/vps" ]
+}
+
+@test "opt_system_files: sudoers non valido non viene installato" {
+  sys_setup
+  make_stub visudo 'exit 1'
+  run opt_system_files
+  [ "$status" -ne 0 ]
+  [ ! -e "$SUDOERS_D/vps-panel" ]
+}
+
+@test "opt_system_files installa acl se manca" {
+  sys_setup
+  make_stub dpkg 'exit 1'
+  make_stub apt-get 'echo "apt-get $*" >>"$BATS_TEST_TMPDIR/apt.calls"'
+  opt_system_files
+  grep -q 'install .* acl' "$BATS_TEST_TMPDIR/apt.calls"
+}
+
+@test "opt_tools_only aggiorna anche sudoers e cron" {
+  sys_setup
+  declare -f opt_tools_only | grep -q opt_system_files
+}
+
+@test "sudoers del pannello: ogni script in tools/ chiamabile dal pannello è elencato" {
+  grep -q '/opt/vps/bin/vps-site' "$REPO_ROOT/templates/sudoers-vps-panel"
 }

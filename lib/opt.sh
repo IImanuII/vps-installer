@@ -4,6 +4,8 @@
 # Cartella dei link ai comandi da lanciare con sudo: /opt/vps/bin non è nel
 # secure_path di sudo su Debian, /usr/local/sbin sì.
 : "${VPS_SBIN:=/usr/local/sbin}"
+: "${SUDOERS_D:=/etc/sudoers.d}"
+: "${CRON_D:=/etc/cron.d}"
 
 opt_install_files() {
   local t
@@ -22,6 +24,42 @@ opt_install_files() {
 opt_tools_only() {
   [[ -f "$(manifest_path)" ]] || die "Manifest assente: macchina mai installata con questo installer. Lancia install.sh senza --tools-only."
   opt_install_files
+  opt_system_files
   manifest_set '.installer_version = $v' --arg v "$VPS_INSTALLER_VERSION"
   log "Script di /opt/vps aggiornati alla versione $VPS_INSTALLER_VERSION."
+}
+
+# opt_system_files — la parte di sistema degli script: sudoers del pannello,
+# cron, cartelle dei siti e pagina di manutenzione. La chiama anche
+# --tools-only: senza, una VPS già installata riceverebbe vps-site ma il
+# pannello non avrebbe il permesso di eseguirlo.
+opt_system_files() {
+  local m tmp
+  m="$(manifest_path)"
+  if [[ "$(jq -r '.panel != null' "$m")" == true ]]; then
+    tmp="$(mktemp)"
+    cp "$VPS_TEMPLATES/sudoers-vps-panel" "$tmp"
+    if ! visudo -cqf "$tmp"; then
+      rm -f "$tmp"
+      die "Regole sudoers non valide"
+    fi
+    install -m 440 "$tmp" "$SUDOERS_D/vps-panel"
+    own root:root "$SUDOERS_D/vps-panel"
+    rm -f "$tmp"
+  else
+    rm -f "$SUDOERS_D/vps-panel"
+  fi
+  if [[ "$(jq -r '.cloudflare.enabled == true' "$m")" == true ]]; then
+    install -m 644 "$VPS_TEMPLATES/cron-vps" "$CRON_D/vps"
+  else
+    rm -f "$CRON_D/vps"
+  fi
+  install -d -m 750 "$SITES_DIR"
+  own "root:$(manifest_group)" "$SITES_DIR"
+  install -d -m 700 "$(dirname "$SITES_BACKUPS")" "$SITES_BACKUPS"
+  install -d -m 755 "$SITES_WWW/_maintenance"
+  install -m 644 "$VPS_TEMPLATES/maintenance.html" "$SITES_WWW/_maintenance/_maintenance.html"
+  if ! dpkg -s acl >/dev/null 2>&1; then
+    apt_install acl || die "Pacchetto acl non installato"
+  fi
 }

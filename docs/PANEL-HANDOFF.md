@@ -39,6 +39,8 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | `/opt/vps/panel.git/` | `root:root` 700 | repository git di Plancia, fuori dalla radice del pannello: il pannello non può modificarlo |
 | `/opt/vps/backups/panel/` | `root:root` 700 / file 600 | dump del DB del pannello prima di ogni aggiornamento (ultimi 5) |
 | `/opt/vps/phpmyadmin/` | `root:panel` 750 / file 640 | phpMyAdmin |
+| `/opt/vps/sites/` | `root:panel` 750 / file 640 | registro dei siti di `vps-site` (un JSON per sito, nessun segreto) |
+| `/opt/vps/backups/sites/` | `root:root` 700 / file 600 | archivi dei siti eliminati (file + dump), cancellati dopo 30 giorni |
 
 ### File di sistema (posizioni obbligate)
 
@@ -63,12 +65,17 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | `/etc/cron.d/vps` | cron degli script `/opt/vps/bin` |
 | `/etc/cron.d/vps-panel` | manutenzione notturna di Plancia (utente panel) |
 | `/var/log/vps-installer.log` | log installazione (senza segreti) |
+| `/etc/nginx/conf.d/<sito>.conf` | vhost di un sito, scritto da `vps-site` |
+| `/etc/php/8.4/fpm/pool.d/site_<slug>.conf` | pool PHP di un sito |
+| `/etc/logrotate.d/vps-site-site_<slug>` | rotazione dei log di un sito |
+| `/var/www/_maintenance/_maintenance.html` | pagina 503 dei siti disattivati |
+| `/var/www/<sito>/` | `site_<slug>`, 2750: `public/` e `tmp/` 2770 (admin nel gruppo, `www-data` in sola lettura via ACL), `logs/`, `db.env` 640 |
 
 ## 3. `manifest.json`
 
 ```json
 {
-  "installer_version": "1.1.0",
+  "installer_version": "1.2.0",
   "installed_at": "2026-10-07T15:30:00+02:00",
   "hostname": "vps-01",
   "ipv4": "203.0.113.10",
@@ -136,11 +143,30 @@ I file di sviluppo del repository (`.claude/`, `Documenti/`, `tests/`, `infra/`,
 `PRODUCT.md`) non arrivano nella radice del pannello (sparse checkout, elenco
 `PD_DEV_PATHS` in `lib/panel_deploy.sh`): il pannello non deve leggerli a runtime.
 
+Forniti dall'installer v1.2 (eseguiti dal pannello, in sudoers):
+
+| Comando | Sincrono | Risposta |
+|---|---|---|
+| `vps-site zones` | sì | `{"ok":true,"zones":["miosito.it",...]}`: zone attive visibili dal token |
+| `vps-site list` | sì | `{"ok":true,"sites":[<registro>...]}` |
+| `vps-site show <dominio>` | sì | `{"ok":true,"site":<registro>}` |
+| `vps-site create <dominio> --type static\|php [--www] [--db]` | no | `{"ok":true,"state":"creating"}` |
+| `vps-site disable <dominio>` / `enable <dominio>` | sì | `{"ok":true,"state":"disabled"\|"active"}` |
+| `vps-site delete <dominio>` | no | `{"ok":true,"state":"deleting"}` |
+| `vps-site db-create <dominio>` | sì | `{"ok":true}` |
+| `vps-site db-password <dominio>` | sì | `{"ok":true}` |
+
+Regole di `vps-site`:
+- la password del database arriva **solo da stdin**, prima riga (16-128 caratteri stampabili, senza spazi né `'` `"` `\`), per `create --db`, `db-create` e `db-password`; il chiamante deve chiudere stdin;
+- `create` e `delete` rispondono subito e lavorano in background come unità systemd (`vps-site-<slug>-<op>`); un lavoro alla volta (lucchetto globale); l'avanzamento sta nel registro (`state`, `job.step`, `job.error`);
+- le operazioni brevi (`disable`, `enable`, `db-*`) rispondono "riprova" se un lavoro è in corso; un breve lucchetto sul registro serializza i comandi concorrenti (attesa fino a 5 s);
+- un lavoro interrotto da un riavvio: creazione -> `error` (si pulisce con `delete`); eliminazione ferma a `queued`/`archive` -> torna allo stato precedente, ferma a `remove` -> `error`;
+- `_run` e `_prune` sono interni (systemd e cron) e sotto sudo vengono rifiutati.
+
 Previsti per il pannello (da scrivere con il pannello, stesse regole):
 
 | Script | Cosa farà |
 |---|---|
-| `vps-site` | `create` / `delete` / `enable` / `disable` sito: utente `site_*`, cartella, pool PHP, vhost, certificato, DNS Cloudflare |
 | `vps-site-wp` | installazione WordPress su un sito esistente |
 | `vps-cache` | attiva/disattiva/svuota cache FastCGI di un sito |
 | `vps-service` | restart/reload di nginx, php-fpm, mariadb, redis (whitelist) |
@@ -167,7 +193,7 @@ Convenzione: DB e utenti dei siti hanno nome `site_<slug>` (es. `site_miosito_it
 - [ ] **Cloudflare:** cambio/verifica token, stato ultimo aggiornamento IP. Usa `vps-cf-token`, `vps-cf-ips-update`.
 - [ ] **phpMyAdmin:** versione installata vs ultima, aggiornamento, cambio password basic auth. Usa `vps-pma-update`, `vps-pma-pass`.
 - [ ] **Backup rclone:** configurazione OAuth Google Drive, pianificazione, retention, stato ultimo backup. Usa `vps-backup`.
-- [ ] **Siti:** creazione statico / PHP / WordPress, rimozione, SSL, cache. Usa `vps-site`, `vps-site-wp`, `vps-cache`.
+- [ ] **Siti:** creazione statico / PHP fatta con `vps-site` (installer 1.2); restano WordPress (`vps-site-wp`) e cache (`vps-cache`).
 - [ ] **Stato server:** dashboard da `vps-status`.
 - [ ] **Sicurezza:** IP bannati da fail2ban, sblocco. Usa `vps-f2b`.
 - [ ] **Pulizia log:** rotazione/pulizia dei log Nginx dei siti (era in `da fare.txt`).
