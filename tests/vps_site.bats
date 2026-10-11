@@ -13,6 +13,20 @@ vs() {
   run --separate-stderr bash "$T" "$@"
 }
 
+# Aspetta che il lucchetto sia davvero preso dal processo in background.
+wait_locked() {
+  local i
+  for i in {1..50}; do
+    flock -n "$1" true || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+teardown() {
+  [[ -z "${pid:-}" ]] || kill "$pid" 2>/dev/null || true
+}
+
 @test "zones: le zone del token" {
   export CF_ZONES="miosito.it altro.it"
   vs zones
@@ -86,6 +100,7 @@ vs() {
   [[ "$output" == *"comando interno"* ]]
   run env SUDO_USER=panel bash "$T" _prune
   [ "$status" -eq 1 ]
+  [[ "$output" == *"comando interno"* ]]
 }
 
 @test "_run create porta il sito ad attivo; show lo restituisce" {
@@ -115,11 +130,26 @@ vs() {
   bash "$T" _run create blog.miosito.it
   flock "$SITES_LOCK" sleep 5 >/dev/null 2>&1 &
   pid=$!
-  sleep 0.3
+  wait_locked "$SITES_LOCK"
   vs disable blog.miosito.it
   [ "$status" -eq 1 ]
   [[ "$(jq -r .error <<<"$output")" == *"riprova"* ]]
-  kill "$pid" 2>/dev/null || true
+}
+
+@test "lucchetto del registro occupato: create e delete chiedono di riprovare" {
+  vs create blog.miosito.it --type static
+  bash "$T" _run create blog.miosito.it
+  flock "$SITES_LOCK.reg" sleep 30 >/dev/null 2>&1 &
+  pid=$!
+  wait_locked "$SITES_LOCK.reg"
+  vs delete blog.miosito.it
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"riprova"* ]]
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  vs create altro.miosito.it --type static
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"riprova"* ]]
+  run ! site_reg_exists altro.miosito.it
 }
 
 @test "delete: stato deleting, stato precedente salvato, lavoro avviato" {
@@ -161,7 +191,13 @@ vs() {
 
 @test "l'output è sempre un solo oggetto JSON" {
   vs create blog.miosito.it --type static
-  [ "$(printf '%s\n' "$output" | wc -l)" -eq 1 ]
+  [ "$status" -eq 0 ]
+  jq -e 'type == "object"' <<<"$output"
+  [ "$(printf '%s
+' "$output" | wc -l)" -eq 1 ]
   vs create blog.miosito.it --type static
-  [ "$(printf '%s\n' "$output" | wc -l)" -eq 1 ]
+  [ "$status" -eq 1 ]
+  jq -e 'type == "object" and .ok == false' <<<"$output"
+  [ "$(printf '%s
+' "$output" | wc -l)" -eq 1 ]
 }

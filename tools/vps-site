@@ -14,6 +14,8 @@ if [[ -n "${SUDO_USER:-}" ]]; then
   VPS_LIB=$VPS_OPT/lib
   VPS_TEMPLATES=$VPS_OPT/templates
   VPS_LOG=/var/log/vps-tools.log
+  # La vera difesa è `Defaults:panel env_reset` in sudoers; questo elenco è una
+  # seconda linea di difesa, nel caso l'ambiente passasse comunque.
   unset CF_API SITES_DIR SITES_WWW SITES_BACKUPS SITES_LOCK SITES_LOCK_WAIT SITES_RUN NGINX_CONF_D \
     PHP_POOL_D LOGROTATE_D VPS_SITE_SELF VPS_NO_CHOWN SITE_ERROR_FILE
   [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
@@ -59,8 +61,18 @@ existing() {
   site_refresh "$1"
 }
 
+# reg_lock — lucchetto breve sul registro, distinto da quello dei lavori: serializza
+# create/delete/disable/... senza essere rifiutato quando un lavoro gira su un altro
+# sito. Resta preso (fd 7) fino alla fine di questo processo, che dura poco;
+# i figli di systemd-run non lo ereditano.
+reg_lock() {
+  exec 7>"$SITES_LOCK.reg"
+  flock -w 5 7 || json_err "operazione in corso, riprova tra poco"
+}
+
 # lock_now — le operazioni brevi non aspettano: se c'è un lavoro, si riprova.
 lock_now() {
+  reg_lock
   exec 9>"$SITES_LOCK"
   flock -n 9 || json_err "operazione in corso su un altro sito, riprova tra poco"
 }
@@ -126,6 +138,7 @@ case "$cmd" in
     done
     [[ "$type" == static || "$type" == php ]] || json_err "tipo non valido: usa --type static o --type php"
     [[ "$db" == no || "$type" == php ]] || json_err "il database si crea solo per i siti PHP"
+    reg_lock
     msg="$(site_validate_new "$d")" || json_err "$msg"
     need_cf
     [[ "$db" == no ]] || read_password
@@ -164,6 +177,7 @@ case "$cmd" in
     ;;
   delete)
     d="${1:-}"
+    reg_lock
     existing "$d"
     state="$(site_reg_get "$d" .state)"
     [[ "$state" != creating && "$state" != deleting ]] || json_err "operazione in corso su $d, riprova più tardi"
