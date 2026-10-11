@@ -1,0 +1,10 @@
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name www.${SITE_DOMAIN};
+    ssl_certificate /etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${SITE_DOMAIN}/privkey.pem;
+    include /etc/nginx/snippets/ssl-params.conf;
+    return 301 https://${SITE_DOMAIN}$request_uri;
+}

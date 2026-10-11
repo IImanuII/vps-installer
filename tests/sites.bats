@@ -232,3 +232,98 @@ setup() {
   site_logrotate_remove blog.miosito.it
   [ ! -e "$f" ]
 }
+
+@test "site_vhost_add php con www: redirect, pool del sito, variabili di Nginx intatte" {
+  site_reg_new miosito.it php yes no
+  site_vhost_add miosito.it
+  f="$NGINX_CONF_D/miosito.it.conf"
+  grep -q 'server_name miosito.it www.miosito.it;' "$f"
+  grep -q 'server_name www.miosito.it;' "$f"
+  grep -q 'return 301 https://miosito.it$request_uri;' "$f"
+  grep -q "fastcgi_pass unix:/run/php/php$PHP_VERSION-fpm-site_miosito_it.sock;" "$f"
+  grep -q 'try_files $uri $uri/ /index.php?$query_string;' "$f"
+  grep -q "root $SITES_WWW/miosito.it/public;" "$f"
+  grep -q '^nginx -t' "$CALLS"
+  grep -q '^systemctl reload nginx' "$CALLS"
+}
+
+@test "site_vhost_add statico senza www: niente PHP, niente blocco www" {
+  site_reg_new blog.miosito.it static no no
+  site_vhost_add blog.miosito.it
+  f="$NGINX_CONF_D/blog.miosito.it.conf"
+  run grep -c fastcgi_pass "$f"
+  [ "$output" = 0 ]
+  run grep -c 'server_name www.' "$f"
+  [ "$output" = 0 ]
+  grep -q 'try_files $uri $uri/ =404;' "$f"
+}
+
+@test "site_vhost_add maintenance: 503 con la pagina di manutenzione" {
+  site_reg_new blog.miosito.it php no no
+  site_vhost_add blog.miosito.it maintenance
+  f="$NGINX_CONF_D/blog.miosito.it.conf"
+  grep -q 'return 503;' "$f"
+  grep -q 'root /var/www/_maintenance;' "$f"
+  grep -q 'Retry-After 3600' "$f"
+  run grep -c fastcgi_pass "$f"
+  [ "$output" = 0 ]
+}
+
+@test "site_vhost_add: nginx -t fallito rimette il file di prima, o nessuno" {
+  site_reg_new blog.miosito.it php no no
+  site_vhost_add blog.miosito.it
+  cp "$NGINX_CONF_D/blog.miosito.it.conf" "$BATS_TEST_TMPDIR/prima"
+  export STUB_RC_nginx=1 SITE_ERROR_FILE="$BATS_TEST_TMPDIR/err"
+  run site_vhost_add blog.miosito.it maintenance
+  [ "$status" -eq 1 ]
+  cmp "$NGINX_CONF_D/blog.miosito.it.conf" "$BATS_TEST_TMPDIR/prima"
+  [[ "$(cat "$SITE_ERROR_FILE")" == *"Nginx"* ]]
+
+  site_reg_new altro.miosito.it php no no
+  run site_vhost_add altro.miosito.it
+  [ "$status" -eq 1 ]
+  [ ! -e "$NGINX_CONF_D/altro.miosito.it.conf" ]
+}
+
+@test "site_valid_db_password" {
+  site_valid_db_password 'Abcdefghijklmnop'
+  site_valid_db_password 'a_B-c9.:!@#%^*+=~xyz'
+  run ! site_valid_db_password 'corta'
+  run ! site_valid_db_password 'con uno spazio dentro'
+  run ! site_valid_db_password "con'apostrofo12345"
+  run ! site_valid_db_password 'con"virgolette12345'
+  run ! site_valid_db_password 'con\barra123456789'
+  run ! site_valid_db_password "$(printf 'x%.0s' {1..129})"
+}
+
+@test "site_db_sql: grant sul solo database del sito, underscore protetti" {
+  run site_db_sql site_blog_miosito_it 'Password-di-prova-123'
+  [[ "$output" == *'CREATE DATABASE IF NOT EXISTS `site_blog_miosito_it`'* ]]
+  [[ "$output" == *'ON `site\_blog\_miosito\_it`.* TO '"'site_blog_miosito_it'@'localhost'"* ]]
+}
+
+@test "site_db_add crea DB e db.env 640; site_db_password cambia solo DB_PASS" {
+  site_reg_new blog.miosito.it php no yes
+  mkdir -p "$SITES_WWW/blog.miosito.it"
+  site_db_add blog.miosito.it 'Password-di-prova-123'
+  f="$SITES_WWW/blog.miosito.it/db.env"
+  [ "$(stat -c %a "$f")" = 640 ]
+  grep -qx 'DB_NAME=site_blog_miosito_it' "$f"
+  grep -qx 'DB_PASS=Password-di-prova-123' "$f"
+  grep -q 'CREATE DATABASE' "$BATS_TEST_TMPDIR/mariadb.sql"
+
+  site_db_password blog.miosito.it 'Nuova-password-456789'
+  grep -qx 'DB_PASS=Nuova-password-456789' "$f"
+  grep -qx 'DB_USER=site_blog_miosito_it' "$f"
+  grep -q "ALTER USER 'site_blog_miosito_it'@'localhost'" "$BATS_TEST_TMPDIR/mariadb.sql"
+}
+
+@test "site_db_add: MariaDB che fallisce dà un motivo e non scrive db.env" {
+  site_reg_new blog.miosito.it php no yes
+  mkdir -p "$SITES_WWW/blog.miosito.it"
+  export STUB_RC_mariadb=1 SITE_ERROR_FILE="$BATS_TEST_TMPDIR/err"
+  run site_db_add blog.miosito.it 'Password-di-prova-123'
+  [ "$status" -eq 1 ]
+  [ ! -e "$SITES_WWW/blog.miosito.it/db.env" ]
+  [[ "$(cat "$SITE_ERROR_FILE")" == *"database"* ]]
+}

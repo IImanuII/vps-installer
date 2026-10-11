@@ -1,0 +1,12 @@
+    # Sito disattivato: ogni richiesta risponde 503 con la pagina di manutenzione.
+    location / {
+        return 503;
+    }
+
+    error_page 503 /_maintenance.html;
+    location = /_maintenance.html {
+        root /var/www/_maintenance;
+        internal;
+        include /etc/nginx/snippets/security-headers.conf;
+        add_header Retry-After 3600 always;
+    }

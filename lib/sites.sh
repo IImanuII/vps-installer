@@ -283,3 +283,108 @@ site_logrotate_add() {
 site_logrotate_remove() {
   rm -f "$LOGROTATE_D/vps-site-$(site_reg_get "$1" .slug)"
 }
+
+# site_tmpl_text FILE VAR... — il testo di un template con le sole variabili elencate.
+site_tmpl_text() {
+  local src="$1" v fmt=""
+  shift
+  for v in "$@"; do
+    export "${v?}"
+    fmt+="\${$v} "
+  done
+  envsubst "$fmt" <"$src"
+}
+
+# site_vhost_add DOMINIO [normal|maintenance] — scrive il vhost e ricarica Nginx.
+# Se nginx -t lo rifiuta rimette il file di prima (o nessuno): un vhost rotto
+# bloccherebbe i reload di tutti i siti e del pannello.
+# Le variabili SITE_* le legge render_template (envsubst), non lo vede shellcheck.
+# shellcheck disable=SC2034
+site_vhost_add() {
+  local d="$1" mode="${2:-normal}" f bak="" variant
+  f="$NGINX_CONF_D/$d.conf"
+  SITE_DOMAIN="$d"
+  SITE_SLUG="$(site_reg_get "$d" .slug)"
+  SITE_ROOT="$(site_root "$d")"
+  SITE_NAMES="$d"
+  SITE_WWW_BLOCK=""
+  if [[ "$mode" == maintenance ]]; then
+    variant=maintenance
+  else
+    variant="$(site_reg_get "$d" .type)"
+  fi
+  SITE_BODY="$(site_tmpl_text "$VPS_TEMPLATES/nginx-site-$variant.inc.tmpl" SITE_DOMAIN SITE_SLUG PHP_VERSION)"
+  if [[ "$(site_reg_get "$d" .www)" == true ]]; then
+    SITE_NAMES="$d www.$d"
+    SITE_WWW_BLOCK="$(site_tmpl_text "$VPS_TEMPLATES/nginx-site-www.inc.tmpl" SITE_DOMAIN)"
+  fi
+  if [[ -f "$f" ]]; then
+    bak="$(mktemp)"
+    cp -p "$f" "$bak"
+  fi
+  render_template "$VPS_TEMPLATES/nginx-site.conf.tmpl" "$f" 644 root:root \
+    SITE_DOMAIN SITE_NAMES SITE_ROOT SITE_BODY SITE_WWW_BLOCK || return 1
+  if nginx -t >>"$VPS_LOG" 2>&1; then
+    rm -f "$bak"
+    systemctl reload nginx || site_fail "Nginx non si è ricaricato"
+    return
+  fi
+  if [[ -n "$bak" ]]; then
+    mv -f "$bak" "$f"
+  else
+    rm -f "$f"
+  fi
+  site_fail "la configurazione Nginx di $d non è valida (dettagli in $VPS_LOG)"
+}
+
+site_vhost_remove() {
+  local f="$NGINX_CONF_D/$1.conf"
+  [[ -f "$f" ]] || return 0
+  rm -f "$f"
+  if ! { nginx -t >>"$VPS_LOG" 2>&1 && systemctl reload nginx; }; then
+    log "ATTENZIONE: Nginx non ricaricato dopo la rimozione del vhost di $1"
+  fi
+}
+
+# site_valid_db_password PASSWORD — 16-128 caratteri ASCII stampabili, senza
+# spazi né ' " \ (la genera il pannello; il controllo è una difesa in più).
+site_valid_db_password() {
+  local p="$1"
+  ((${#p} >= 16 && ${#p} <= 128)) || return 1
+  LC_ALL=C
+  [[ "$p" =~ ^[[:graph:]]+$ ]] || return 1
+  [[ "$p" != *[\'\"\\]* ]]
+}
+
+# site_db_sql SLUG PASSWORD — database e utente del sito. Nel GRANT gli _ vanno
+# protetti: altrimenti sono caratteri jolly e il permesso varrebbe anche per
+# altri nomi simili.
+site_db_sql() {
+  local esc="${1//_/\\_}"
+  printf 'CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n' "$1"
+  sql_user_grant "$1" "$2" "ALL PRIVILEGES" "\`$esc\`.*"
+}
+
+site_db_add() {
+  local d="$1" slug
+  slug="$(site_reg_get "$d" .slug)"
+  site_db_sql "$slug" "$2" | mariadb >>"$VPS_LOG" 2>&1 \
+    || { site_fail "il database $slug non è stato creato (dettagli in $VPS_LOG)"; return 1; }
+  printf 'DB_HOST=localhost\nDB_NAME=%s\nDB_USER=%s\nDB_PASS=%s\n' "$slug" "$slug" "$2" \
+    | write_file "$(site_root "$d")/db.env" 640 "$slug:$slug"
+}
+
+site_db_password() {
+  local d="$1" slug
+  slug="$(site_reg_get "$d" .slug)"
+  printf "ALTER USER '%s'@'localhost' IDENTIFIED BY %s;\n" "$slug" "$(sql_quote "$2")" | mariadb >>"$VPS_LOG" 2>&1 \
+    || { site_fail "la password del database non è stata cambiata (dettagli in $VPS_LOG)"; return 1; }
+  printf 'DB_PASS=%s\n' "$2" | env_merge "$(site_root "$d")/db.env" 640 "$slug:$slug"
+}
+
+site_db_remove() {
+  local slug
+  slug="$(site_reg_get "$1" .slug)"
+  printf "DROP DATABASE IF EXISTS \`%s\`;\nDROP USER IF EXISTS '%s'@'localhost';\n" "$slug" "$slug" \
+    | mariadb >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: database o utente $slug non eliminati"
+}

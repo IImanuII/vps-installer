@@ -1,0 +1,35 @@
+# vps-site: ${SITE_DOMAIN} — file generato, non modificarlo a mano
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${SITE_NAMES};
+    include /etc/nginx/snippets/acme.conf;
+    location / {
+        return 301 https://${SITE_DOMAIN}$request_uri;
+    }
+}
+${SITE_WWW_BLOCK}
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${SITE_DOMAIN};
+
+    ssl_certificate /etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${SITE_DOMAIN}/privkey.pem;
+    include /etc/nginx/snippets/ssl-params.conf;
+    include /etc/nginx/snippets/security-headers.conf;
+
+    root ${SITE_ROOT}/public;
+    index index.php index.html;
+
+    access_log ${SITE_ROOT}/logs/access.log main;
+    error_log ${SITE_ROOT}/logs/error.log error;
+
+    limit_req zone=req_limit_per_ip burst=20 nodelay;
+
+    location ~ /\.(?!well-known) {
+        deny all;
+    }
+${SITE_BODY}
+}
