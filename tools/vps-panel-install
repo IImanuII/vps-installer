@@ -40,6 +40,14 @@ ask() {
   fi
 }
 
+# drop_typeahead — scarta gli Invio premuti mentre lo script lavorava, così un
+# tasto ripetuto non consuma i tentativi successivi. Solo da terminale: in un
+# file o in una pipe le righe in attesa sono le risposte vere.
+drop_typeahead() {
+  [[ -t 0 ]] || return 0
+  while IFS= read -r -t 0.2 _; do :; done
+}
+
 install_key() {
   # shellcheck disable=SC2034 # invio riceve la riga, il valore non serve
   local n invio
@@ -56,6 +64,7 @@ Aggiungi questa deploy key al repository, SENZA "Allow write access":
   Chiave: $(cat "$PD_KEY.pub")
 
 EOT
+    drop_typeahead
     ask invio "Premi Invio quando l'hai aggiunta... "
     if pd_git ls-remote "$PANEL_REPO" >/dev/null 2>>"$VPS_LOG"; then
       return 0
