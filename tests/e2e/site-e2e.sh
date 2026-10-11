@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end di vps-site in WSL (root): utenti, ACL, PHP-FPM, Nginx e MariaDB
-# veri; Cloudflare, certbot e systemd finti. Lascia la macchina com'era.
+# veri; Cloudflare, certbot e systemd finti. Può installare con apt-get nginx,
+# php8.4-fpm, mariadb-server e acl se mancano, e lascia i servizi in esecuzione;
+# il resto lo rimette com'era.
 # Uso (da Windows, via PowerShell):
 #   wsl -d Debian -- sudo bash /mnt/c/.../vps-installer/tests/e2e/site-e2e.sh
 set -Eeuo pipefail
@@ -19,6 +21,7 @@ ADMIN=e2eadmin
 PASS='Password-e2e-1234567'
 created=()
 made_maint=
+made_admin=
 
 fail() { echo "E2E FALLITO: $*" >&2; exit 1; }
 
@@ -39,7 +42,7 @@ cleanup() {
     mariadb -e "DROP DATABASE IF EXISTS \`site_${d//./_}\`; DROP USER IF EXISTS 'site_${d//./_}'@'localhost';" 2>/dev/null
     rm -rf "/etc/letsencrypt/live/$d"
   done
-  userdel -r "$ADMIN" 2>/dev/null
+  [[ -z "$made_admin" ]] || userdel -r "$ADMIN" 2>/dev/null
   for f in "${created[@]}"; do rm -f "$f"; done
   [[ -z "$made_maint" ]] || rmdir /var/www/_maintenance 2>/dev/null
   nginx -t >/dev/null 2>&1 && /usr/bin/systemctl reload nginx 2>/dev/null
@@ -132,7 +135,7 @@ export SITES_RUN="$work/run" SITES_LOCK="$work/vps-site.lock" LOGROTATE_D="$work
 export VPS_SITE_SELF="$src/tools/vps-site"
 mkdir -p "$VPS_OPT/secrets" "$SITES_WWW" "$LOGROTATE_D"
 printf 'dns_cloudflare_api_token = %s\n' "$(printf 'a%.0s' {1..40})" >"$VPS_OPT/secrets/cloudflare.ini"
-id "$ADMIN" >/dev/null 2>&1 || useradd -m "$ADMIN"
+id "$ADMIN" >/dev/null 2>&1 || { useradd -m "$ADMIN" && made_admin=1; }
 jq -n --arg a "$ADMIN" '{installer_version:"1.2.0", admin_user:$a, ipv4:"127.0.0.1", ipv6:null,
   cloudflare:{enabled:true, zone:"e2etest.it"}, panel:{domain:"panel.e2etest.it"}}' >"$VPS_OPT/manifest.json"
 
@@ -176,22 +179,41 @@ vs disable "$D1" | jq -e '.state == "disabled"' >/dev/null || fail "disable"
 wait_code "$D1" 503 || true
 code="$(get "$D1" -o /dev/null -w '%{http_code}')"
 [[ "$code" == 503 ]] || fail "manutenzione: $code"
-get "$D1" | grep -q manutenzione || fail "pagina di manutenzione"
+out="$(get "$D1")"
+[[ "$out" == *manutenzione* ]] || fail "pagina di manutenzione"
 vs enable "$D1" | jq -e '.state == "active"' >/dev/null || fail "enable"
 wait_code "$D1" 200 || fail "riattivato"
 
 echo "== crea $D2 (statico)"
 vs create "$D2" --type static | jq -e '.ok' >/dev/null || fail "create $D2"
 wait_code "$D2" 200 || true
-get "$D2" | grep -q "<h1>$D2</h1>" || fail "segnaposto di $D2"
+out="$(get "$D2")"
+[[ "$out" == *"<h1>$D2</h1>"* ]] || fail "segnaposto di $D2"
 
 echo "== elimina"
+pool="/etc/php/8.4/fpm/pool.d/$s.conf"
+rotf="$LOGROTATE_D/vps-site-$s"
+[[ -n "$(mariadb -N -e "SHOW DATABASES LIKE '$s'")" ]] || fail "il DB $s non esiste prima di delete"
+[[ "$(mariadb -N -e "SELECT COUNT(*) FROM mysql.user WHERE User='$s'")" == 1 ]] || fail "l'utente DB $s non esiste prima di delete"
+[[ -e "$pool" && -e "$rotf" && -d "$r" ]] || fail "pool, logrotate o cartella di $D1 mancano prima di delete"
 vs delete "$D1" | jq -e '.ok' >/dev/null || fail "delete $D1"
 [[ "$(vs list | jq '.sites | length')" == 1 ]] || fail "registro di $D1 ancora presente"
 ls "$SITES_BACKUPS/$D1"-*.tar.gz >/dev/null || fail "archivio file di $D1"
 ls "$SITES_BACKUPS/$D1"-*.sql.gz >/dev/null || fail "dump di $D1"
 id "$s" >/dev/null 2>&1 && fail "utente $s ancora presente"
 [[ ! -e "/etc/nginx/conf.d/$D1.conf" ]] || fail "vhost di $D1 ancora presente"
+[[ -z "$(mariadb -N -e "SHOW DATABASES LIKE '$s'")" ]] || fail "DB $s ancora presente"
+[[ "$(mariadb -N -e "SELECT COUNT(*) FROM mysql.user WHERE User='$s'")" == 0 ]] || fail "utente DB $s ancora presente"
+[[ ! -e "$pool" ]] || fail "pool di $D1 ancora presente"
+[[ ! -e "/etc/letsencrypt/live/$D1" ]] || fail "certificato di $D1 ancora presente"
+[[ ! -e "$r" ]] || fail "cartella di $D1 ancora presente"
+[[ ! -e "$rotf" ]] || fail "logrotate di $D1 ancora presente"
+tarf="$(compgen -G "$SITES_BACKUPS/$D1-*.tar.gz" | head -n1)"
+lista="$(tar -tzf "$tarf")"
+[[ "$lista" == *"$D1/public/index.php"* ]] || fail "index.php non è nell'archivio: $lista"
+sqlf="$(compgen -G "$SITES_BACKUPS/$D1-*.sql.gz" | head -n1)"
+dump="$(zcat "$sqlf")"
+[[ "$dump" == *"$s"* ]] || fail "il dump non contiene il DB $s"
 vs delete "$D2" | jq -e '.ok' >/dev/null || fail "delete $D2"
 [[ "$(vs list | jq '.sites | length')" == 0 ]] || fail "siti rimasti"
 
