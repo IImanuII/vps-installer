@@ -73,7 +73,10 @@ manifest_write() {
   if [[ -f "$f" ]]; then
     old="$(jq -c '.panel // null | if . == null then null else {version, deployed_at, repo} end' "$f" 2>/dev/null)" || old=null
   fi
-  manifest_build     | jq --argjson old "${old:-null}" 'if .panel != null and $old != null then .panel += ($old | with_entries(select(.value != null))) else . end'     | write_file "$f" 640 "root:$(manifest_group)"
+  manifest_build \
+    | jq --argjson old "${old:-null}" \
+      'if .panel != null and $old != null then .panel += ($old | with_entries(select(.value != null))) else . end' \
+    | write_file "$f" 640 "root:$(manifest_group)"
 }
 
 # manifest_set FILTRO [ARGOMENTI_JQ...]
