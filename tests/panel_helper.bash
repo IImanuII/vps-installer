@@ -7,7 +7,7 @@ pd_test_setup() {
   export PD_TEST=1 PD_AS_PANEL=0 PD_SKIP_TELEGRAM_CHECK=1
   export PD_HEALTH_URL=http://127.0.0.1:9/health PD_CURL_RESOLVE="" PD_HEALTH_SLEEP=0
   export PD_BACKUPS="$BATS_TEST_TMPDIR/backups" PD_CRON="$BATS_TEST_TMPDIR/cron-vps-panel"
-  export PD_LOCK="$BATS_TEST_TMPDIR/update.lock" PD_KEY="$VPS_OPT/secrets/panel-deploy-key"
+  export PD_LOCK="$BATS_TEST_TMPDIR/update.lock" PD_KEY="$VPS_OPT/secrets/panel-deploy-key" PD_GIT_DIR="$BATS_TEST_TMPDIR/panel.git"
   export PD_PHP="$BATS_TEST_TMPDIR/bin/php" VPS_LIB="$REPO_ROOT/lib"
   export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
   P="$BATS_TEST_TMPDIR/panel"
@@ -52,8 +52,7 @@ printf "%s\n" "$*" >>"$T/php.args"; cat >>"$T/php.stdin"; exit "${PHP_RC:-0}"'
 # pd_test_installed TAG — la radice come la lascia un'installazione riuscita a TAG.
 pd_test_installed() {
   pd_load
-  pd_git init -q -b main
-  pd_git remote add origin "$PANEL_REPO"
+  pd_repo_init
   pd_git fetch -q --tags origin
   pd_checkout "$1"
   manifest_set '.panel.version = $v' --arg v "${1#v}"

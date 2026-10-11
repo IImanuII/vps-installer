@@ -8,6 +8,7 @@
 : "${PANEL_REPO:=git@github.com:IImanuII/vps-panel.git}"
 : "${PD_REPO_WEB:=https://github.com/IImanuII/vps-panel}"
 : "${PD_KEY:=$VPS_OPT/secrets/panel-deploy-key}"
+: "${PD_GIT_DIR:=$VPS_OPT/panel.git}"
 : "${PD_KNOWN_HOSTS:=$VPS_TEMPLATES/github-known-hosts}"
 : "${PD_BACKUPS:=$VPS_OPT/backups/panel}"
 : "${PD_CRON:=/etc/cron.d/vps-panel}"
@@ -27,15 +28,45 @@ pd_load() {
 }
 
 pd_git() {
-  GIT_SSH_COMMAND="ssh -i $PD_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$PD_KNOWN_HOSTS" \
-    git -c safe.directory="$PANEL_ROOT" -c advice.detachedHead=false -C "$PANEL_ROOT" "$@"
+  GIT_SSH_COMMAND="ssh -i '$PD_KEY' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$PD_KNOWN_HOSTS'"     git --git-dir="$PD_GIT_DIR" --work-tree="$PANEL_ROOT"     -c safe.directory="$PANEL_ROOT" -c advice.detachedHead=false "$@"
+}
+
+# pd_repo_init — crea (se manca) la git dir fuori dalla radice e imposta origin.
+pd_repo_init() {
+  if [[ ! -d "$PD_GIT_DIR" ]]; then
+    install -d -m 700 "$PD_GIT_DIR" || return 1
+    git --git-dir="$PD_GIT_DIR" init -q -b main || return 1
+  fi
+  pd_git config core.bare false || return 1
+  if pd_git remote get-url origin >/dev/null 2>&1; then
+    pd_git remote set-url origin "$PANEL_REPO" || return 1
+  else
+    pd_git remote add origin "$PANEL_REPO" || return 1
+  fi
+}
+
+# pd_repo_ok — la git dir è una vera cartella, di root, non scrivibile da altri.
+pd_repo_ok() {
+  [[ -d "$PD_GIT_DIR" && ! -L "$PD_GIT_DIR" ]] || return 1
+  [[ "${VPS_NO_CHOWN:-}" == 1 ]] && return 0
+  local info perm
+  info="$(stat -c '%u %a' "$PD_GIT_DIR")" || return 1
+  [[ "${info%% *}" == 0 ]] || return 1
+  perm="${info#* }"
+  (( (8#$perm & 8#022) == 0 )) || return 1
 }
 
 pd_key_ensure() {
-  [[ -f "$PD_KEY" ]] && return 0
   install -d -m 700 "$(dirname "$PD_KEY")" || return 1
-  ssh-keygen -q -t ed25519 -N '' -C "vps-panel@$(hostname)" -f "$PD_KEY" || return 1
-  chmod 600 "$PD_KEY"
+  chmod 700 "$(dirname "$PD_KEY")" || return 1
+  if [[ ! -f "$PD_KEY" ]]; then
+    ssh-keygen -q -t ed25519 -N '' -C "vps-panel@$(hostname)" -f "$PD_KEY" || return 1
+  fi
+  chmod 600 "$PD_KEY" || return 1
+  if [[ ! -f "$PD_KEY.pub" ]]; then
+    ssh-keygen -y -f "$PD_KEY" >"$PD_KEY.pub" || return 1
+    chmod 644 "$PD_KEY.pub" || return 1
+  fi
 }
 
 pd_latest_tag() {
@@ -52,10 +83,22 @@ pd_ver_gt() {
 }
 
 # pd_checkout TAG — codice al rilascio TAG; config/.env, logs/ e storage/ sono
-# ignorati da git e restano come sono. Tutto torna dell'utente panel.
+# ignorati da git e restano come sono. Solo i file tracciati e le loro cartelle
+# tornano a panel (chown -h, mai -R: non si segue nessun link simbolico).
 pd_checkout() {
+  local f d
   pd_git checkout -q -f "$1" || return 1
-  own -R panel:panel "$PANEL_ROOT" || return 1
+  [[ "${VPS_NO_CHOWN:-}" == 1 ]] && return 0
+  declare -A seen=()
+  while IFS= read -r -d '' f; do
+    chown -h panel:panel "$PANEL_ROOT/$f" || return 1
+    d="$(dirname "$f")"
+    while [[ "$d" != . && -z "${seen[$d]:-}" ]]; do
+      seen[$d]=1
+      chown -h panel:panel "$PANEL_ROOT/$d" || return 1
+      d="$(dirname "$d")"
+    done
+  done < <(pd_git ls-files -z)
 }
 
 # pd_env_merge TOKEN — APP_KEY solo se manca (cambiarla renderebbe illeggibili i

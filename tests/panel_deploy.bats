@@ -42,15 +42,14 @@ setup() {
   pd_test_tag v3.0.0-rc1
   pd_test_tag latest
   pd_load
-  pd_git init -q -b main
-  pd_git remote add origin "$PANEL_REPO"
+  pd_repo_init
   pd_git fetch -q --tags origin
   [ "$(pd_latest_tag)" = v1.10.0 ]
 }
 
 @test "pd_latest_tag senza tag non stampa niente e non fallisce" {
   pd_load
-  pd_git init -q -b main
+  pd_repo_init
   run pd_latest_tag
   [ "$status" -eq 0 ]
   [ -z "$output" ]
@@ -92,4 +91,51 @@ setup() {
   printf 'DB_NAME=pan;el\n' >"$PD_ENV"
   run pd_db_name
   [ "$status" -eq 1 ]
+}
+
+@test "la git dir sta fuori dalla radice: nessun .git nella radice" {
+  pd_test_installed v1.0.0
+  [ ! -e "$P/.git" ]
+  [ -d "$PD_GIT_DIR" ]
+  [ "$(pd_current_tag)" = v1.0.0 ]
+}
+
+@test "pd_repo_init è idempotente e origin è PANEL_REPO" {
+  pd_load
+  pd_repo_init
+  pd_repo_init
+  [ "$(pd_git remote get-url origin)" = "$PANEL_REPO" ]
+  [ "$(pd_git remote | wc -l)" -eq 1 ]
+  [ "$(pd_git config core.bare)" = false ]
+  PANEL_REPO=/altro/repo pd_repo_init
+  [ "$(pd_git remote get-url origin)" = /altro/repo ]
+}
+
+@test "pd_repo_ok: falso per cartella mancante e per link simbolico" {
+  pd_load
+  ! pd_repo_ok
+  pd_repo_init
+  pd_repo_ok
+  mv "$PD_GIT_DIR" "$BATS_TEST_TMPDIR/vera.git"
+  ln -s "$BATS_TEST_TMPDIR/vera.git" "$PD_GIT_DIR"
+  ! pd_repo_ok
+}
+
+@test "pd_checkout non segue link simbolici nel work tree" {
+  pd_test_installed v1.0.0
+  ln -s /etc/passwd "$P/trappola"
+  pd_checkout v1.1.0
+  [ -L "$P/trappola" ]
+  # il blocco chown usa -h e non -R (nei test è saltato: VPS_NO_CHOWN=1)
+  grep -q 'chown -h' "$REPO_ROOT/lib/panel_deploy.sh"
+  ! grep -q 'chown -R\|own -R' "$REPO_ROOT/lib/panel_deploy.sh"
+}
+
+@test "pd_key_ensure: cartella 700, rigenera .pub mancante" {
+  pd_key_ensure
+  [ "$(stat -c %a "$(dirname "$PD_KEY")")" = 700 ]
+  first="$(cut -d' ' -f1,2 "$PD_KEY.pub")"
+  rm "$PD_KEY.pub"
+  pd_key_ensure
+  [ "$(cut -d' ' -f1,2 "$PD_KEY.pub")" = "$first" ]
 }
