@@ -92,8 +92,27 @@ pd_ver_gt() {
 # chown -R -P -h sull'intera radice è la forma sicura: coreutils scende con
 # fchownat su descrittori di directory e non segue mai i link simbolici, mentre
 # un giro per percorso potrebbe essere eluso scambiando una cartella con un link.
+# I file di sviluppo del repository (PD_DEV_PATHS) non arrivano nella radice:
+# sparse checkout; read-tree li toglie anche da una radice già installata.
+PD_DEV_PATHS=(/.claude/ /Documenti/ /tests/ /infra/ /PRODUCT.md)
+
+pd_sparse_setup() {
+  local p
+  pd_git config core.sparseCheckout true || return 1
+  pd_git config core.sparseCheckoutCone false || return 1
+  mkdir -p "$PD_GIT_DIR/info" || return 1
+  {
+    echo '/*'
+    for p in "${PD_DEV_PATHS[@]}"; do
+      echo "!$p"
+    done
+  } >"$PD_GIT_DIR/info/sparse-checkout"
+}
+
 pd_checkout() {
+  pd_sparse_setup || return 1
   pd_git checkout -q -f "$1" || return 1
+  pd_git read-tree -mu HEAD || return 1
   [[ "${VPS_NO_CHOWN:-}" == 1 ]] && return 0
   chown -R -P -h panel:panel -- "$PANEL_ROOT" || return 1
 }

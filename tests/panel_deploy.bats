@@ -73,6 +73,43 @@ setup() {
   grep -qx riga "$P/logs/app.log"
 }
 
+# Rilascio v1.2.0 con i file di sviluppo che stanno nel repository di Plancia.
+dev_release() {
+  local f
+  for f in .claude/CLAUDE.md Documenti/note.md tests/t.php infra/nginx.conf PRODUCT.md app/cli/nuovo.php; do
+    mkdir -p "$PD_WORK/$(dirname "$f")"
+    echo x >"$PD_WORK/$f"
+  done
+  git -C "$PD_WORK" add -A && git -C "$PD_WORK" commit -qm v1.2.0 && git -C "$PD_WORK" tag v1.2.0
+  git -C "$PD_WORK" push -q "$PANEL_REPO" main --tags
+}
+
+@test "pd_checkout: i file di sviluppo non arrivano nella radice" {
+  dev_release
+  pd_test_installed v1.2.0
+  [ -f "$P/app/cli/nuovo.php" ]
+  [ -f "$P/install/schema.sql" ]
+  for f in .claude Documenti tests infra PRODUCT.md; do
+    [ ! -e "$P/$f" ]
+  done
+  [ -z "$(pd_git status --porcelain --untracked-files=no)" ]
+  [ "$(pd_current_tag)" = v1.2.0 ]
+}
+
+@test "pd_checkout toglie i file di sviluppo da una radice installata senza filtro" {
+  dev_release
+  pd_load
+  pd_repo_init
+  pd_git fetch -q --tags origin
+  pd_git checkout -q -f v1.2.0
+  [ -f "$P/Documenti/note.md" ]
+  pd_checkout v1.2.0
+  for f in .claude Documenti tests infra PRODUCT.md; do
+    [ ! -e "$P/$f" ]
+  done
+  [ -f "$P/app/cli/nuovo.php" ]
+}
+
 @test "pd_env_merge aggiunge APP_KEY una volta e il token" {
   pd_load
   pd_env_merge "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
