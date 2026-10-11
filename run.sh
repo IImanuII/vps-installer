@@ -47,6 +47,10 @@ main() {
   ((EUID == 0)) || die "Esegui come root: sudo bash $0"
   touch "$VPS_LOG"
   chmod 600 "$VPS_LOG"
+  if [[ "${1:-}" == "--tools-only" ]]; then
+    opt_tools_only
+    return
+  fi
   if [[ "${1:-}" == "--reset" ]]; then
     rm -f "$VPS_ANSWERS" "$VPS_STATE" "$VPS_ROOT/summary.env"
   fi

@@ -38,3 +38,20 @@ setup() {
   manifest_set '.mail.configured = true | .mail.alert_email = $e' --arg e avvisi@gmail.com
   [ "$(jq -r .mail.alert_email "$VPS_OPT/manifest.json")" = avvisi@gmail.com ]
 }
+
+@test "manifest_write conserva version, deployed_at e repo del pannello" {
+  manifest_write
+  manifest_set '.panel.version = "2.1.0" | .panel.deployed_at = "2026-10-11T10:00:00+02:00" | .panel.repo = "git@github.com:IImanuII/vps-panel.git"'
+  manifest_write
+  [ "$(jq -r .panel.version "$VPS_OPT/manifest.json")" = 2.1.0 ]
+  [ "$(jq -r .panel.repo "$VPS_OPT/manifest.json")" = "git@github.com:IImanuII/vps-panel.git" ]
+  [ "$(jq -r .panel.domain "$VPS_OPT/manifest.json")" = panel.miosito.it ]
+}
+
+@test "manifest_write senza pannello non resuscita i campi vecchi" {
+  manifest_write
+  manifest_set '.panel.version = "2.1.0"'
+  PANEL_ENABLED=no
+  manifest_write
+  [ "$(jq -r .panel "$VPS_OPT/manifest.json")" = null ]
+}

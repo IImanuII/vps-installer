@@ -3,11 +3,7 @@
 
 step_main() {
   log "Strumenti: installo /opt/vps"
-  install -d -m 755 "$VPS_OPT" "$VPS_OPT/bin" "$VPS_OPT/lib" "$VPS_OPT/templates"
-  install -d -m 700 "$VPS_OPT/secrets"
-  install -m 644 "$VPS_ROOT"/lib/*.sh "$VPS_OPT/lib/"
-  install -m 644 "$VPS_ROOT"/templates/* "$VPS_OPT/templates/"
-  install -m 755 "$VPS_ROOT"/tools/vps-* "$VPS_OPT/bin/"
+  opt_install_files
   manifest_write
 
   if is_yes "$PANEL_ENABLED"; then

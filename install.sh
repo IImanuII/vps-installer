@@ -13,6 +13,7 @@ usage() {
   cat <<'EOF'
 Uso: sudo bash install.sh [opzioni]
   --reset           ricomincia dalla procedura guidata
+  --tools-only      aggiorna solo gli script di /opt/vps (VPS già installata)
   --local FILE      usa un archivio locale invece di scaricarlo
   -h, --help        mostra questo aiuto
 Se la connessione cade: ricollegati e lancia  sudo tmux attach -t vps-installer
@@ -113,12 +114,13 @@ ensure_release() {
 
 main() {
   set -Eeuo pipefail
-  local self orig_args=("$@") local_tar="" run_args=()
+  local self orig_args=("$@") local_tar="" run_args=() tools_only=0
   self="$(readlink -f "$0")"
   while (($#)); do
     case "$1" in
       --local) local_tar="${2:?manca il file}"; local_tar="$(readlink -f "$local_tar")"; shift 2 ;;
       --reset) run_args+=(--reset); shift ;;
+      --tools-only) run_args+=(--tools-only); tools_only=1; shift ;;
       -h | --help) usage; exit 0 ;;
       *) echo "Opzione sconosciuta: $1" >&2; usage; exit 1 ;;
     esac
@@ -143,6 +145,10 @@ main() {
     read -r -p "Premi Invio per chiudere." _ || true
     exit 1
   }
+  if ((tools_only)); then
+    rm -rf "$VPS_DEST"
+    echo "Script di /opt/vps aggiornati. Per il pannello: sudo vps-panel-install (prima volta) o sudo vps-panel-update."
+  fi
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

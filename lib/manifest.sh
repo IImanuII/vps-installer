@@ -65,8 +65,15 @@ manifest_build() {
     }'
 }
 
+# I campi che scrive vps-panel-install (version, deployed_at, repo) non vengono
+# dalla procedura guidata: si conservano quando il manifest si riscrive.
 manifest_write() {
-  manifest_build | write_file "$(manifest_path)" 640 "root:$(manifest_group)"
+  local f old=null
+  f="$(manifest_path)"
+  if [[ -f "$f" ]]; then
+    old="$(jq -c '.panel // null | if . == null then null else {version, deployed_at, repo} end' "$f" 2>/dev/null)" || old=null
+  fi
+  manifest_build     | jq --argjson old "${old:-null}" 'if .panel != null and $old != null then .panel += ($old | with_entries(select(.value != null))) else . end'     | write_file "$f" 640 "root:$(manifest_group)"
 }
 
 # manifest_set FILTRO [ARGOMENTI_JQ...]
