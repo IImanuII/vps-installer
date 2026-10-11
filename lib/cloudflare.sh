@@ -129,3 +129,28 @@ cf_write_ini() {
   printf 'dns_cloudflare_api_token = %s\n' "$1" \
     | write_file "$VPS_OPT/secrets/cloudflare.ini" 600 root:root
 }
+
+# cf_list_zones — le zone attive visibili dal token, una per riga.
+cf_list_zones() {
+  local page=1 pages resp
+  while :; do
+    resp="$(cf_api GET "/zones?status=active&per_page=50&page=$page")" || return 1
+    jq -e '.success == true' >/dev/null 2>&1 <<<"$resp" || return 1
+    jq -r '.result[].name' <<<"$resp"
+    pages="$(jq -r '.result_info.total_pages // 1' <<<"$resp")"
+    ((page < pages)) || break
+    page=$((page + 1))
+  done
+}
+
+# cf_create_record ZONE_ID TIPO NOME CONTENUTO — record proxato nuovo; stampa l'id.
+cf_create_record() {
+  local body resp
+  body="$(jq -nc --arg t "$2" --arg n "$3" --arg c "$4" '{type: $t, name: $n, content: $c, ttl: 1, proxied: true}')"
+  resp="$(cf_api POST "/zones/$1/dns_records" "$body")" || return 1
+  if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$resp"; then
+    log "Cloudflare: record $2 $3 non creato: $(jq -c '.errors // empty' <<<"$resp" 2>/dev/null || true)"
+    return 1
+  fi
+  jq -r '.result.id' <<<"$resp"
+}

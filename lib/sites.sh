@@ -122,3 +122,83 @@ site_validate_new() {
     return 1
   fi
 }
+
+# site_cf_token — il token di sistema (lo stesso di certbot) per cf_api.
+site_cf_token() {
+  CF_API_TOKEN="$(cf_token_from_ini)"
+  export CF_API_TOKEN
+  [[ -n "$CF_API_TOKEN" ]]
+}
+
+# site_names DOMINIO — i nomi serviti: il dominio e, se richiesto, www.
+site_names() {
+  printf '%s\n' "$1"
+  if [[ "$(site_reg_get "$1" .www)" == true ]]; then
+    printf 'www.%s\n' "$1"
+  fi
+}
+
+# site_dns_add DOMINIO — record A (e AAAA con IPv6) proxati verso la VPS per ogni
+# nome. Prima si controllano tutti i nomi, poi si crea: con un conflitto non si
+# crea niente. Un record già giusto si riusa e non si annota, quindi
+# all'eliminazione resta dov'è.
+site_dns_add() {
+  local d="$1" zone zid zname v4 v6 n recs conflicts type ip id t
+  local todo=()
+  zone="$(cf_find_zone "$d")" \
+    || { site_fail "la zona di $d non è su Cloudflare o il token non la vede: serve un token con Zone: Read e DNS: Edit su tutte le zone"; return 1; }
+  read -r zid zname <<<"$zone"
+  site_reg_update "$d" '.zone = {id: $id, name: $name}' --arg id "$zid" --arg name "$zname" || return 1
+  v4="$(jq -r '.ipv4 // empty' "$(manifest_path)")"
+  v6="$(jq -r '.ipv6 // empty' "$(manifest_path)")"
+  while read -r n; do
+    recs="$(cf_list_records "$zid" "$n")" || { site_fail "Cloudflare non risponde (record di $n)"; return 1; }
+    conflicts="$(cf_dns_conflicts "$recs" "$v4" "$v6")"
+    if [[ -n "$conflicts" ]]; then
+      site_fail "il record ${conflicts%%$'\n'*} punta altrove: toglilo da Cloudflare o scegli un altro nome"
+      return 1
+    fi
+    for type in A AAAA; do
+      ip="$v4"
+      [[ "$type" == A ]] || ip="$v6"
+      [[ -n "$ip" ]] || continue
+      if jq -e --arg t "$type" --arg c "$ip" 'any(.result[]; .type == $t and .content == $c)' >/dev/null <<<"$recs"; then
+        continue
+      fi
+      todo+=("$type $n $ip")
+    done
+  done < <(site_names "$d")
+  for t in "${todo[@]}"; do
+    read -r type n ip <<<"$t"
+    id="$(cf_create_record "$zid" "$type" "$n" "$ip")" || { site_fail "Cloudflare non ha creato il record $type di $n"; return 1; }
+    site_reg_update "$d" '.dns_records += [{id: $id, name: $n, type: $t}]' --arg id "$id" --arg n "$n" --arg t "$type" || return 1
+  done
+}
+
+# site_dns_remove DOMINIO — toglie i record annotati; uno che non c'è più non è un errore.
+site_dns_remove() {
+  local d="$1" zid id
+  zid="$(site_reg_get "$d" '.zone.id // empty')"
+  [[ -n "$zid" ]] || return 0
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    cf_delete_record "$zid" "$id" || log "ATTENZIONE: record $id di $d non eliminato da Cloudflare: toglilo a mano"
+  done < <(site_reg_get "$d" '.dns_records[].id')
+  site_reg_update "$d" '.dns_records = []'
+}
+
+# site_cert_issue DOMINIO — certificato Let's Encrypt via DNS Cloudflare per tutti i nomi.
+site_cert_issue() {
+  local n args=(certonly -n --agree-tos --register-unsafely-without-email --keep-until-expiring
+    --cert-name "$1" --dns-cloudflare --dns-cloudflare-credentials "$VPS_OPT/secrets/cloudflare.ini"
+    --dns-cloudflare-propagation-seconds 30)
+  while read -r n; do
+    args+=(-d "$n")
+  done < <(site_names "$1")
+  certbot "${args[@]}" >>"$VPS_LOG" 2>&1 \
+    || site_fail "Let's Encrypt non ha rilasciato il certificato (dettagli in $VPS_LOG)"
+}
+
+site_cert_remove() {
+  certbot delete -n --cert-name "$1" >>"$VPS_LOG" 2>&1 || true
+}
