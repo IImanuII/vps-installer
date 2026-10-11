@@ -212,6 +212,26 @@ setup() {
   [ ! -f "$PD_BACKUPS/vecchio-2.sql.gz" ]
 }
 
+@test "pd_dump: due dump nello stesso secondo non si sovrascrivono" {
+  pd_test_installed v1.0.0
+  make_stub date 'echo 20261011-120000'
+  a="$(pd_dump v1.0.0)"
+  b="$(pd_dump v1.0.0)"
+  [ "$a" != "$b" ]
+  [ -f "$a" ] && [ -f "$b" ]
+  [[ "$(basename "$a")" == v1.0.0-20261011-120000-*.sql.gz ]]
+  [ "$(stat -c %a "$b")" = 600 ]
+}
+
+@test "pd_restore: dump corrotto, nessun DROP del database" {
+  pd_test_installed v1.0.0
+  echo 'non sono un gzip' >"$BATS_TEST_TMPDIR/rotto.sql.gz"
+  run pd_restore "$BATS_TEST_TMPDIR/rotto.sql.gz"
+  [ "$status" -eq 1 ]
+  run grep -q 'DROP DATABASE' "$BATS_TEST_TMPDIR/mariadb.args"
+  [ "$status" -ne 0 ]
+}
+
 @test "pd_restore ricrea il database e carica il dump" {
   pd_test_installed v1.0.0
   printf -- '-- contenuto\n' | gzip >"$BATS_TEST_TMPDIR/d.sql.gz"

@@ -86,8 +86,9 @@ pd_ver_gt() {
   [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" == "$1" ]]
 }
 
-# pd_checkout TAG — codice al rilascio TAG; config/.env, logs/ e storage/ sono
-# ignorati da git e restano come sono. Tutto torna a panel.
+# pd_checkout TAG — codice al rilascio TAG; config/.env, logs/ e storage/ hanno
+# il contenuto intatto (ignorato da git); proprietà riportata a panel come tutto
+# il resto.
 # chown -R -P -h sull'intera radice è la forma sicura: coreutils scende con
 # fchownat su descrittori di directory e non segue mai i link simbolici, mentre
 # un giro per percorso potrebbe essere eluso scambiando una cartella con un link.
@@ -154,12 +155,14 @@ pd_migrations() {
   done < <(printf '%s\n' "$names" | sort -V)
 }
 
-# pd_dump TAG — dump gzip del database del pannello; stampa il percorso.
+# pd_dump TAG — dump gzip del database del pannello (600, nome unico anche per
+# due dump nello stesso secondo); stampa il percorso.
 pd_dump() {
-  local db f
+  local db f stamp
   db="$(pd_db_name)" || return 1
   install -d -m 700 "$PD_BACKUPS" || return 1
-  f="$PD_BACKUPS/${1:-senza-tag}-$(date +%Y%m%d-%H%M%S).sql.gz"
+  stamp="$(date +%Y%m%d-%H%M%S)" || return 1
+  f="$(umask 077 && mktemp "$PD_BACKUPS/${1:-senza-tag}-$stamp-XXXX.sql.gz")" || return 1
   (
     set -o pipefail
     umask 077
@@ -174,6 +177,8 @@ pd_dump() {
 pd_restore() {
   local db
   db="$(pd_db_name)" || return 1
+  # un dump illeggibile non deve costare il database che c'è
+  gzip -t -- "$1" || return 1
   mariadb -e "DROP DATABASE IF EXISTS \`$db\`; CREATE DATABASE \`$db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" || return 1
   (set -o pipefail; gunzip -c "$1" | mariadb "$db") || return 1
 }
