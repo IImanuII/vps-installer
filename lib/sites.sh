@@ -388,3 +388,225 @@ site_db_remove() {
   printf "DROP DATABASE IF EXISTS \`%s\`;\nDROP USER IF EXISTS '%s'@'localhost';\n" "$slug" "$slug" \
     | mariadb >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: database o utente $slug non eliminati"
 }
+
+# site_step DOMINIO OP PASSO FUNZIONE [ARG...] — registra il passo e lo esegue in
+# una subshell: un die dentro una funzione di libreria ferma il passo, non il
+# lavoro, che così può ancora disfare quanto fatto.
+site_step() {
+  local d="$1" op="$2" step="$3"
+  shift 3
+  site_job "$d" "$op" "$step" || return 1
+  (
+    set -o pipefail
+    "$@"
+  )
+}
+
+# site_error_text PASSO — il motivo scritto da site_fail, o uno generico.
+site_error_text() {
+  local m=""
+  if [[ -n "${SITE_ERROR_FILE:-}" && -f "$SITE_ERROR_FILE" ]]; then
+    m="$(head -n 1 "$SITE_ERROR_FILE")"
+  fi
+  printf '%s' "${m:-passo \"$1\" non riuscito (dettagli in $VPS_LOG)}"
+}
+
+site_create_step() {
+  case "$1" in
+    dns) site_dns_add "$2" ;;
+    user) site_user_add "$2" ;;
+    php) site_pool_add "$2" ;;
+    cert) site_cert_issue "$2" ;;
+    nginx) site_vhost_add "$2" normal ;;
+    db)
+      if [[ -z "$3" ]]; then
+        site_fail "password del database mancante"
+        return 1
+      fi
+      site_db_add "$2" "$3"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# site_undo_create DOMINIO PASSO... — disfa i passi tentati, dall'ultimo al primo.
+# Ogni rimozione tollera ciò che non c'è.
+site_undo_create() {
+  local d="$1" i
+  shift
+  for ((i = $#; i >= 1; i--)); do
+    case "${!i}" in
+      db) (site_db_remove "$d") ;;
+      nginx) (site_vhost_remove "$d") ;;
+      cert) (site_cert_remove "$d") ;;
+      php) (site_pool_remove "$d") ;;
+      user) (site_user_remove "$d") || log "ATTENZIONE: utente o cartella di $d non rimossi" ;;
+      dns) (site_dns_remove "$d") ;;
+    esac
+  done
+}
+
+site_job_create() {
+  local d="$1" slug type pass="" step msg
+  local steps=(dns user) tried=()
+  slug="$(site_reg_get "$d" .slug)"
+  type="$(site_reg_get "$d" .type)"
+  if [[ "$(site_reg_get "$d" .db)" == true ]]; then
+    pass="$(cat "$SITES_RUN/$slug.pass" 2>/dev/null || true)"
+    rm -f "$SITES_RUN/$slug.pass"
+  fi
+  [[ "$type" != php ]] || steps+=(php)
+  steps+=(cert nginx)
+  [[ "$(site_reg_get "$d" .db)" != true ]] || steps+=(db)
+  for step in "${steps[@]}"; do
+    tried+=("$step")
+    if ! site_step "$d" create "$step" site_create_step "$step" "$d" "$pass"; then
+      msg="$(site_error_text "$step")"
+      site_undo_create "$d" "${tried[@]}"
+      site_reg_update "$d" '.state = "error"'
+      site_job "$d" create "$step" "$msg"
+      return 1
+    fi
+  done
+  (site_logrotate_add "$d") || log "ATTENZIONE: rotazione dei log di $d non configurata"
+  site_reg_update "$d" '.state = "active"'
+  site_job "$d" create "done"
+}
+
+# site_archive DOMINIO — file e dump del sito in SITES_BACKUPS (root 600). Se
+# qualcosa non va non resta un archivio a metà e si restituisce errore.
+site_archive() {
+  local d="$1" slug base ok=1
+  slug="$(site_reg_get "$d" .slug)"
+  base="$SITES_BACKUPS/$d-$(date +%Y%m%d-%H%M%S)"
+  install -d -m 700 "$SITES_BACKUPS" || return 1
+  (
+    umask 077
+    tar -czf "$base.tar.gz" -C "$SITES_WWW" "$d"
+  ) >>"$VPS_LOG" 2>&1 || ok=0
+  if ((ok)) && [[ "$(site_reg_get "$d" .db)" == true ]]; then
+    (
+      umask 077
+      set -o pipefail
+      mariadb-dump --single-transaction "$slug" | gzip >"$base.sql.gz"
+    ) 2>>"$VPS_LOG" || ok=0
+  fi
+  if ((ok)); then
+    return 0
+  fi
+  rm -f "$base.tar.gz" "$base.sql.gz"
+  site_fail "archivio di $d non riuscito: niente è stato cancellato (dettagli in $VPS_LOG)"
+}
+
+# site_job_delete DOMINIO — archivio (salvo un sito in errore: c'è solo da
+# pulire), poi rimozione di tutto, record DNS creati compresi.
+site_job_delete() {
+  local d="$1" prev msg
+  prev="$(site_reg_get "$d" '.prev_state // "active"')"
+  if [[ "$prev" != error ]]; then
+    if ! site_step "$d" delete archive site_archive "$d"; then
+      msg="$(site_error_text archive)"
+      site_reg_update "$d" '.state = $s' --arg s "$prev"
+      site_job "$d" delete archive "$msg"
+      return 1
+    fi
+  fi
+  site_job "$d" delete remove
+  (site_vhost_remove "$d")
+  (site_pool_remove "$d")
+  (site_cert_remove "$d")
+  (site_logrotate_remove "$d")
+  (site_db_remove "$d")
+  (site_user_remove "$d") || log "ATTENZIONE: utente o cartella di $d non rimossi"
+  (site_dns_remove "$d")
+  rm -f "$(site_reg_path "$d")"
+  log "vps-site: $d eliminato"
+}
+
+site_prune() {
+  [[ -d "$SITES_BACKUPS" ]] || return 0
+  find "$SITES_BACKUPS" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.sql.gz' \) -mtime +30 -delete
+}
+
+# site_abort DOMINIO OP MESSAGGIO — un lavoro che non può nemmeno partire.
+site_abort() {
+  if [[ "$2" == create ]]; then
+    site_reg_update "$1" '.state = "error"'
+  else
+    site_reg_update "$1" '.state = (.prev_state // "active")'
+  fi
+  site_job "$1" "$2" "$(site_reg_get "$1" .job.step)" "$3"
+}
+
+# site_run OP DOMINIO — il lavoro in background (unità systemd), uno alla volta
+# su tutta la macchina: gli altri aspettano il lucchetto fino a 10 minuti.
+site_run() {
+  local op="$1" d="$2" rc=0
+  if ! valid_domain "$d" || ! site_reg_exists "$d"; then
+    log "vps-site _run: sito sconosciuto: $d"
+    return 1
+  fi
+  [[ "$op" == create || "$op" == delete ]] || return 1
+  install -d -m 700 "$SITES_RUN"
+  SITE_ERROR_FILE="$SITES_RUN/$(site_reg_get "$d" .slug).err"
+  rm -f "$SITE_ERROR_FILE"
+  exec 9>"$SITES_LOCK"
+  if ! flock -w "${SITES_LOCK_WAIT:-600}" 9; then
+    exec 9>&-
+    site_abort "$d" "$op" "la coda dei lavori è ferma da troppo tempo: riprova"
+    return 1
+  fi
+  if ! site_cf_token; then
+    exec 9>&-
+    site_abort "$d" "$op" "token Cloudflare mancante in $VPS_OPT/secrets/cloudflare.ini"
+    return 1
+  fi
+  if [[ "$op" == create ]]; then
+    site_job_create "$d" || rc=1
+  else
+    site_job_delete "$d" || rc=1
+  fi
+  rm -f "$SITE_ERROR_FILE"
+  # Libera il lucchetto: in un processo a sé si chiude da solo, ma chi chiama
+  # site_run da una shell che resta viva (i test) non deve bloccare il lavoro dopo.
+  exec 9>&-
+  return "$rc"
+}
+
+# site_refresh DOMINIO — un lavoro in corso la cui unità systemd non c'è più
+# (riavvio, processo ucciso). Una creazione diventa errore, così il pannello
+# offre Elimina; un'eliminazione torna allo stato di prima, perché l'archivio
+# potrebbe non esserci ancora. Il primo minuto non si guarda: tra la scrittura
+# del registro e l'avvio dell'unità passa qualche istante.
+site_refresh() {
+  local d="$1" state op ts slug
+  state="$(site_reg_get "$d" .state)"
+  [[ "$state" == creating || "$state" == deleting ]] || return 0
+  ts="$(site_reg_get "$d" '.job.ts // 0')"
+  (($(date +%s) - ts > 60)) || return 0
+  op="$(site_reg_get "$d" .job.op)"
+  slug="$(site_reg_get "$d" .slug)"
+  if systemctl is-active --quiet "vps-site-$slug-$op.service"; then
+    return 0
+  fi
+  if [[ "$state" == creating ]]; then
+    site_abort "$d" create "operazione interrotta: elimina il sito per pulire i resti"
+  else
+    site_abort "$d" delete "eliminazione interrotta: riprova"
+  fi
+}
+
+site_list_json() {
+  local f files=()
+  for f in "$SITES_DIR"/*.json; do
+    [[ -f "$f" ]] && files+=("$f")
+  done
+  if ((${#files[@]} == 0)); then
+    echo '[]'
+    return
+  fi
+  for f in "${files[@]}"; do
+    site_refresh "$(basename "$f" .json)"
+  done
+  jq -s 'sort_by(.domain)' "${files[@]}"
+}

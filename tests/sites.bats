@@ -327,3 +327,151 @@ setup() {
   [ ! -e "$SITES_WWW/blog.miosito.it/db.env" ]
   [[ "$(cat "$SITE_ERROR_FILE")" == *"database"* ]]
 }
+
+# Prepara un sito in creazione come lo lascia `vps-site create`.
+nuovo() { # DOMINIO TIPO WWW DB [PASSWORD]
+  site_reg_new "$1" "$2" "$3" "$4"
+  if [[ -n "${5:-}" ]]; then
+    mkdir -p "$SITES_RUN"
+    printf '%s' "$5" >"$SITES_RUN/$(site_slug "$1").pass"
+  fi
+}
+
+@test "site_run create: tutti i passi, sito attivo, password letta e cancellata" {
+  nuovo blog.miosito.it php no yes 'Password-di-prova-123'
+  site_run create blog.miosito.it
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  [ "$(site_reg_get blog.miosito.it .job.step)" = done ]
+  [ "$(site_reg_get blog.miosito.it .job.error)" = null ]
+  [ -f "$NGINX_CONF_D/blog.miosito.it.conf" ]
+  [ -f "$PHP_POOL_D/site_blog_miosito_it.conf" ]
+  [ -f "$LOGROTATE_D/vps-site-site_blog_miosito_it" ]
+  grep -qx 'DB_PASS=Password-di-prova-123' "$SITES_WWW/blog.miosito.it/db.env"
+  [ ! -e "$SITES_RUN/site_blog_miosito_it.pass" ]
+}
+
+@test "site_run create: certbot fallisce, si disfa tutto e resta l'errore" {
+  nuovo miosito.it php yes no
+  export STUB_RC_certbot=1
+  run site_run create miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get miosito.it .state)" = error ]
+  [ "$(site_reg_get miosito.it .job.step)" = cert ]
+  [[ "$(site_reg_get miosito.it .job.error)" == *"Let's Encrypt"* ]]
+  [ ! -e "$NGINX_CONF_D/miosito.it.conf" ]
+  [ ! -e "$PHP_POOL_D/site_miosito_it.conf" ]
+  [ ! -e "$SITES_WWW/miosito.it" ]
+  grep -q '^DELETE .*/dns_records/rec1' "$BATS_TEST_TMPDIR/cf.log"
+  grep -q '^DELETE .*/dns_records/rec2' "$BATS_TEST_TMPDIR/cf.log"
+  grep -q '^certbot delete -n --cert-name miosito.it' "$CALLS"
+}
+
+@test "site_run create: nginx -t fallisce, nessun vhost resta" {
+  nuovo blog.miosito.it static no no
+  export STUB_RC_nginx=1
+  run site_run create blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .job.step)" = nginx ]
+  [ ! -e "$NGINX_CONF_D/blog.miosito.it.conf" ]
+}
+
+@test "site_run delete: archivio, rimozione completa, registro cancellato" {
+  nuovo blog.miosito.it php no yes 'Password-di-prova-123'
+  site_run create blog.miosito.it
+  echo ciao >"$SITES_WWW/blog.miosito.it/public/ciao.txt"
+  site_reg_update blog.miosito.it '.prev_state = .state | .state = "deleting"'
+  site_run delete blog.miosito.it
+  run ! site_reg_exists blog.miosito.it
+  [ ! -e "$SITES_WWW/blog.miosito.it" ]
+  [ ! -e "$NGINX_CONF_D/blog.miosito.it.conf" ]
+  [ ! -e "$PHP_POOL_D/site_blog_miosito_it.conf" ]
+  tgz="$(ls "$SITES_BACKUPS"/blog.miosito.it-*.tar.gz)"
+  [ "$(stat -c %a "$tgz")" = 600 ]
+  tar -tzf "$tgz" | grep -q 'blog.miosito.it/public/ciao.txt'
+  ls "$SITES_BACKUPS"/blog.miosito.it-*.sql.gz
+  grep -q 'DROP DATABASE IF EXISTS `site_blog_miosito_it`' "$BATS_TEST_TMPDIR/mariadb.sql"
+  grep -q '^DELETE .*/dns_records/rec1' "$BATS_TEST_TMPDIR/cf.log"
+}
+
+@test "site_run delete: archivio non riuscito, niente cancellato e stato di prima" {
+  nuovo blog.miosito.it static no no
+  site_run create blog.miosito.it
+  site_reg_update blog.miosito.it '.state = "disabled"'
+  site_reg_update blog.miosito.it '.prev_state = .state | .state = "deleting"'
+  make_stub tar 'exit 2'
+  run site_run delete blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = disabled ]
+  [[ "$(site_reg_get blog.miosito.it .job.error)" == *"niente è stato cancellato"* ]]
+  [ -d "$SITES_WWW/blog.miosito.it/public" ]
+  [ -f "$NGINX_CONF_D/blog.miosito.it.conf" ]
+  run ls "$SITES_BACKUPS"
+  [ -z "$output" ]
+}
+
+@test "site_run delete di un sito in errore salta l'archivio" {
+  nuovo blog.miosito.it static no no
+  export STUB_RC_certbot=1
+  site_run create blog.miosito.it || true
+  unset STUB_RC_certbot
+  site_reg_update blog.miosito.it '.prev_state = .state | .state = "deleting"'
+  site_run delete blog.miosito.it
+  run ! site_reg_exists blog.miosito.it
+  [ ! -e "$SITES_BACKUPS" ] || [ -z "$(ls "$SITES_BACKUPS")" ]
+}
+
+@test "site_run: lucchetto occupato oltre l'attesa, il lavoro finisce in errore" {
+  nuovo blog.miosito.it static no no
+  export SITES_LOCK_WAIT=1
+  flock "$SITES_LOCK" sleep 5 >/dev/null 2>&1 &
+  pid=$!
+  sleep 0.3
+  run site_run create blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = error ]
+  [[ "$(site_reg_get blog.miosito.it .job.error)" == *"coda"* ]]
+  kill "$pid" 2>/dev/null || true
+}
+
+@test "site_refresh: creazione interrotta diventa errore, eliminazione interrotta torna com'era" {
+  nuovo blog.miosito.it static no no
+  site_reg_update blog.miosito.it '.job.ts = 1'
+  export STUB_RC_systemctl=3
+  site_refresh blog.miosito.it
+  [ "$(site_reg_get blog.miosito.it .state)" = error ]
+  [[ "$(site_reg_get blog.miosito.it .job.error)" == *"interrotta"* ]]
+
+  nuovo altro.miosito.it static no no
+  site_reg_update altro.miosito.it '.state = "active" | .prev_state = .state | .state = "deleting" | .job.op = "delete" | .job.ts = 1'
+  site_refresh altro.miosito.it
+  [ "$(site_reg_get altro.miosito.it .state)" = active ]
+  [[ "$(site_reg_get altro.miosito.it .job.error)" == *"riprova"* ]]
+}
+
+@test "site_refresh non tocca un lavoro appena partito o ancora vivo" {
+  nuovo blog.miosito.it static no no
+  export STUB_RC_systemctl=3
+  site_refresh blog.miosito.it
+  [ "$(site_reg_get blog.miosito.it .state)" = creating ]
+  site_reg_update blog.miosito.it '.job.ts = 1'
+  export STUB_RC_systemctl=0
+  site_refresh blog.miosito.it
+  [ "$(site_reg_get blog.miosito.it .state)" = creating ]
+}
+
+@test "site_list_json: array ordinato, vuoto senza siti" {
+  [ "$(site_list_json)" = "[]" ]
+  site_reg_new zeta.miosito.it static no no
+  site_reg_new alfa.miosito.it static no no
+  [ "$(site_list_json | jq -r '.[0].domain')" = alfa.miosito.it ]
+  [ "$(site_list_json | jq length)" = 2 ]
+}
+
+@test "site_prune cancella solo gli archivi oltre 30 giorni" {
+  mkdir -p "$SITES_BACKUPS"
+  touch -d '40 days ago' "$SITES_BACKUPS/vecchio.miosito.it-20260101-000000.tar.gz"
+  touch "$SITES_BACKUPS/nuovo.miosito.it-20261011-000000.tar.gz"
+  site_prune
+  [ ! -e "$SITES_BACKUPS/vecchio.miosito.it-20260101-000000.tar.gz" ]
+  [ -e "$SITES_BACKUPS/nuovo.miosito.it-20261011-000000.tar.gz" ]
+}
