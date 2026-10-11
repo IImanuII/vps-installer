@@ -120,3 +120,40 @@ tag_now() { git --git-dir="$PD_GIT_DIR" describe --tags --exact-match; }
   [ "$status" -eq 1 ]
   [[ "$output" == *"non è un rilascio"* ]]
 }
+
+@test "aggiornamento interrotto (codice al bersaglio, manifest vecchio): riparte e ripara" {
+  pd_test_installed v1.0.0
+  pd_checkout v1.1.0
+  run bash "$T"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"interrotto"* ]]
+  [[ "$output" != *"Già aggiornata"* ]]
+  grep -qx -- '-- migrazione 1.1.0' "$BATS_TEST_TMPDIR/mariadb.sql"
+  [ "$(tag_now)" = v1.1.0 ]
+  [ "$(jq -r .panel.version "$VPS_OPT/manifest.json")" = 1.1.0 ]
+}
+
+@test "versione del manifest sconosciuta: errore, niente modifiche" {
+  pd_test_installed v1.0.0
+  manifest_set '.panel.version = $v' --arg v 7.7.7
+  run bash "$T"
+  [ "$status" -eq 1 ]
+  [ ! -d "$PD_BACKUPS" ]
+  [ "$(tag_now)" = v1.0.0 ]
+}
+
+@test "manifest corrotto: uscita 1, non 2" {
+  pd_test_installed v1.0.0
+  echo '{rotto' >"$VPS_OPT/manifest.json"
+  run bash "$T"
+  [ "$status" -eq 1 ]
+}
+
+@test "ritorno a versione più vecchia con /health rotto: torna alla nuova, database intatto" {
+  pd_test_installed v1.1.0
+  CURL_RC=22 run bash "$T" --ref v1.0.0
+  [ "$status" -eq 1 ]
+  [ "$(tag_now)" = v1.1.0 ]
+  ! grep -q 'DROP DATABASE' "$BATS_TEST_TMPDIR/mariadb.args"
+  [ "$(jq -r .panel.version "$VPS_OPT/manifest.json")" = 1.1.0 ]
+}

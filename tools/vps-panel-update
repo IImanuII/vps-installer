@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # vps-panel-update [--ref vX.Y.Z] — porta Plancia all'ultimo rilascio (o a uno preciso).
 # Prima un dump del database; se un passo fallisce torna alla versione di prima,
-# codice e database. Uscita: 0 ok o già aggiornata, 1 errore (versione di prima
-# ripristinata o nessuna modifica), 2 ritorno indietro fallito.
+# codice e database. La versione di partenza è quella del manifest: un aggiornamento
+# interrotto (codice già al bersaglio, manifest vecchio) si ripara rilanciando.
+# Uscita: 0 ok o già aggiornata, 1 errore (versione di prima ripristinata, nessuna
+# modifica, oppure codice e database già al bersaglio ma manifest non scritto:
+# rilanciare ripara il manifest), 2 ritorno indietro fallito.
 # Sotto sudo l'ambiente del chiamante non deve influenzare lo script.
 if [[ -n "${SUDO_USER:-}" ]]; then
   VPS_OPT=/opt/vps
@@ -33,7 +36,7 @@ TOUCHED_DB=0
 apply() {
   STAGE="checkout di $2"
   pd_checkout "$2" || return 1
-  if pd_ver_gt "${2#v}" "${1#v}"; then
+  if pd_ver_gt "${2#v}" "${1#v}" || [[ "$1" == "$2" ]]; then
     STAGE="schema.sql"
     TOUCHED_DB=1
     pd_schema "$2" || return 1
@@ -51,7 +54,7 @@ apply() {
 }
 
 main() {
-  local ref="" cur target dump ver ok=1
+  local ref="" cur head target dump ver ok=1
   enable_error_trap
   while (($#)); do
     case "$1" in
@@ -61,7 +64,7 @@ main() {
     esac
   done
   ((EUID == 0)) || [[ "${PD_TEST:-}" == 1 ]] || die "Esegui con: sudo vps-panel-update"
-  pd_load
+  pd_load || die "Manifest non leggibile"
   exec 9>"$PD_LOCK" || die "Lock $PD_LOCK non apribile"
   flock -n 9 || die "Un altro aggiornamento è in corso"
   ver="$(jq -r '.panel.version // empty' "$(manifest_path)")" || die "Manifest non leggibile"
@@ -73,8 +76,14 @@ main() {
   fi
 
   pd_git fetch -q --tags origin 2>>"$VPS_LOG" || die "Download dei rilasci non riuscito"
-  cur="$(pd_current_tag)" || die "Versione attuale non leggibile"
-  [[ "$cur" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Il checkout attuale non è un rilascio vX.Y.Z: sistemalo a mano"
+  cur="v$ver"
+  [[ "$cur" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Versione nel manifest non valida: $ver"
+  pd_git rev-parse -q --verify "refs/tags/$cur" >/dev/null || die "Il rilascio $cur del manifest non esiste nel repository"
+  head="$(pd_current_tag)" || die "Versione attuale non leggibile"
+  [[ "$head" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Il checkout attuale non è un rilascio vX.Y.Z: sistemalo a mano"
+  if [[ "$head" != "$cur" ]]; then
+    say "ATTENZIONE: checkout ($head) diverso dal manifest ($cur): aggiornamento precedente interrotto, riparto da $cur."
+  fi
   if [[ -n "$ref" ]]; then
     [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--ref deve essere nella forma vX.Y.Z"
     pd_git rev-parse -q --verify "refs/tags/$ref" >/dev/null || die "Il rilascio $ref non esiste"
@@ -83,15 +92,16 @@ main() {
     target="$(pd_latest_tag)" || die "Elenco dei rilasci non leggibile"
     [[ -n "$target" ]] || die "Nessun rilascio vX.Y.Z nel repository"
   fi
-  if [[ "$target" == "$cur" ]]; then
+  if [[ "$target" == "$cur" && "$head" == "$cur" ]]; then
     say "Già aggiornata ($cur)."
     exit 0
   fi
 
   dump="$(pd_dump "$cur")" || die "Backup del database non riuscito: nessuna modifica fatta"
   say "Plancia: $cur → $target (backup: $dump)"
+  trap "" HUP
   if ! apply "$cur" "$target"; then
-    log "Aggiornamento a $target fallito durante: $STAGE. Torno a $cur."
+    log "Aggiornamento a $target fallito durante: $STAGE. Torno a $cur." || :
     pd_checkout "$cur" || ok=0
     if ((TOUCHED_DB)); then
       pd_restore "$dump" || ok=0
@@ -100,10 +110,11 @@ main() {
     if ((ok)); then
       die "Aggiornamento a $target fallito ($STAGE): ripristinata $cur. Backup del database: $dump"
     fi
-    log "ERRORE: aggiornamento a $target fallito ($STAGE) e ritorno a $cur NON riuscito. Backup del database: $dump"
+    log "ERRORE: aggiornamento a $target fallito ($STAGE) e ritorno a $cur NON riuscito. Backup del database: $dump" || :
     exit 2
   fi
-  pd_manifest "$target" || die "Manifest non aggiornato: il codice è già a $target (backup del database: $dump)"
+  trap - HUP
+  pd_manifest "$target" || die "Manifest non aggiornato: codice e database sono già a $target; rilancia sudo vps-panel-update per riparare il manifest (backup: $dump)"
   say "Plancia aggiornata: $cur → $target"
 }
 
