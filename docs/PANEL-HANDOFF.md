@@ -132,6 +132,9 @@ Forniti dall'installer v1.1, **eseguiti dall'amministratore** (non dal pannello,
 
 Regole per il pannello: i rilasci sono tag annotati `vX.Y.Z`; le modifiche allo schema di
 un'installazione esistente vanno in `install/migrations/X.Y.Z.sql`, idempotenti.
+I file di sviluppo del repository (`.claude/`, `Documenti/`, `tests/`, `infra/`,
+`PRODUCT.md`) non arrivano nella radice del pannello (sparse checkout, elenco
+`PD_DEV_PATHS` in `lib/panel_deploy.sh`): il pannello non deve leggerli a runtime.
 
 Previsti per il pannello (da scrivere con il pannello, stesse regole):
 

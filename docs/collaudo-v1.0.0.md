@@ -17,4 +17,4 @@
 
 - Controllare prima su Cloudflare i record del dominio del pannello.
 - Dopo l'installer: `sudo vps-panel-install` (v1.1) e la checklist "Verifica manuale" di
-  `vps-panel/Documenti/deploy/README.md`; esito in `docs/collaudo-v1.1.0.md`.
+  `vps-panel/Documenti/deploy/README.md`; esito in [`docs/collaudo-v1.1.0.md`](collaudo-v1.1.0.md).

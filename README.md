@@ -44,9 +44,13 @@ sudo vps-panel-update      # poi, per ogni nuovo rilascio
 Su una VPS installata con una versione precedente alla 1.1, prima:
 
 ```bash
-curl -fsSLO https://github.com/IImanuII/vps-installer/releases/download/v1.1.0/install.sh
+curl -fsSLO https://github.com/IImanuII/vps-installer/releases/download/v1.1.1/install.sh
 sudo bash install.sh --tools-only
 ```
+
+`--tools-only` non fa domande e non usa tmux: va bene anche da remoto
+(`ssh host 'sudo bash install.sh --tools-only'`). L'installazione completa invece
+vuole un terminale.
 
 ## Sviluppo
 
