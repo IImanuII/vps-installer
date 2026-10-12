@@ -176,6 +176,7 @@ setup() {
   grep -q '^gpasswd -a manu site_blog_miosito_it' "$CALLS"
   [ "$(stat -c %a "$r")" = 2750 ]
   [ "$(stat -c %a "$r/logs")" = 2750 ]
+  [ "$(stat -c %a "$r/logs/php")" = 2770 ]
   [ "$(stat -c %a "$r/public")" = 2770 ]
   [ "$(stat -c %a "$r/tmp")" = 2770 ]
   grep -q "^setfacl -m u:www-data:x $r\$" "$CALLS"
@@ -208,6 +209,7 @@ setup() {
   grep -qx '\[site_blog_miosito_it\]' "$f"
   grep -qx "listen = /run/php/php$PHP_VERSION-fpm-site_blog_miosito_it.sock" "$f"
   grep -qx "php_admin_value\[open_basedir\] = $SITES_WWW/blog.miosito.it/" "$f"
+  grep -qx "php_admin_value\[error_log\] = $SITES_WWW/blog.miosito.it/logs/php/php-error.log" "$f"
   grep -q "^systemctl reload php$PHP_VERSION-fpm" "$CALLS"
 }
 
@@ -220,15 +222,16 @@ setup() {
   [[ "$(cat "$SITE_ERROR_FILE")" == *"PHP-FPM"* ]]
 }
 
-@test "site_logrotate_add: settimanale, 8 copie, ruotato da root" {
+@test "site_logrotate_add: log di Nginx ruotati da root, log di PHP come utente del sito" {
   site_reg_new blog.miosito.it php no no
   site_logrotate_add blog.miosito.it
   f="$LOGROTATE_D/vps-site-site_blog_miosito_it"
   grep -q "^$SITES_WWW/blog.miosito.it/logs/\*.log {" "$f"
-  grep -qx '    rotate 8' "$f"
-  # Niente "su": nginx (root) crea i log di proprietà di root e il sito non potrebbe troncarli.
-  run grep -c '^ *su ' "$f"
-  [ "$output" = 0 ]
+  grep -q "^$SITES_WWW/blog.miosito.it/logs/php/\*.log {" "$f"
+  [ "$(grep -c '^    rotate 8$' "$f")" = 2 ]
+  # Un solo "su", nella sezione di logs/php: logs/ è di root e ruota come root.
+  [ "$(grep -c '^ *su ' "$f")" = 1 ]
+  [ "$(sed -n '/logs\/php\/\*.log {/,/}/p' "$f" | grep -c '^    su site_blog_miosito_it site_blog_miosito_it$')" = 1 ]
   site_logrotate_remove blog.miosito.it
   [ ! -e "$f" ]
 }
@@ -543,4 +546,128 @@ nuovo() { # DOMINIO TIPO WWW DB [PASSWORD]
   [[ "$(site_reg_get blog.miosito.it .job.error)" == *"password del database mancante"* ]]
   run ! grep -qs POST "$BATS_TEST_TMPDIR/cf.log"
   run ! grep -qs certbot "$CALLS"
+}
+
+# --- Revisione finale ---
+
+@test "site_validate_new rifiuta un vhost già presente e un link rotto al posto della radice" {
+  touch "$NGINX_CONF_D/blog.miosito.it.conf"
+  run site_validate_new blog.miosito.it
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"configurazione Nginx"* ]]
+
+  ln -s "$BATS_TEST_TMPDIR/non-esiste" "$SITES_WWW/altro.miosito.it"
+  run site_validate_new altro.miosito.it
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cartella"* ]]
+}
+
+@test "site_dns_add: record giusto ma col proxy spento è un conflitto" {
+  echo '{"success":true,"result":[{"id":"vecchio","type":"A","name":"blog.miosito.it","content":"203.0.113.10","proxied":false}]}' \
+    >"$BATS_TEST_TMPDIR/cf-records-blog.miosito.it.json"
+  site_reg_new blog.miosito.it static no no
+  export CF_API_TOKEN=x SITE_ERROR_FILE="$BATS_TEST_TMPDIR/err"
+  run site_dns_add blog.miosito.it
+  [ "$status" -eq 1 ]
+  [[ "$(cat "$SITE_ERROR_FILE")" == *"A blog.miosito.it non passa da Cloudflare (proxy spento)"* ]]
+  run grep -c '^POST ' "$BATS_TEST_TMPDIR/cf.log"
+  [ "$output" = 0 ]
+}
+
+@test "site_user_add: radice e logs/ di root, solo public/ tmp/ logs/php/ del sito" {
+  site_reg_new blog.miosito.it php no no
+  export VPS_NO_CHOWN=0
+  # shellcheck disable=SC2016
+  make_stub chown 'echo "chown $*" >>"$CALLS"'
+  site_user_add blog.miosito.it
+  r="$SITES_WWW/blog.miosito.it"
+  grep -qx "chown root:site_blog_miosito_it $r $r/logs" "$CALLS"
+  grep -qx "chown site_blog_miosito_it:site_blog_miosito_it $r/logs/php $r/public $r/tmp" "$CALLS"
+  run grep -c "^chown site_blog_miosito_it:site_blog_miosito_it $r\( \|$\)" "$CALLS"
+  [ "$output" = 0 ]
+}
+
+@test "site_db_add: db.env di root, gruppo del sito" {
+  site_reg_new blog.miosito.it php no yes
+  mkdir -p "$SITES_WWW/blog.miosito.it"
+  export VPS_NO_CHOWN=0
+  # shellcheck disable=SC2016
+  make_stub chown 'echo "chown $*" >>"$CALLS"'
+  site_db_add blog.miosito.it 'Password-di-prova-123'
+  grep -q "^chown root:site_blog_miosito_it $SITES_WWW/blog.miosito.it/.tmp." "$CALLS"
+  : >"$CALLS"
+  site_db_password blog.miosito.it 'Nuova-password-456789'
+  grep -q "^chown root:site_blog_miosito_it $SITES_WWW/blog.miosito.it/.tmp." "$CALLS"
+}
+
+@test "site_user_remove: ferma i processi, userdel -f se userdel fallisce" {
+  site_reg_new blog.miosito.it php no no
+  site_user_add blog.miosito.it
+  make_stub id 'exit 0'
+  make_stub getent 'exit 0'
+  # shellcheck disable=SC2016
+  make_stub userdel 'echo "userdel $*" >>"$CALLS"; [ "$1" = -f ]'
+  hash -r
+  site_user_remove blog.miosito.it
+  grep -qx 'pkill -u site_blog_miosito_it' "$CALLS"
+  grep -q '^pgrep -u site_blog_miosito_it' "$CALLS"
+  grep -qx 'userdel site_blog_miosito_it' "$CALLS"
+  grep -qx 'userdel -f site_blog_miosito_it' "$CALLS"
+  [ ! -e "$SITES_WWW/blog.miosito.it" ]
+}
+
+@test "site_user_remove: userdel che fallisce sempre dà errore ma la cartella sparisce" {
+  site_reg_new blog.miosito.it php no no
+  site_user_add blog.miosito.it
+  make_stub id 'exit 0'
+  make_stub getent 'exit 0'
+  export STUB_RC_userdel=1
+  hash -r
+  run site_user_remove blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ ! -e "$SITES_WWW/blog.miosito.it" ]
+}
+
+@test "site_dns_remove: un record rifiutato resta annotato, uno già sparito no" {
+  site_reg_new miosito.it static yes no
+  export CF_API_TOKEN=x
+  site_dns_add miosito.it
+  # rec1 (miosito.it) esiste ancora e la DELETE fallisce; rec2 (www) non c'è più.
+  echo '{"success":true,"result":[{"id":"rec1","type":"A","name":"miosito.it","content":"203.0.113.10","proxied":true}]}' \
+    >"$BATS_TEST_TMPDIR/cf-records-miosito.it.json"
+  # shellcheck disable=SC2329
+  cf_delete_record() { return 1; }
+  run site_dns_remove miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get miosito.it '[.dns_records[].id] | join(",")')" = rec1 ]
+}
+
+@test "site_run delete: utente non rimosso, sito in errore col registro; un nuovo tentativo finisce" {
+  nuovo blog.miosito.it php no no
+  site_run create blog.miosito.it
+  site_reg_update blog.miosito.it '.prev_state = .state | .state = "deleting"'
+  make_stub id 'exit 0'
+  make_stub getent 'exit 0'
+  export STUB_RC_userdel=1
+  hash -r
+  run site_run delete blog.miosito.it
+  [ "$status" -eq 1 ]
+  site_reg_exists blog.miosito.it
+  [ "$(site_reg_get blog.miosito.it .state)" = error ]
+  [ "$(site_reg_get blog.miosito.it .job.step)" = remove ]
+  [[ "$(site_reg_get blog.miosito.it .job.error)" == *"restano: utente o cartella"* ]]
+  [ "$(ls "$SITES_BACKUPS" | grep -c '\.tar\.gz$')" = 1 ]
+
+  # Elimina di nuovo: dallo stato di errore niente archivio, e stavolta finisce.
+  unset STUB_RC_userdel
+  site_reg_update blog.miosito.it '.prev_state = .state | .state = "deleting"'
+  site_run delete blog.miosito.it
+  run ! site_reg_exists blog.miosito.it
+  [ "$(ls "$SITES_BACKUPS" | grep -c '\.tar\.gz$')" = 1 ]
+}
+
+@test "site_job_create: alla fine stato attivo e lavoro concluso insieme" {
+  nuovo blog.miosito.it static no no
+  site_run create blog.miosito.it
+  [ "$(site_reg_get blog.miosito.it '"\(.state) \(.job.op) \(.job.step) \(.job.error)"')" = "active create done null" ]
 }

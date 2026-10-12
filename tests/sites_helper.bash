@@ -20,9 +20,12 @@ sites_test_setup() {
   local c body
   # shellcheck disable=SC2016
   body='n="$(basename "$0")"; echo "$n $*" >>"$CALLS"; v="STUB_RC_$(printf %s "$n" | tr -c "a-zA-Z0-9" _)"; exit "${!v:-0}"'
-  for c in groupadd useradd userdel groupdel gpasswd setfacl nginx "php-fpm$PHP_VERSION" systemctl certbot systemd-run visudo; do
+  for c in groupadd useradd userdel groupdel gpasswd setfacl nginx "php-fpm$PHP_VERSION" systemctl certbot systemd-run visudo pkill; do
     make_stub "$c" "$body"
   done
+  # pgrep: di norma nessun processo rimasto (1); STUB_RC_pgrep=0 simula processi vivi.
+  # shellcheck disable=SC2016
+  make_stub pgrep 'echo "pgrep $*" >>"$CALLS"; exit "${STUB_RC_pgrep:-1}"'
   # shellcheck disable=SC2016
   make_stub mariadb 'echo "mariadb $*" >>"$CALLS"; cat >>"$BATS_TEST_TMPDIR/mariadb.sql"; exit "${STUB_RC_mariadb:-0}"'
   # shellcheck disable=SC2016

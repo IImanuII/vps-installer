@@ -69,7 +69,7 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | `/etc/php/8.4/fpm/pool.d/site_<slug>.conf` | pool PHP di un sito |
 | `/etc/logrotate.d/vps-site-site_<slug>` | rotazione dei log di un sito |
 | `/var/www/_maintenance/_maintenance.html` | pagina 503 dei siti disattivati |
-| `/var/www/<sito>/` | `site_<slug>`, 2750: `public/` e `tmp/` 2770 (admin nel gruppo, `www-data` in sola lettura via ACL), `logs/`, `db.env` 640 |
+| `/var/www/<sito>/` | `root:site_<slug>` 2750 (il sito non scrive nella radice); `logs/` `root:site_<slug>` 2750 con `access.log`/`error.log` di Nginx; `logs/php/` `site_<slug>` 2770 con `php-error.log`; `public/` e `tmp/` `site_<slug>` 2770 (admin nel gruppo, `www-data` in sola lettura via ACL); `db.env` `root:site_<slug>` 640. Radice, `logs/` e `db.env` sono di root perché Nginx (root) e `vps-site` seguirebbero un link messo lì dal sito |
 
 ## 3. `manifest.json`
 
@@ -161,7 +161,9 @@ Regole di `vps-site`:
 - `create` e `delete` rispondono subito e lavorano in background come unità systemd (`vps-site-<slug>-<op>`); un lavoro alla volta (lucchetto globale); l'avanzamento sta nel registro (`state`, `job.step`, `job.error`);
 - le operazioni brevi (`disable`, `enable`, `db-*`) rispondono "riprova" se un lavoro è in corso; un breve lucchetto sul registro serializza i comandi concorrenti (attesa fino a 5 s);
 - un lavoro interrotto da un riavvio: creazione -> `error` (si pulisce con `delete`); eliminazione ferma a `queued`/`archive` -> torna allo stato precedente, ferma a `remove` -> `error`;
-- `_run` e `_prune` sono interni (systemd e cron) e sotto sudo vengono rifiutati.
+- un'eliminazione che non riesce a togliere tutto (ad es. `userdel` rifiutato) non cancella il registro: il sito va in `error` con `job.error` che elenca i resti, e un nuovo `delete` riprova senza riarchiviare;
+- `_run` e `_prune` sono interni (systemd e cron) e sotto sudo vengono rifiutati;
+- sotto sudo `vps-site` si rilancia subito in un'unità systemd temporanea (`systemd-run --wait --pipe --collect --quiet --service-type=exec --setenv=VPS_SITE_VIA_SYSTEMD=1 /opt/vps/bin/vps-site ...`): `php8.4-fpm.service` gira con `ProtectSystem=full` e `sudo` lanciato da PHP eredita il suo spazio dei mount, dove `/etc` è in sola lettura, quindi `disable`/`enable`/`db-*` non potrebbero scrivere vhost e configurazioni. stdin, stdout e codice d'uscita passano invariati; dentro l'unità `_run`/`_prune` restano rifiutati. Gli altri script che scrivono in `/etc` chiamati dal pannello (ad es. `vps-cf-ips-update`) hanno lo stesso limite e potranno servirsi dello stesso schema.
 
 Previsti per il pannello (da scrivere con il pannello, stesse regole):
 

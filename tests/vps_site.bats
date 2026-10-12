@@ -201,3 +201,59 @@ teardown() {
   [ "$(printf '%s
 ' "$output" | wc -l)" -eq 1 ]
 }
+
+# --- Revisione finale: rilancio in un'unità systemd ---
+
+# systemd-run finto: annota gli argomenti e ciò che arriva su stdin, risponde
+# come farebbe il vps-site interno ed esce con un codice riconoscibile.
+stub_systemd_run_pipe() {
+  # shellcheck disable=SC2016
+  make_stub systemd-run 'echo "systemd-run $*" >>"$CALLS"; cat >"$BATS_TEST_TMPDIR/stdin"; echo "{\"ok\":true,\"interno\":true}"; exit 7'
+}
+
+@test "sotto sudo vps-site si rilancia con systemd-run, stdin e codice d'uscita compresi" {
+  stub_systemd_run_pipe
+  run --separate-stderr bash -c "printf 'Nuova-password-456789\n' | SUDO_USER=panel bash '$T' db-password blog.miosito.it"
+  [ "$status" -eq 7 ]
+  [ "$(jq -r .interno <<<"$output")" = true ]
+  grep -qx 'systemd-run --wait --pipe --collect --quiet --service-type=exec --setenv=VPS_SITE_VIA_SYSTEMD=1 /opt/vps/bin/vps-site db-password blog.miosito.it' "$CALLS"
+  [ "$(cat "$BATS_TEST_TMPDIR/stdin")" = Nuova-password-456789 ]
+}
+
+@test "senza sudo nessun rilancio" {
+  stub_systemd_run_pipe
+  vs list
+  [ "$status" -eq 0 ]
+  run ! grep -qs -- '--pipe' "$CALLS"
+}
+
+@test "_run e _prune rifiutati sotto sudo prima del rilancio, e dentro l'unità rilanciata" {
+  stub_systemd_run_pipe
+  run env SUDO_USER=panel bash "$T" _run create blog.miosito.it
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"comando interno"* ]]
+  run ! grep -qs systemd-run "$CALLS"
+  for c in _run _prune; do
+    run env VPS_SITE_VIA_SYSTEMD=1 VPS_OPT="$VPS_OPT" VPS_LIB="$VPS_LIB" bash "$T" "$c" create blog.miosito.it
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"comando interno"* ]]
+  done
+}
+
+@test "dentro l'unità rilanciata l'ambiente non sceglie le librerie" {
+  mkdir -p "$BATS_TEST_TMPDIR/evil"
+  echo "touch '$BATS_TEST_TMPDIR/caricata'" >"$BATS_TEST_TMPDIR/evil/x.sh"
+  # L'esito non conta (fuori dalla VPS /opt/vps/lib non c'è): conta che evil/ non sia letta.
+  env VPS_SITE_VIA_SYSTEMD=1 VPS_LIB="$BATS_TEST_TMPDIR/evil" VPS_OPT="$BATS_TEST_TMPDIR/evil" bash "$T" list >/dev/null 2>&1 || true
+  [ ! -e "$BATS_TEST_TMPDIR/caricata" ]
+}
+
+@test "create --www rifiutato se www.<dominio> è il pannello" {
+  jq '.panel.domain = "www.miosito.it"' "$VPS_OPT/manifest.json" >"$BATS_TEST_TMPDIR/m" && mv "$BATS_TEST_TMPDIR/m" "$VPS_OPT/manifest.json"
+  vs create miosito.it --type static --www
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"pannello"* ]]
+  run ! site_reg_exists miosito.it
+  vs create miosito.it --type static
+  [ "$status" -eq 0 ]
+}

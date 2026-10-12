@@ -105,8 +105,14 @@ site_validate_new() {
     echo "il sito $d esiste già"
     return 1
   fi
-  if [[ -e "$(site_root "$d")" ]]; then
+  # Anche un collegamento simbolico rotto conta: install -d lo seguirebbe.
+  if [[ -e "$(site_root "$d")" || -L "$(site_root "$d")" ]]; then
     echo "la cartella $(site_root "$d") esiste già e non è un sito di vps-site"
+    return 1
+  fi
+  # Un vhost con lo stesso nome lo sovrascriveremmo, e all'eliminazione sparirebbe.
+  if [[ -e "$NGINX_CONF_D/$d.conf" || -L "$NGINX_CONF_D/$d.conf" ]]; then
+    echo "esiste già una configurazione Nginx per $d ($NGINX_CONF_D/$d.conf)"
     return 1
   fi
   slug="$(site_slug "$d")"
@@ -158,6 +164,17 @@ site_dns_add() {
       site_fail "il record ${conflicts%%$'\n'*} punta altrove: toglilo da Cloudflare o scegli un altro nome"
       return 1
     fi
+    # Un record giusto ma col proxy spento non va: l'origine accetta solo il
+    # traffico che arriva da Cloudflare, quindi il sito non risponderebbe.
+    conflicts="$(jq -r --arg v4 "$v4" --arg v6 "$v6" '
+      .result[]
+      | select(((.type == "A" and .content == $v4) or (.type == "AAAA" and .content == $v6))
+          and .proxied != true)
+      | "\(.type) \(.name)"' <<<"$recs")"
+    if [[ -n "$conflicts" ]]; then
+      site_fail "il record ${conflicts%%$'\n'*} non passa da Cloudflare (proxy spento): attivalo o toglilo"
+      return 1
+    fi
     for type in A AAAA; do
       ip="$v4"
       [[ "$type" == A ]] || ip="$v6"
@@ -175,16 +192,30 @@ site_dns_add() {
   done
 }
 
-# site_dns_remove DOMINIO — toglie i record annotati; uno che non c'è più non è un errore.
+# site_dns_remove DOMINIO — toglie i record annotati; uno che non c'è più non è
+# un errore. Restituisce 1 se Cloudflare ne ha rifiutato qualcuno.
 site_dns_remove() {
-  local d="$1" zid id
+  local d="$1" zid id n recs left_json
+  local left=()
   zid="$(site_reg_get "$d" '.zone.id // empty')"
   [[ -n "$zid" ]] || return 0
-  while read -r id; do
+  while read -r id n; do
     [[ -n "$id" ]] || continue
-    cf_delete_record "$zid" "$id" || log "ATTENZIONE: record $id di $d non eliminato da Cloudflare: toglilo a mano"
-  done < <(site_reg_get "$d" '.dns_records[].id')
-  site_reg_update "$d" '.dns_records = []'
+    cf_delete_record "$zid" "$id" && continue
+    # Un record già tolto a mano fa fallire la DELETE: se non compare più tra
+    # quelli del nome, è come tolto.
+    if recs="$(cf_list_records "$zid" "$n")" \
+      && ! jq -e --arg i "$id" 'any(.result[]; .id == $i)' >/dev/null <<<"$recs"; then
+      continue
+    fi
+    log "ATTENZIONE: record $id ($n) di $d non eliminato da Cloudflare"
+    left+=("$id")
+  done < <(site_reg_get "$d" '.dns_records[] | "\(.id) \(.name)"')
+  # Restano annotati solo i record non tolti: un nuovo tentativo riprova quelli.
+  left_json="$(printf '%s\n' "${left[@]}" | jq -R . | jq -sc 'map(select(. != ""))')"
+  site_reg_update "$d" '.dns_records |= map(select(.id as $i | $left | any(. == $i)))' \
+    --argjson left "$left_json" || return 1
+  ((${#left[@]} == 0))
 }
 
 # site_cert_issue DOMINIO — certificato Let's Encrypt via DNS Cloudflare per tutti i nomi.
@@ -218,9 +249,15 @@ site_user_add() {
   if [[ -n "$admin" ]]; then
     gpasswd -a "$admin" "$slug" >/dev/null || return 1
   fi
+  # La radice e logs/ sono di root (gruppo del sito, sola lettura): il sito non
+  # può metterci collegamenti simbolici. Nginx (root) apre access.log ed
+  # error.log seguendo i link a ogni reload, e vps-site scrive db.env qui:
+  # in cartelle del sito un link verso /etc diventerebbe una scrittura come root.
+  # Il sito scrive solo in public/, tmp/ e logs/php/ (il log di PHP).
   install -d -m 2750 "$root" "$root/logs" || return 1
-  install -d -m 2770 "$root/public" "$root/tmp" || return 1
-  own "$slug:$slug" "$root" "$root/logs" "$root/public" "$root/tmp" || return 1
+  own "root:$slug" "$root" "$root/logs" || return 1
+  install -d -m 2770 "$root/logs/php" "$root/public" "$root/tmp" || return 1
+  own "$slug:$slug" "$root/logs/php" "$root/public" "$root/tmp" || return 1
   setfacl -m u:www-data:x "$root" || return 1
   setfacl -m u:www-data:rX -m d:u:www-data:rX "$root/public" || return 1
   # I file creati da PHP restano modificabili dall'admin e viceversa.
@@ -231,19 +268,30 @@ site_user_add() {
 }
 
 # site_user_remove DOMINIO — utente, gruppo e radice; ciò che manca già si salta.
+# Restituisce 1 se qualcosa resta, ma prova comunque a togliere tutto.
 site_user_remove() {
-  local d="$1" slug root
+  local d="$1" slug root rc=0
   slug="$(site_reg_get "$d" .slug)"
   root="$(site_root "$d")"
   # Mai un rm -rf su un percorso che non sia la radice di un sito di vps-site.
   [[ -n "$d" && "$slug" == site_* && "$root" == "$SITES_WWW/$d" ]] || return 1
   if id -u "$slug" >/dev/null 2>&1; then
-    userdel "$slug" >>"$VPS_LOG" 2>&1 || return 1
+    # Subito dopo il reload (asincrono) di PHP-FPM i processi del pool possono
+    # girare ancora come utente del sito, e userdel si rifiuterebbe.
+    pkill -u "$slug" >/dev/null 2>&1 || true
+    for _ in {1..50}; do
+      pgrep -u "$slug" >/dev/null 2>&1 || break
+      sleep 0.1
+    done
+    if ! userdel "$slug" >>"$VPS_LOG" 2>&1; then
+      userdel -f "$slug" >>"$VPS_LOG" 2>&1 || rc=1
+    fi
   fi
   if getent group "$slug" >/dev/null 2>&1; then
-    groupdel "$slug" >>"$VPS_LOG" 2>&1 || return 1
+    groupdel "$slug" >>"$VPS_LOG" 2>&1 || rc=1
   fi
-  rm -rf --one-file-system -- "$root"
+  rm -rf --one-file-system -- "$root" || rc=1
+  return "$rc"
 }
 
 site_pool_file() {
@@ -269,7 +317,7 @@ site_pool_remove() {
   local f
   f="$(site_pool_file "$1")"
   [[ -f "$f" ]] || return 0
-  rm -f "$f"
+  rm -f "$f" || return 1
   systemctl reload "php$PHP_VERSION-fpm" || log "ATTENZIONE: PHP-FPM non ricaricato dopo la rimozione del pool di $1"
 }
 
@@ -340,7 +388,7 @@ site_vhost_add() {
 site_vhost_remove() {
   local f="$NGINX_CONF_D/$1.conf"
   [[ -f "$f" ]] || return 0
-  rm -f "$f"
+  rm -f "$f" || return 1
   if ! { nginx -t >>"$VPS_LOG" 2>&1 && systemctl reload nginx; }; then
     log "ATTENZIONE: Nginx non ricaricato dopo la rimozione del vhost di $1"
   fi
@@ -365,13 +413,15 @@ site_db_sql() {
   sql_user_grant "$1" "$2" "ALL PRIVILEGES" "\`$esc\`.*"
 }
 
+# db.env è root:<sito> 640 nella radice, che è di root: PHP e l'admin (gruppo)
+# lo leggono, ma il sito non può sostituirlo con un link che vps-site seguirebbe.
 site_db_add() {
   local d="$1" slug
   slug="$(site_reg_get "$d" .slug)"
   site_db_sql "$slug" "$2" | mariadb >>"$VPS_LOG" 2>&1 \
     || { site_fail "il database $slug non è stato creato (dettagli in $VPS_LOG)"; return 1; }
   printf 'DB_HOST=localhost\nDB_NAME=%s\nDB_USER=%s\nDB_PASS=%s\n' "$slug" "$slug" "$2" \
-    | write_file "$(site_root "$d")/db.env" 640 "$slug:$slug"
+    | write_file "$(site_root "$d")/db.env" 640 "root:$slug"
 }
 
 site_db_password() {
@@ -379,14 +429,14 @@ site_db_password() {
   slug="$(site_reg_get "$d" .slug)"
   printf "ALTER USER '%s'@'localhost' IDENTIFIED BY %s;\n" "$slug" "$(sql_quote "$2")" | mariadb >>"$VPS_LOG" 2>&1 \
     || { site_fail "la password del database non è stata cambiata (dettagli in $VPS_LOG)"; return 1; }
-  printf 'DB_PASS=%s\n' "$2" | env_merge "$(site_root "$d")/db.env" 640 "$slug:$slug"
+  printf 'DB_PASS=%s\n' "$2" | env_merge "$(site_root "$d")/db.env" 640 "root:$slug"
 }
 
 site_db_remove() {
   local slug
   slug="$(site_reg_get "$1" .slug)"
   printf "DROP DATABASE IF EXISTS \`%s\`;\nDROP USER IF EXISTS '%s'@'localhost';\n" "$slug" "$slug" \
-    | mariadb >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: database o utente $slug non eliminati"
+    | mariadb >>"$VPS_LOG" 2>&1 || { log "ATTENZIONE: database o utente $slug non eliminati"; return 1; }
 }
 
 # site_step DOMINIO OP PASSO FUNZIONE [ARG...] — registra il passo e lo esegue in
@@ -474,8 +524,11 @@ site_job_create() {
     fi
   done
   (site_logrotate_add "$d") || log "ATTENZIONE: rotazione dei log di $d non configurata"
-  site_reg_update "$d" '.state = "active"'
-  site_job "$d" create "done"
+  # Stato e lavoro in una sola scrittura: il pannello non deve mai vedere un
+  # sito attivo con il lavoro ancora a metà.
+  site_reg_update "$d" \
+    '.state = "active" | .job = {op: "create", step: "done", error: null, updated_at: $at, ts: ($ts | tonumber)}' \
+    --arg at "$(date -Iseconds)" --arg ts "$(date +%s)"
 }
 
 # site_archive DOMINIO — file e dump del sito in SITES_BACKUPS (root 600). Se
@@ -520,13 +573,26 @@ site_job_delete() {
     fi
   fi
   site_job "$d" delete remove
-  (site_vhost_remove "$d")
-  (site_pool_remove "$d")
+  # Si prova a togliere tutto; se qualcosa resta il registro non si cancella:
+  # il sito va in errore con l'elenco dei resti, e Elimina riprova (saltando
+  # l'archivio, perché lo stato di partenza è errore). Ogni rimozione tollera
+  # ciò che non c'è più, quindi riprovare è sicuro.
+  local left=()
+  (site_vhost_remove "$d") || left+=("configurazione Nginx")
+  (site_pool_remove "$d") || left+=("pool PHP-FPM")
   (site_cert_remove "$d")
-  (site_logrotate_remove "$d")
-  (site_db_remove "$d")
-  (site_user_remove "$d") || log "ATTENZIONE: utente o cartella di $d non rimossi"
-  (site_dns_remove "$d")
+  (site_logrotate_remove "$d") || left+=("rotazione dei log")
+  (site_db_remove "$d") || left+=("database")
+  (site_user_remove "$d") || left+=("utente o cartella $(site_root "$d")")
+  (site_dns_remove "$d") || left+=("record DNS su Cloudflare")
+  if ((${#left[@]})); then
+    msg="eliminazione incompleta, restano: $(printf '%s, ' "${left[@]}")"
+    msg="${msg%, }: elimina di nuovo per riprovare (dettagli in $VPS_LOG)"
+    log "vps-site: $msg"
+    site_reg_update "$d" '.state = "error"'
+    site_job "$d" delete remove "$msg"
+    return 1
+  fi
   rm -f "$(site_reg_path "$d")"
   log "vps-site: $d eliminato"
 }

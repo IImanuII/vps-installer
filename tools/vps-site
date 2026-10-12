@@ -2,14 +2,25 @@
 # vps-site — i siti della VPS: zones, list, show, create, disable, enable,
 # delete, db-create, db-password. Contratto in docs/PANEL-HANDOFF.md, sezione 4.
 # Lo esegue il pannello con sudo; _run e _prune li lanciano solo systemd e cron,
-# quindi attraverso sudo si rifiutano prima ancora di caricare le librerie.
-if [[ ("${1:-}" == _run || "${1:-}" == _prune) && -n "${SUDO_USER:-}" ]]; then
-  printf '{"ok":false,"error":"comando interno"}
-'
+# quindi attraverso sudo (o il rilancio qui sotto) si rifiutano prima ancora di
+# caricare le librerie. Questo controllo deve restare il primo.
+if [[ ("${1:-}" == _run || "${1:-}" == _prune) && (-n "${SUDO_USER:-}" || -n "${VPS_SITE_VIA_SYSTEMD:-}") ]]; then
+  printf '{"ok":false,"error":"comando interno"}\n'
   exit 1
 fi
-# Sotto sudo l'ambiente del chiamante non deve influenzare lo script.
-if [[ -n "${SUDO_USER:-}" ]]; then
+# PHP-FPM gira con ProtectSystem=full: sudo lanciato dal pannello eredita il suo
+# spazio dei mount, dove /etc (e quindi /etc/nginx/conf.d, i pool, logrotate) è
+# in sola lettura. Ci si rilancia allora in un'unità systemd nuova, fuori da
+# quella sandbox: stdin (la password), stdout e codice d'uscita passano intatti.
+# Il percorso è assoluto e fisso, mai preso dall'ambiente.
+if [[ -n "${SUDO_USER:-}" && -z "${VPS_SITE_VIA_SYSTEMD:-}" ]]; then
+  exec systemd-run --wait --pipe --collect --quiet --service-type=exec \
+    --setenv=VPS_SITE_VIA_SYSTEMD=1 /opt/vps/bin/vps-site "$@"
+fi
+# Chiamata del pannello (sotto sudo o già rilanciata): l'ambiente del chiamante
+# non deve influenzare lo script. Nell'unità systemd l'ambiente è già pulito,
+# ma i valori fissi valgono comunque.
+if [[ -n "${SUDO_USER:-}" || -n "${VPS_SITE_VIA_SYSTEMD:-}" ]]; then
   VPS_OPT=/opt/vps
   VPS_LIB=$VPS_OPT/lib
   VPS_TEMPLATES=$VPS_OPT/templates
@@ -140,6 +151,11 @@ case "$cmd" in
     [[ "$db" == no || "$type" == php ]] || json_err "il database si crea solo per i siti PHP"
     reg_lock
     msg="$(site_validate_new "$d")" || json_err "$msg"
+    # www.<dominio> non può essere il dominio del pannello: il vhost del sito
+    # gli ruberebbe il nome.
+    if [[ "$www" == yes && "www.$d" == "$(jq -r '.panel.domain // empty' "$(manifest_path)")" ]]; then
+      json_err "www.$d è il dominio del pannello: crea il sito senza --www"
+    fi
     need_cf
     [[ "$db" == no ]] || read_password
     site_reg_new "$d" "$type" "$www" "$db"
