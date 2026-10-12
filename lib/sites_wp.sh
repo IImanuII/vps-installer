@@ -45,7 +45,7 @@ site_placeholder_intact() {
 # shellcheck disable=SC2034
 site_wp_config_write() {
   local d="$1" i rc
-  # Le password finiscono in stringhe PHP tra apici: qui si rifiuta ci� che le romperebbe.
+  # Le password finiscono in stringhe PHP tra apici: qui si rifiuta ciò che le romperebbe.
   if ! site_valid_db_password "$2" || ! site_valid_db_password "$3"; then
     site_fail "password non valida per wp-config.php"
     return 1
@@ -147,4 +147,133 @@ site_wp() {
   # cwd = radice del sito: quella di chi chiama potrebbe non essere leggibile dal sito.
   (cd "$root" && runuser -u "$slug" -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$root/tmp" \
     WP_CLI_CACHE_DIR="$root/tmp/.wp-cli" "$WP_BIN" --path="$root/public" "$@")
+}
+
+# site_wp_args_clean DOMINIO — cancella i file di passaggio di WordPress (la
+# password admin non deve sopravvivere a un lavoro finito, fallito o mai partito).
+site_wp_args_clean() {
+  local slug
+  slug="$(site_reg_get "$1" .slug)"
+  rm -f "$SITES_RUN/$slug.wpargs" "$SITES_RUN/$slug.wppass"
+}
+
+# site_wp_args_read DOMINIO — WP_TITLE, WP_ADMIN_USER, WP_ADMIN_EMAIL, WP_LOGIN_PATH,
+# WP_CLOUDFLARE e WP_ADMIN_PASS dai file di passaggio, che poi cancella.
+# Variabili della shell, non esportate: la password admin arriva a WP-CLI solo su stdin.
+site_wp_args_read() {
+  local slug f
+  slug="$(site_reg_get "$1" .slug)"
+  f="$SITES_RUN/$slug.wpargs"
+  WP_TITLE="" WP_ADMIN_USER="" WP_ADMIN_EMAIL="" WP_LOGIN_PATH="" WP_CLOUDFLARE=false WP_ADMIN_PASS=""
+  if [[ -f "$f" ]]; then
+    WP_TITLE="$(jq -r '.title // ""' "$f")"
+    WP_ADMIN_USER="$(jq -r '.admin_user // ""' "$f")"
+    WP_ADMIN_EMAIL="$(jq -r '.admin_email // ""' "$f")"
+    WP_LOGIN_PATH="$(jq -r '.login_path // ""' "$f")"
+    WP_CLOUDFLARE="$(jq -r 'if .cloudflare == true then "true" else "false" end' "$f")"
+  fi
+  WP_ADMIN_PASS="$(cat "$SITES_RUN/$slug.wppass" 2>/dev/null || true)"
+  site_wp_args_clean "$1"
+  site_wp_valid_title "$WP_TITLE" && site_wp_valid_user "$WP_ADMIN_USER" && site_wp_valid_email "$WP_ADMIN_EMAIL" \
+    && site_wp_valid_path "$WP_LOGIN_PATH" && site_valid_db_password "$WP_ADMIN_PASS"
+}
+
+# site_wp_install_files DOMINIO DB_PASSWORD — passo "wp": WordPress in public/,
+# wp-config.php, utente Redis, installazione con la password admin su stdin.
+site_wp_install_files() {
+  local d="$1" root redis_pw
+  root="$(site_root "$d")"
+  # Primo controllo del passo, prima di toccare qualunque cosa: chi chiama si
+  # basa su questo messaggio per non disfare un public/ con file veri.
+  site_placeholder_intact "$d" || { site_fail "public/ non è vuota: WordPress si installa solo su un sito appena creato"; return 1; }
+  rm -f "$root/public/index.html"
+  site_wp "$d" core download --locale=it_IT >>"$VPS_LOG" 2>&1 \
+    || { site_fail "download di WordPress non riuscito (dettagli in $VPS_LOG)"; return 1; }
+  redis_pw="$(rand_secret 48)"
+  site_wp_config_write "$d" "$2" "$redis_pw" || return 1
+  site_redis_user_add "$d" "$redis_pw" || return 1
+  printf '%s\n' "$WP_ADMIN_PASS" | site_wp "$d" core install --url="https://$d" --title="$WP_TITLE" \
+    --admin_user="$WP_ADMIN_USER" --admin_email="$WP_ADMIN_EMAIL" --skip-email --locale=it_IT \
+    --prompt=admin_password >>"$VPS_LOG" 2>&1 \
+    || { site_fail "installazione di WordPress non riuscita (dettagli in $VPS_LOG)"; return 1; }
+}
+
+# site_wp_plugins DOMINIO — passo "plugins": plugin, aggiornamenti automatici,
+# registro, vhost wordpress, cron.
+site_wp_plugins() {
+  local d="$1"
+  site_wp "$d" plugin install wps-hide-login redis-cache --activate >>"$VPS_LOG" 2>&1 \
+    || { site_fail "installazione dei plugin non riuscita (dettagli in $VPS_LOG)"; return 1; }
+  site_wp "$d" option update whl_page "$WP_LOGIN_PATH" >>"$VPS_LOG" 2>&1 || { site_fail "percorso di login non impostato"; return 1; }
+  site_wp "$d" redis enable >>"$VPS_LOG" 2>&1 || { site_fail "cache Redis non attivata (dettagli in $VPS_LOG)"; return 1; }
+  if [[ "$WP_CLOUDFLARE" == true ]]; then
+    site_wp "$d" plugin install cloudflare --activate >>"$VPS_LOG" 2>&1 \
+      || { site_fail "installazione del plugin Cloudflare non riuscita"; return 1; }
+  fi
+  site_wp "$d" plugin auto-updates enable --all >>"$VPS_LOG" 2>&1 || { site_fail "aggiornamenti automatici dei plugin non attivati"; return 1; }
+  site_reg_update "$d" '.type = "wordpress" | .wordpress = {login_path: $p, admin_user: $u, cloudflare_plugin: ($cf == "true"), installed_at: $at}' \
+    --arg p "$WP_LOGIN_PATH" --arg u "$WP_ADMIN_USER" --arg cf "$WP_CLOUDFLARE" --arg at "$(date -Iseconds)" || return 1
+  site_vhost_add "$d" normal || return 1
+  site_wp_cron_add "$d"
+}
+
+# site_wp_undo DOMINIO — toglie WordPress da un sito PHP (wp-install fallito):
+# public/ torna con il solo segnaposto, il DB senza tabelle, vhost PHP.
+site_wp_undo() {
+  local d="$1" root slug
+  root="$(site_root "$d")"
+  slug="$(site_reg_get "$d" .slug)"
+  site_wp_cron_remove "$d"
+  site_redis_user_remove "$d" || log "ATTENZIONE: utente Redis di $d non rimosso"
+  rm -f "$root/wp-config.php"
+  # find -delete non segue i collegamenti simbolici: sicuro anche in una cartella del sito.
+  find "$root/public" -mindepth 1 -delete || log "ATTENZIONE: file di WordPress di $d non tolti tutti"
+  # Il segnaposto lo scrive l'utente del sito, non root: public/ è sua e il pool
+  # PHP è vivo, un file temporaneo di root lì dentro potrebbe essere scambiato
+  # con un collegamento prima di chmod/chown.
+  # shellcheck disable=SC2016
+  SITE_DOMAIN="$d" envsubst '${SITE_DOMAIN}' <"$VPS_TEMPLATES/site-placeholder.html.tmpl" \
+    | (cd "$root" && runuser -u "$slug" -- sh -c 'umask 002 && cat >"$1"' sh "$root/public/index.html") \
+    || log "ATTENZIONE: segnaposto di $d non ripristinato"
+  printf "SELECT CONCAT('DROP TABLE IF EXISTS \`', table_name, '\`;') FROM information_schema.tables WHERE table_schema = '%s';\n" "$slug" \
+    | mariadb -N | mariadb "$slug" >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: tabelle di WordPress di $d non tolte"
+  site_reg_update "$d" '.type = "php" | del(.wordpress)'
+  site_vhost_add "$d" normal || log "ATTENZIONE: vhost PHP di $d non ripristinato"
+}
+
+# site_job_wpinstall DOMINIO — lavoro "wpinstall": WordPress su un sito PHP con
+# DB appena creato. Se un passo fallisce il sito torna PHP con il segnaposto.
+site_job_wpinstall() {
+  local d="$1" dbpass="" msg step
+  if [[ "$(site_reg_get "$d" .db)" == true ]]; then
+    dbpass="$(env_get "$(site_root "$d")/db.env" DB_PASS)"
+  fi
+  # I file di passaggio si leggono (e cancellano) comunque, anche se poi si rifiuta.
+  if ! site_wp_args_read "$d" || [[ -z "$dbpass" ]]; then
+    site_reg_update "$d" '.state = "active"'
+    if [[ -z "$dbpass" ]]; then
+      site_job "$d" wpinstall queued "WordPress richiede un sito con database"
+    else
+      site_job "$d" wpinstall queued "dati di WordPress mancanti o non validi"
+    fi
+    return 1
+  fi
+  for step in wp plugins; do
+    case "$step" in
+      wp) site_step "$d" wpinstall wp site_wp_install_files "$d" "$dbpass" ;;
+      plugins) site_step "$d" wpinstall plugins site_wp_plugins "$d" ;;
+    esac && continue
+    msg="$(site_error_text "$step")"
+    # Un public/ con file propri non si tocca: il controllo è il primo del passo
+    # wp, e con questo messaggio nulla è stato ancora cambiato.
+    if [[ "$msg" != *"non è vuota"* ]]; then
+      (site_wp_undo "$d")
+    fi
+    site_reg_update "$d" '.state = "active" | .type = "php"'
+    site_job "$d" wpinstall "$step" "$msg"
+    return 1
+  done
+  site_reg_update "$d" \
+    '.state = "active" | .job = {op: "wpinstall", step: "done", error: null, updated_at: $at, ts: ($ts | tonumber)}' \
+    --arg at "$(date -Iseconds)" --arg ts "$(date +%s)"
 }

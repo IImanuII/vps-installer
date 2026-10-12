@@ -430,11 +430,26 @@ site_db_add() {
     | write_file "$(site_root "$d")/db.env" 640 "root:$slug"
 }
 
+site_db_alter_password() {
+  printf "ALTER USER '%s'@'localhost' IDENTIFIED BY %s;\n" "$1" "$(sql_quote "$2")" | mariadb >>"$VPS_LOG" 2>&1
+}
+
+# site_db_password DOMINIO PASSWORD — su un sito WordPress anche wp-config.php:
+# DB e wp-config devono cambiare insieme, altrimenti il sito non si connette più.
 site_db_password() {
-  local d="$1" slug
+  local d="$1" slug old
   slug="$(site_reg_get "$d" .slug)"
-  printf "ALTER USER '%s'@'localhost' IDENTIFIED BY %s;\n" "$slug" "$(sql_quote "$2")" | mariadb >>"$VPS_LOG" 2>&1 \
+  old="$(env_get "$(site_root "$d")/db.env" DB_PASS)"
+  site_db_alter_password "$slug" "$2" \
     || { site_fail "la password del database non è stata cambiata (dettagli in $VPS_LOG)"; return 1; }
+  if [[ "$(site_reg_get "$d" .type)" == wordpress ]] && ! site_wp_config_set_db_password "$d" "$2"; then
+    # wp-config.php non aggiornato: si rimette nel DB la password di prima
+    # (db.env non è ancora cambiato), così il sito continua a funzionare.
+    if [[ -z "$old" ]] || ! site_db_alter_password "$slug" "$old"; then
+      log "ATTENZIONE: password del database di $d cambiata ma wp-config.php non aggiornato"
+    fi
+    return 1
+  fi
   printf 'DB_PASS=%s\n' "$2" | env_merge "$(site_root "$d")/db.env" 640 "root:$slug"
 }
 
@@ -481,6 +496,8 @@ site_create_step() {
       fi
       site_db_add "$2" "$3"
       ;;
+    wp) site_wp_install_files "$2" "$3" ;;
+    plugins) site_wp_plugins "$2" ;;
     *) return 1 ;;
   esac
 }
@@ -492,6 +509,13 @@ site_undo_create() {
   shift
   for ((i = $#; i >= 1; i--)); do
     case "${!i}" in
+      # I file di WordPress e wp-config.php spariscono con la radice (passo user);
+      # restano fuori solo cron e utente Redis. Chi ha tentato plugins ha
+      # tentato anche wp: basta il caso wp.
+      wp)
+        (site_wp_cron_remove "$d")
+        (site_redis_user_remove "$d") || log "ATTENZIONE: utente Redis di $d non rimosso"
+        ;;
       db) (site_db_remove "$d") ;;
       nginx) (site_vhost_remove "$d") ;;
       cert) (site_cert_remove "$d") ;;
@@ -511,14 +535,24 @@ site_job_create() {
     pass="$(cat "$SITES_RUN/$slug.pass" 2>/dev/null || true)"
     rm -f "$SITES_RUN/$slug.pass"
   fi
+  if [[ "$type" == wordpress ]]; then
+    # Letti (e cancellati) subito: la password admin non resta in /run se il
+    # lavoro si ferma prima. WordPress senza database non esiste.
+    if ! site_wp_args_read "$d" || [[ "$(site_reg_get "$d" .db)" != true ]]; then
+      site_reg_update "$d" '.state = "error"'
+      site_job "$d" create wp "dati di WordPress mancanti o non validi"
+      return 1
+    fi
+  fi
   if [[ "$(site_reg_get "$d" .db)" == true && -z "$pass" ]]; then
     site_reg_update "$d" '.state = "error"'
     site_job "$d" create db "password del database mancante"
     return 1
   fi
-  [[ "$type" != php ]] || steps+=(php)
+  [[ "$type" != php && "$type" != wordpress ]] || steps+=(php)
   steps+=(cert nginx)
   [[ "$(site_reg_get "$d" .db)" != true ]] || steps+=(db)
+  [[ "$type" != wordpress ]] || steps+=(wp plugins)
   for step in "${steps[@]}"; do
     tried+=("$step")
     if ! site_step "$d" create "$step" site_create_step "$step" "$d" "$pass"; then
@@ -588,6 +622,8 @@ site_job_delete() {
   (site_pool_remove "$d") || left+=("pool PHP-FPM")
   (site_cert_remove "$d")
   (site_logrotate_remove "$d") || left+=("rotazione dei log")
+  (site_wp_cron_remove "$d") || left+=("cron di WordPress")
+  (site_redis_user_remove "$d") || left+=("utente Redis")
   (site_db_remove "$d") || left+=("database")
   (site_user_remove "$d") || left+=("utente o cartella $(site_root "$d")")
   (site_dns_remove "$d") || left+=("record DNS su Cloudflare")
@@ -612,8 +648,13 @@ site_prune() {
 site_abort() {
   if [[ "$2" == create ]]; then
     site_reg_update "$1" '.state = "error"'
-    # la password del database non deve sopravvivere a un lavoro che non è partito
+    # le password non devono sopravvivere a un lavoro che non è partito
     rm -f "$SITES_RUN/$(site_reg_get "$1" .slug).pass"
+    site_wp_args_clean "$1"
+  elif [[ "$2" == wpinstall ]]; then
+    # il sito PHP non è stato toccato: resta attivo com'era
+    site_reg_update "$1" '.state = "active"'
+    site_wp_args_clean "$1"
   else
     site_reg_update "$1" '.state = (.prev_state // "active")'
   fi
@@ -628,7 +669,7 @@ site_run() {
     log "vps-site _run: sito sconosciuto: $d"
     return 1
   fi
-  [[ "$op" == create || "$op" == delete ]] || return 1
+  [[ "$op" == create || "$op" == delete || "$op" == wpinstall ]] || return 1
   install -d -m 700 "$SITES_RUN"
   SITE_ERROR_FILE="$SITES_RUN/$(site_reg_get "$d" .slug).err"
   rm -f "$SITE_ERROR_FILE"
@@ -640,21 +681,23 @@ site_run() {
   fi
   # Un doppione o un _run fuori posto non deve disfare un sito che funziona.
   state="$(site_reg_get "$d" .state)"
-  if [[ "$op" == create && "$state" != creating ]] || [[ "$op" == delete && "$state" != deleting ]]; then
+  if [[ "$op" == create && "$state" != creating ]] || [[ "$op" == delete && "$state" != deleting ]] \
+    || [[ "$op" == wpinstall && "$state" != installing ]]; then
     exec 9>&-
     log "vps-site _run: $d è in stato $state, $op ignorato"
     return 1
   fi
-  if ! site_cf_token; then
+  # wpinstall non parla con Cloudflare: il token serve solo a creare ed eliminare.
+  if [[ "$op" != wpinstall ]] && ! site_cf_token; then
     exec 9>&-
     site_abort "$d" "$op" "token Cloudflare mancante in $VPS_OPT/secrets/cloudflare.ini"
     return 1
   fi
-  if [[ "$op" == create ]]; then
-    site_job_create "$d" || rc=1
-  else
-    site_job_delete "$d" || rc=1
-  fi
+  case "$op" in
+    create) site_job_create "$d" || rc=1 ;;
+    wpinstall) site_job_wpinstall "$d" || rc=1 ;;
+    *) site_job_delete "$d" || rc=1 ;;
+  esac
   rm -f "$SITE_ERROR_FILE"
   # Libera il lucchetto: in un processo a sé si chiude da solo, ma chi chiama
   # site_run da una shell che resta viva (i test) non deve bloccare il lavoro dopo.
@@ -666,10 +709,11 @@ site_run() {
 # (riavvio, processo ucciso). Una creazione diventa errore, così il pannello
 # offre Elimina; un'eliminazione torna allo stato di prima, perché l'archivio
 # potrebbe non esserci ancora. Il primo minuto non si guarda: tra la scrittura
-# del registro e l'avvio dell'unità passa qualche istante.
+# del registro e l'avvio dell'unità passa qualche istante. Un'installazione di
+# WordPress interrotta diventa errore: il sito è a metà tra PHP e WordPress.
 site_refresh() {
   local d="$1" rc=0
-  [[ "$(site_reg_get "$d" .state)" == creating || "$(site_reg_get "$d" .state)" == deleting ]] || return 0
+  in_list "$(site_reg_get "$d" .state)" creating deleting installing || return 0
   # Se il lucchetto globale è occupato un lavoro è in corso o in coda: non si
   # tocca nulla. Evita di scambiare per morto un lavoro che sta finendo.
   exec 8>"$SITES_LOCK" || return 0
@@ -683,7 +727,7 @@ site_refresh() {
 site_refresh_locked() {
   local d="$1" state op ts slug step
   state="$(site_reg_get "$d" .state)"
-  [[ "$state" == creating || "$state" == deleting ]] || return 0
+  in_list "$state" creating deleting installing || return 0
   ts="$(site_reg_get "$d" '.job.ts // 0')"
   (($(date +%s) - ts > 60)) || return 0
   op="$(site_reg_get "$d" .job.op)"
@@ -694,6 +738,10 @@ site_refresh_locked() {
   fi
   if [[ "$state" == creating ]]; then
     site_abort "$d" create "operazione interrotta: elimina il sito per pulire i resti"
+  elif [[ "$state" == installing ]]; then
+    site_wp_args_clean "$d"
+    site_reg_update "$d" '.state = "error"'
+    site_job "$d" wpinstall "$step" "installazione WordPress interrotta: elimina il sito e ricrealo"
   elif [[ "$step" == remove ]]; then
     # l'archivio c'è già e la rimozione è a metà: tornare indietro porterebbe
     # a riarchiviare una cartella che non esiste più. Errore: riprovare salta l'archivio.

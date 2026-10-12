@@ -177,3 +177,189 @@ setup() {
   run grep -c '^user site_a_miosito_it ' "$REDIS_ACL_FILE"
   [ "$output" = 0 ]
 }
+
+# Prepara i file di passaggio come li lascia `vps-site` (task 3).
+wp_args() { # DOMINIO [cloudflare true|false]
+  local slug; slug="$(site_slug "$1")"
+  mkdir -p "$SITES_RUN"
+  jq -n --arg cf "${2:-false}" '{title:"Il blog", admin_user:"gestore", admin_email:"io@miosito.it", login_path:"accesso-7k2f", cloudflare:($cf=="true")}' >"$SITES_RUN/$slug.wpargs"
+  printf '%s' 'Password-admin-wp-12345' >"$SITES_RUN/$slug.wppass"
+}
+
+@test "creazione WordPress: tutti i passi, credenziali solo su stdin, file di passaggio cancellati" {
+  site_reg_new blog.miosito.it wordpress no yes
+  printf '%s' 'Password-db-1234567890' >"$SITES_RUN/site_blog_miosito_it.pass" 2>/dev/null || { mkdir -p "$SITES_RUN"; printf '%s' 'Password-db-1234567890' >"$SITES_RUN/site_blog_miosito_it.pass"; }
+  wp_args blog.miosito.it
+  site_run create blog.miosito.it
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  [ "$(site_reg_get blog.miosito.it .wordpress.login_path)" = accesso-7k2f ]
+  [ "$(site_reg_get blog.miosito.it .wordpress.admin_user)" = gestore ]
+  grep -q 'wp --path=.* core download --locale=it_IT' "$CALLS"
+  grep -q 'wp --path=.* core install --url=https://blog.miosito.it --title=Il blog --admin_user=gestore --admin_email=io@miosito.it --skip-email --locale=it_IT --prompt=admin_password' "$CALLS"
+  grep -q 'Password-admin-wp-12345' "$BATS_TEST_TMPDIR/wp.stdin"
+  run grep -c 'Password-admin-wp-12345\|Password-db-1234567890' "$CALLS"
+  [ "$output" = 0 ]
+  grep -q 'wp --path=.* plugin install wps-hide-login redis-cache --activate' "$CALLS"
+  grep -q 'wp --path=.* option update whl_page accesso-7k2f' "$CALLS"
+  grep -q 'wp --path=.* redis enable' "$CALLS"
+  grep -q 'wp --path=.* plugin auto-updates enable --all' "$CALLS"
+  run grep -c 'plugin install cloudflare' "$CALLS"
+  [ "$output" = 0 ]
+  [ -f "$SITES_WWW/blog.miosito.it/wp-config.php" ]
+  [ -f "$CRON_D/vps-site-site_blog_miosito_it" ]
+  grep -q '^user site_blog_miosito_it ' "$REDIS_ACL_FILE"
+  grep -q 'location = /xmlrpc.php' "$NGINX_CONF_D/blog.miosito.it.conf"
+  [ -z "$(ls "$SITES_RUN")" ]
+}
+
+@test "creazione WordPress con il plugin Cloudflare" {
+  site_reg_new blog.miosito.it wordpress no yes
+  mkdir -p "$SITES_RUN"; printf '%s' 'Password-db-1234567890' >"$SITES_RUN/site_blog_miosito_it.pass"
+  wp_args blog.miosito.it true
+  site_run create blog.miosito.it
+  grep -q 'wp --path=.* plugin install cloudflare --activate' "$CALLS"
+  [ "$(site_reg_get blog.miosito.it .wordpress.cloudflare_plugin)" = true ]
+}
+
+@test "creazione WordPress: download fallito, si annulla tutto (anche Redis, cron, wp-config)" {
+  site_reg_new blog.miosito.it wordpress no yes
+  mkdir -p "$SITES_RUN"; printf '%s' 'Password-db-1234567890' >"$SITES_RUN/site_blog_miosito_it.pass"
+  wp_args blog.miosito.it
+  export WP_FAIL_ON="core download"
+  run site_run create blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = error ]
+  [ "$(site_reg_get blog.miosito.it .job.step)" = wp ]
+  [ ! -e "$SITES_WWW/blog.miosito.it" ]
+  run grep -c site_blog_miosito_it "$REDIS_ACL_FILE"
+  [ "$output" = 0 ]
+  [ ! -e "$CRON_D/vps-site-site_blog_miosito_it" ]
+  [ -z "$(ls "$SITES_RUN" | grep -v '\.err$')" ]
+}
+
+# Un sito PHP attivo con DB e segnaposto, come lo lascia la 2a.
+php_site() {
+  site_reg_new blog.miosito.it php no yes
+  mkdir -p "$SITES_RUN"; printf '%s' 'Password-db-1234567890' >"$SITES_RUN/site_blog_miosito_it.pass"
+  site_run create blog.miosito.it
+}
+
+@test "wp-install su un sito PHP vuoto: diventa WordPress" {
+  php_site
+  site_reg_update blog.miosito.it '.state = "installing"'
+  wp_args blog.miosito.it
+  site_run wpinstall blog.miosito.it
+  [ "$(site_reg_get blog.miosito.it .type)" = wordpress ]
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  grep -q "define( 'DB_PASSWORD', 'Password-db-1234567890' );" "$SITES_WWW/blog.miosito.it/wp-config.php"
+  grep -q 'location = /xmlrpc.php' "$NGINX_CONF_D/blog.miosito.it.conf"
+}
+
+@test "wp-install fallito: il sito torna PHP con il segnaposto e il DB senza tabelle" {
+  php_site
+  site_reg_update blog.miosito.it '.state = "installing"'
+  wp_args blog.miosito.it
+  export WP_FAIL_ON="plugin install"
+  run site_run wpinstall blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .type)" = php ]
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  [[ "$(site_reg_get blog.miosito.it .job.error)" == *plugin* ]]
+  site_placeholder_intact blog.miosito.it
+  [ ! -e "$SITES_WWW/blog.miosito.it/wp-config.php" ]
+  run grep -c site_blog_miosito_it "$REDIS_ACL_FILE"
+  [ "$output" = 0 ]
+  [ ! -e "$CRON_D/vps-site-site_blog_miosito_it" ]
+  grep -q 'information_schema.tables' "$BATS_TEST_TMPDIR/mariadb.sql"
+  run grep -c 'location = /xmlrpc.php' "$NGINX_CONF_D/blog.miosito.it.conf"
+  [ "$output" = 0 ]
+}
+
+@test "wp-install su public/ non intatta: rifiutato senza toccare niente" {
+  php_site
+  echo x >"$SITES_WWW/blog.miosito.it/public/mio.html"
+  site_reg_update blog.miosito.it '.state = "installing"'
+  wp_args blog.miosito.it
+  run site_run wpinstall blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ -f "$SITES_WWW/blog.miosito.it/public/mio.html" ]
+  [ "$(site_reg_get blog.miosito.it .type)" = php ]
+  [[ "$(site_reg_get blog.miosito.it .job.error)" == *"non è vuota"* ]]
+  run grep -c 'core download' "$CALLS"
+  [ "$output" = 0 ]
+}
+
+@test "eliminazione di un sito WordPress toglie anche utente Redis e cron" {
+  site_reg_new blog.miosito.it wordpress no yes
+  mkdir -p "$SITES_RUN"; printf '%s' 'Password-db-1234567890' >"$SITES_RUN/site_blog_miosito_it.pass"
+  wp_args blog.miosito.it
+  site_run create blog.miosito.it
+  # prima dell'eliminazione utente Redis e cron ci sono davvero
+  grep -q '^user site_blog_miosito_it ' "$REDIS_ACL_FILE"
+  [ -f "$CRON_D/vps-site-site_blog_miosito_it" ]
+  site_reg_update blog.miosito.it '.prev_state = .state | .state = "deleting"'
+  site_run delete blog.miosito.it
+  run site_reg_exists blog.miosito.it
+  [ "$status" -eq 1 ]
+  run grep -c site_blog_miosito_it "$REDIS_ACL_FILE"
+  [ "$output" = 0 ]
+  [ ! -e "$CRON_D/vps-site-site_blog_miosito_it" ]
+}
+
+@test "site_refresh: wpinstall interrotto diventa errore" {
+  php_site
+  site_reg_update blog.miosito.it '.state = "installing" | .job.op = "wpinstall" | .job.ts = 1'
+  export STUB_RC_systemctl=3
+  site_refresh blog.miosito.it
+  [ "$(site_reg_get blog.miosito.it .state)" = error ]
+  [[ "$(site_reg_get blog.miosito.it .job.error)" == *"installazione WordPress interrotta"* ]]
+}
+
+@test "nuova password DB su un sito WordPress aggiorna anche wp-config.php" {
+  site_reg_new blog.miosito.it wordpress no yes
+  mkdir -p "$SITES_WWW/blog.miosito.it/public"
+  site_wp_config_write blog.miosito.it 'Password-db-1234567890' 'Password-redis-1234567890'
+  printf 'DB_PASS=Password-db-1234567890\n' >"$SITES_WWW/blog.miosito.it/db.env"
+  site_db_password blog.miosito.it 'Nuova-password-db-0987654321'
+  grep -q "define( 'DB_PASSWORD', 'Nuova-password-db-0987654321' );" "$SITES_WWW/blog.miosito.it/wp-config.php"
+}
+
+@test "nuova password DB: wp-config.php senza la riga, DB rimesso com'era e db.env intatto" {
+  site_reg_new blog.miosito.it wordpress no yes
+  mkdir -p "$SITES_WWW/blog.miosito.it/public"
+  printf '<?php\n// niente\n' >"$SITES_WWW/blog.miosito.it/wp-config.php"
+  printf 'DB_PASS=Password-db-1234567890\n' >"$SITES_WWW/blog.miosito.it/db.env"
+  export SITE_ERROR_FILE="$BATS_TEST_TMPDIR/err"
+  run site_db_password blog.miosito.it 'Nuova-password-db-0987654321'
+  [ "$status" -eq 1 ]
+  grep -qx 'DB_PASS=Password-db-1234567890' "$SITES_WWW/blog.miosito.it/db.env"
+  [ "$(grep -c 'ALTER USER' "$BATS_TEST_TMPDIR/mariadb.sql")" = 2 ]
+  tail -n 1 "$BATS_TEST_TMPDIR/mariadb.sql" | grep -q "Password-db-1234567890"
+}
+
+@test "wp-install su un sito senza database: rifiutato, file di passaggio cancellati" {
+  site_reg_new blog.miosito.it php no no
+  site_run create blog.miosito.it
+  site_reg_update blog.miosito.it '.state = "installing"'
+  wp_args blog.miosito.it
+  run site_run wpinstall blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  [ "$(site_reg_get blog.miosito.it .type)" = php ]
+  [ -z "$(ls "$SITES_RUN")" ]
+  run grep -c 'core download' "$CALLS"
+  [ "$output" = 0 ]
+}
+
+@test "site_abort di wpinstall: sito di nuovo attivo, file di passaggio cancellati" {
+  php_site
+  site_reg_update blog.miosito.it '.state = "installing"'
+  wp_args blog.miosito.it
+  export SITES_LOCK_WAIT=0
+  exec 7>"$SITES_LOCK"; flock -n 7
+  run site_run wpinstall blog.miosito.it
+  exec 7>&-
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  [ -z "$(ls "$SITES_RUN")" ]
+}
