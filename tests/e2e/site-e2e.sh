@@ -15,7 +15,9 @@ done
 
 work="$(mktemp -d /tmp/site-e2e.XXXXXX)"
 chmod 755 "$work"
-D1=blog.e2etest.it
+# Il sito con --www è il dominio principale della zona: dalla v1.2.1 il www si
+# aggiunge solo lì (Cloudflare non ha un certificato per www.blog.zona).
+D1=e2etest.it
 D2=vetrina.e2etest.it
 ADMIN=e2eadmin
 PASS='Password-e2e-1234567'
@@ -23,7 +25,12 @@ created=()
 made_maint=
 made_admin=
 
-fail() { echo "E2E FALLITO: $*" >&2; exit 1; }
+fail() {
+  echo "E2E FALLITO: $*" >&2
+  # La cartella di prova sparisce nel cleanup: il registro degli strumenti si mostra qui.
+  [[ ! -f "${VPS_LOG:-}" ]] || { echo "--- ultime righe di $VPS_LOG" >&2; tail -n 40 "$VPS_LOG" >&2; }
+  exit 1
+}
 
 cleanup() {
   set +e
