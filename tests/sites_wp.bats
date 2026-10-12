@@ -92,6 +92,38 @@ setup() {
   [[ "$(cat "$SITE_ERROR_FILE")" == *Redis* ]]
 }
 
+@test "utente Redis: le chiavi del prefisso si cancellano prima di aggiungerlo e quando si toglie" {
+  # Un sito ricreato con lo stesso dominio ha lo stesso prefisso: senza svuotarlo
+  # WordPress leggerebbe dalla cache le opzioni del sito eliminato (visto nell'E2E).
+  site_reg_new blog.miosito.it wordpress no yes
+  site_redis_user_add blog.miosito.it 'Password-redis-1234567890'
+  ev="$(grep -n 'EVAL .*SCAN.*UNLINK.* 0 site_blog_miosito_it:\* auth=si' "$CALLS" | cut -d: -f1)"
+  acl="$(grep -n 'ACL LOAD' "$CALLS" | cut -d: -f1)"
+  [ -n "$ev" ] && [ -n "$acl" ] && [ "$ev" -lt "$acl" ]
+  : >"$CALLS"
+  site_redis_user_remove blog.miosito.it
+  grep -q 'EVAL .* 0 site_blog_miosito_it:\* auth=si' "$CALLS"
+}
+
+@test "utente Redis: cache non svuotabile, l'utente non si aggiunge" {
+  site_reg_new blog.miosito.it wordpress no yes
+  cp "$REDIS_ACL_FILE" "$BATS_TEST_TMPDIR/prima"
+  export STUB_RC_redis_cli=1 SITE_ERROR_FILE="$BATS_TEST_TMPDIR/err"
+  run site_redis_user_add blog.miosito.it 'Password-redis-1234567890'
+  [ "$status" -eq 1 ]
+  cmp "$REDIS_ACL_FILE" "$BATS_TEST_TMPDIR/prima"
+  run grep -c 'ACL LOAD' "$CALLS"
+  [ "$output" = 0 ]
+}
+
+@test "utente Redis: un sito PHP eliminato non tocca Redis" {
+  site_reg_new blog.miosito.it php no yes
+  : >"$CALLS"
+  site_redis_user_remove blog.miosito.it
+  run grep -c redis-cli "$CALLS"
+  [ "$output" = 0 ]
+}
+
 @test "cron di WordPress come utente del sito" {
   site_reg_new blog.miosito.it wordpress no yes
   site_wp_cron_add blog.miosito.it
@@ -201,7 +233,13 @@ wp_args() { # DOMINIO [cloudflare true|false]
   [ "$output" = 0 ]
   grep -q 'wp --path=.* plugin install wps-hide-login redis-cache --activate' "$CALLS"
   grep -q 'wp --path=.* option update whl_page accesso-7k2f' "$CALLS"
-  grep -q 'wp --path=.* redis enable' "$CALLS"
+  # permalink belli: senza, /wp-login.php finisce sulla home con 200 invece di 404
+  grep -q 'wp --path=.* rewrite structure /%postname%/' "$CALLS"
+  # drop-in copiato a mano: `wp redis enable` fa FLUSHDB, vietato all'utente ACL del sito
+  run grep -c 'redis enable' "$CALLS"
+  [ "$output" = 0 ]
+  grep -q 'drop-in' "$SITES_WWW/blog.miosito.it/public/wp-content/object-cache.php"
+  grep -q 'wp --path=.* redis status' "$CALLS"
   grep -q 'wp --path=.* plugin auto-updates enable --all' "$CALLS"
   run grep -c 'plugin install cloudflare' "$CALLS"
   [ "$output" = 0 ]
@@ -428,6 +466,21 @@ exec "$BATS_TEST_TMPDIR/bin/wp.orig" "$@"'
   [ ! -e "$CRON_D/vps-site-site_blog_miosito_it" ]
   [ ! -e "$SITES_WWW/blog.miosito.it" ]
   [ -z "$(ls "$SITES_RUN")" ]
+}
+
+@test "wp-install: Redis non collegato dopo il drop-in, passo plugins fallito e annullato" {
+  php_site
+  site_reg_update blog.miosito.it '.state = "installing"'
+  wp_args blog.miosito.it
+  export WP_REDIS_STATUS="Not connected"
+  run site_run wpinstall blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .job.step)" = plugins ]
+  [[ "$(site_reg_get blog.miosito.it .job.error)" == *"Redis non collegata"* ]]
+  [ "$(site_reg_get blog.miosito.it .type)" = php ]
+  [ ! -e "$SITES_WWW/blog.miosito.it/public/wp-content" ]
+  run grep -c site_blog_miosito_it "$REDIS_ACL_FILE"
+  [ "$output" = 0 ]
 }
 
 @test "wp-install fallito a core install: annullato del tutto" {

@@ -81,6 +81,9 @@ exec "$@"'
   # shellcheck disable=SC2016
   make_stub wp 'echo "wp $*" >>"$CALLS"; if [[ "$*" == *--prompt=* ]]; then cat >>"$BATS_TEST_TMPDIR/wp.stdin"; fi
 if [[ -n "${WP_FAIL_ON:-}" && "$*" == *"$WP_FAIL_ON"* ]]; then exit 1; fi
-if [[ "$*" == *"core download"* ]]; then p="${*##*--path=}"; p="${p%% *}"; mkdir -p "$p/wp-content"; echo "<?php" >"$p/index.php"; fi
+p="${*##*--path=}"; p="${p%% *}"
+if [[ "$*" == *"core download"* ]]; then mkdir -p "$p/wp-content"; echo "<?php" >"$p/index.php"; fi
+if [[ "$*" == *"plugin install"*redis-cache* ]]; then mkdir -p "$p/wp-content/plugins/redis-cache/includes"; echo "<?php // drop-in" >"$p/wp-content/plugins/redis-cache/includes/object-cache.php"; fi
+if [[ "$*" == *"redis status"* ]]; then echo "Status: ${WP_REDIS_STATUS:-Connected}"; fi
 exit 0'
 }

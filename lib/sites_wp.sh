@@ -108,15 +108,39 @@ site_redis_acl_replace() {
   site_fail "Redis non ha accettato l'utente del sito (dettagli in $VPS_LOG)"
 }
 
+# site_redis_purge DOMINIO — cancella le chiavi del prefisso del sito. Un sito
+# ricreato con lo stesso dominio ha lo stesso prefisso: senza questo WordPress
+# leggerebbe dalla cache le opzioni (e gli utenti) del sito eliminato.
+# Lo script Lua gira dentro Redis: i nomi delle chiavi (spazi, apici, a capo)
+# non passano mai da una shell. Il prefisso è [a-z0-9_]: nessun jolly del glob.
+site_redis_purge() {
+  local slug pw
+  slug="$(site_reg_get "$1" .slug)"
+  pw="$(head -n 1 "$REDIS_ADMIN_SECRET" 2>/dev/null)" || return 1
+  [[ -n "$pw" ]] || return 1
+  REDISCLI_AUTH="$pw" redis-cli --no-auth-warning --user vps-admin EVAL \
+    "local c, n = '0', 0 repeat local r = redis.call('SCAN', c, 'MATCH', ARGV[1], 'COUNT', 1000) c = r[1] for _, k in ipairs(r[2]) do redis.call('UNLINK', k) n = n + 1 end until c == '0' return n" \
+    0 "$slug:*" >>"$VPS_LOG" 2>&1
+}
+
 site_redis_user_add() {
   local slug h
   slug="$(site_reg_get "$1" .slug)"
   h="$(printf '%s' "$2" | sha256sum | cut -d' ' -f1)"
+  site_redis_purge "$1" || { site_fail "cache Redis di un sito precedente non svuotata (dettagli in $VPS_LOG)"; return 1; }
   site_redis_acl_replace "$1" "user $slug on #$h ~$slug:* &$slug:* +@all -@dangerous -@admin +info"
 }
 
 site_redis_user_remove() {
-  grep -q "^user $(site_reg_get "$1" .slug) " "$REDIS_ACL_FILE" 2>/dev/null || return 0
+  local has_user=0
+  grep -q "^user $(site_reg_get "$1" .slug) " "$REDIS_ACL_FILE" 2>/dev/null && has_user=1
+  # Le chiavi si tolgono anche se la riga ACL non c'è più (un WordPress a metà
+  # potrebbe averne lasciate); i siti PHP e statici non hanno mai usato Redis.
+  # Se non riesce, ci riprova la prossima creazione con lo stesso dominio.
+  if ((has_user)) || [[ "$(site_reg_get "$1" .type)" == wordpress ]]; then
+    site_redis_purge "$1" || log "ATTENZIONE: chiavi Redis di $1 non cancellate"
+  fi
+  ((has_user)) || return 0
   site_redis_acl_replace "$1"
 }
 
@@ -201,6 +225,24 @@ site_wp_install_files() {
     || { site_fail "installazione di WordPress non riuscita (dettagli in $VPS_LOG)"; return 1; }
 }
 
+# site_wp_redis_dropin DOMINIO — attiva la cache Redis copiando il drop-in del
+# plugin. `wp redis enable` non si può usare: dopo la copia lancia FLUSHDB, che
+# l'utente ACL del sito non ha (giustamente: svuoterebbe le chiavi di tutti i
+# siti), e fallisce. La copia la fa l'utente del sito: wp-content/ è sua.
+site_wp_redis_dropin() {
+  local d="$1" root slug out
+  root="$(site_root "$d")"
+  slug="$(site_reg_get "$d" .slug)"
+  (cd "$root" && runuser -u "$slug" -- cp -- "$root/public/wp-content/plugins/redis-cache/includes/object-cache.php" \
+    "$root/public/wp-content/object-cache.php") >>"$VPS_LOG" 2>&1 \
+    || { site_fail "cache Redis non attivata: drop-in non copiato (dettagli in $VPS_LOG)"; return 1; }
+  # Il drop-in non dà errori se Redis rifiuta le credenziali (ripiega sul DB):
+  # si controlla che il sito si colleghi davvero.
+  out="$(site_wp "$d" redis status 2>&1)" || true
+  printf '%s\n' "$out" >>"$VPS_LOG"
+  [[ "$out" == *"Status: Connected"* ]] || { site_fail "cache Redis non collegata (dettagli in $VPS_LOG)"; return 1; }
+}
+
 # site_wp_plugins DOMINIO — passo "plugins": plugin, aggiornamenti automatici,
 # registro, vhost wordpress, cron.
 site_wp_plugins() {
@@ -208,7 +250,11 @@ site_wp_plugins() {
   site_wp "$d" plugin install wps-hide-login redis-cache --activate >>"$VPS_LOG" 2>&1 \
     || { site_fail "installazione dei plugin non riuscita (dettagli in $VPS_LOG)"; return 1; }
   site_wp "$d" option update whl_page "$WP_LOGIN_PATH" >>"$VPS_LOG" 2>&1 || { site_fail "percorso di login non impostato"; return 1; }
-  site_wp "$d" redis enable >>"$VPS_LOG" 2>&1 || { site_fail "cache Redis non attivata (dettagli in $VPS_LOG)"; return 1; }
+  # Permalink "belli": con quelli semplici (il default senza Apache) WPS Hide
+  # Login non riesce a dare 404 su /wp-login.php e /wp-admin, che finiscono
+  # sulla home con 200 (visto nell'E2E). Nginx li serve già con try_files.
+  site_wp "$d" rewrite structure '/%postname%/' >>"$VPS_LOG" 2>&1 || { site_fail "permalink non impostati"; return 1; }
+  site_wp_redis_dropin "$d" || return 1
   if [[ "$WP_CLOUDFLARE" == true ]]; then
     site_wp "$d" plugin install cloudflare --activate >>"$VPS_LOG" 2>&1 \
       || { site_fail "installazione del plugin Cloudflare non riuscita"; return 1; }
