@@ -232,12 +232,14 @@ site_wp_undo() {
   # Prima i file di WordPress, poi wp-config.php: un WordPress rimasto a metà
   # senza wp-config offrirebbe setup-config.php a chiunque.
   # find -delete non segue i collegamenti simbolici: sicuro anche in una cartella del sito.
-  if find "$root/public" -mindepth 1 -delete; then
-    rm -f "$root/wp-config.php" || rc=1
-  else
+  if ! find "$root/public" -mindepth 1 -delete; then
+    # File di WordPress ancora lì: DB e vhost restano come sono e il sito
+    # risponde 503, altrimenti install.php sarebbe aperto a chiunque.
     log "ATTENZIONE: file di WordPress di $d non tolti tutti"
-    rc=1
+    site_vhost_add "$d" maintenance || log "ATTENZIONE: vhost di manutenzione di $d non scritto"
+    return 1
   fi
+  rm -f "$root/wp-config.php" || rc=1
   # Il segnaposto lo scrive l'utente del sito, non root: public/ è sua e il pool
   # PHP è vivo, un file temporaneo di root lì dentro potrebbe essere scambiato
   # con un collegamento prima di chmod/chown.
@@ -257,7 +259,13 @@ site_wp_undo() {
     rc=1
   fi
   site_reg_update "$d" '.type = "php" | del(.wordpress)' || rc=1
-  site_vhost_add "$d" normal || { log "ATTENZIONE: vhost PHP di $d non ripristinato"; rc=1; }
+  # Il vhost PHP solo se tutto il resto è tornato com'era; altrimenti 503 (il
+  # passo plugins potrebbe aver già messo il vhost wordpress).
+  if ((rc == 0)); then
+    site_vhost_add "$d" normal || { log "ATTENZIONE: vhost PHP di $d non ripristinato"; rc=1; }
+  else
+    site_vhost_add "$d" maintenance || log "ATTENZIONE: vhost di manutenzione di $d non scritto"
+  fi
   return "$rc"
 }
 

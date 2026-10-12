@@ -475,3 +475,33 @@ exec "$BATS_TEST_TMPDIR/bin/wp.orig" "$@"'
   [ "$status" -eq 1 ]
   [ -z "$(ls "$SITES_RUN")" ]
 }
+
+@test "wp-install: file di WordPress non tolti, DB intatto e il sito resta in 503" {
+  php_site
+  site_reg_update blog.miosito.it '.state = "installing"'
+  wp_args blog.miosito.it
+  : >"$BATS_TEST_TMPDIR/mariadb.sql"
+  # find -delete fallisce; le altre ricerche (controllo del segnaposto) funzionano
+  # shellcheck disable=SC2016
+  make_stub find 'if [[ " $* " == *" -delete "* ]]; then exit 1; fi; exec /usr/bin/find "$@"'
+  export WP_FAIL_ON="plugin install"
+  run site_run wpinstall blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = error ]
+  [[ "$(site_reg_get blog.miosito.it .job.error)" == *"non annullata del tutto"* ]]
+  grep -q 'return 503' "$NGINX_CONF_D/blog.miosito.it.conf"
+  run grep -c 'DROP DATABASE' "$BATS_TEST_TMPDIR/mariadb.sql"
+  [ "$output" = 0 ]
+  [ -f "$SITES_WWW/blog.miosito.it/wp-config.php" ]
+}
+
+@test "wp-install: annullamento a metà (DB non ricreato), il vhost resta in 503" {
+  php_site
+  site_reg_update blog.miosito.it '.state = "installing"'
+  wp_args blog.miosito.it
+  export WP_FAIL_ON="plugin install" STUB_RC_mariadb=1
+  run site_run wpinstall blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = error ]
+  grep -q 'return 503' "$NGINX_CONF_D/blog.miosito.it.conf"
+}
