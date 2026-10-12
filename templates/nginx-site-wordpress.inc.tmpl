@@ -1,0 +1,31 @@
+    location = /favicon.ico {
+        log_not_found off;
+        access_log off;
+    }
+
+    location = /robots.txt {
+        allow all;
+        log_not_found off;
+        access_log off;
+    }
+
+    # xmlrpc.php: bersaglio classico di attacchi a forza bruta, WordPress non ne ha bisogno.
+    location = /xmlrpc.php {
+        deny all;
+    }
+
+    # Niente PHP tra i file caricati: un upload malevolo non deve poter essere eseguito.
+    location ~* /(?:uploads|files)/.*\.php$ {
+        deny all;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    location ~ \.php$ {
+        try_files $uri =404;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_pass unix:/run/php/php${PHP_VERSION}-fpm-${SITE_SLUG}.sock;
+    }

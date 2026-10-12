@@ -61,4 +61,26 @@ case "$m $url" in
     echo "{\"success\":${CF_POST_OK:-true},\"result\":{\"id\":\"rec$c\"}}" ;;
   "DELETE "*) echo "{\"success\":true,\"result\":{}}" ;;
 esac'
+  export REDIS_ACL_FILE="$BATS_TEST_TMPDIR/users.acl" REDIS_ADMIN_SECRET="$VPS_OPT/secrets/redis-admin"
+  export CRON_D="$BATS_TEST_TMPDIR/cron.d" WP_BIN="$BATS_TEST_TMPDIR/bin/wp"
+  mkdir -p "$CRON_D"
+  printf 'user default off\n' >"$REDIS_ACL_FILE"
+  printf 'segreto-admin-redis-0123456789\n' >"$REDIS_ADMIN_SECRET"
+  # redis-cli: annota argomenti e se la password è arrivata dall'ambiente (mai negli argomenti).
+  # shellcheck disable=SC2016
+  make_stub redis-cli 'echo "redis-cli $* auth=${REDISCLI_AUTH:+si}" >>"$CALLS"; exit "${STUB_RC_redis_cli:-0}"'
+  # runuser -u UTENTE -- [env -i VAR=... ] COMANDO...: annota l'utente ed esegue il
+  # comando saltando `env -i` e le sue assegnazioni (cancellerebbero CALLS e
+  # BATS_TEST_TMPDIR, che servono allo stub di wp).
+  # shellcheck disable=SC2016
+  make_stub runuser 'echo "runuser $1 $2" >>"$CALLS"; shift 3
+if [[ "$1" == env ]]; then shift; while [[ "$1" == -i || "$1" == *=* ]]; do shift; done; fi
+exec "$@"'
+  # wp (WP-CLI): annota la chiamata; legge stdin solo con --prompt (altrimenti
+  # potrebbe bloccarsi su uno stdin mai chiuso); WP_FAIL_ON="core download" fa fallire quel comando.
+  # shellcheck disable=SC2016
+  make_stub wp 'echo "wp $*" >>"$CALLS"; if [[ "$*" == *--prompt=* ]]; then cat >>"$BATS_TEST_TMPDIR/wp.stdin"; fi
+if [[ -n "${WP_FAIL_ON:-}" && "$*" == *"$WP_FAIL_ON"* ]]; then exit 1; fi
+if [[ "$*" == *"core download"* ]]; then p="${*##*--path=}"; p="${p%% *}"; mkdir -p "$p/wp-content"; echo "<?php" >"$p/index.php"; fi
+exit 0'
 }

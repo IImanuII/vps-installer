@@ -1,0 +1,43 @@
+<?php
+// vps-site: ${WP_DOMAIN} — file generato e di root: il sito lo legge ma non può modificarlo.
+define( 'DB_NAME', '${WP_DB_NAME}' );
+define( 'DB_USER', '${WP_DB_NAME}' );
+define( 'DB_PASSWORD', '${WP_DB_PASSWORD}' );
+define( 'DB_HOST', 'localhost' );
+define( 'DB_CHARSET', 'utf8mb4' );
+define( 'DB_COLLATE', '' );
+
+define( 'AUTH_KEY',         '${WP_KEY1}' );
+define( 'SECURE_AUTH_KEY',  '${WP_KEY2}' );
+define( 'LOGGED_IN_KEY',    '${WP_KEY3}' );
+define( 'NONCE_KEY',        '${WP_KEY4}' );
+define( 'AUTH_SALT',        '${WP_KEY5}' );
+define( 'SECURE_AUTH_SALT', '${WP_KEY6}' );
+define( 'LOGGED_IN_SALT',   '${WP_KEY7}' );
+define( 'NONCE_SALT',       '${WP_KEY8}' );
+
+$table_prefix = 'wp_';
+
+define( 'WP_HOME', 'https://${WP_DOMAIN}' );
+define( 'WP_SITEURL', 'https://${WP_DOMAIN}' );
+define( 'DISALLOW_FILE_EDIT', true );
+define( 'FS_METHOD', 'direct' );
+define( 'WP_AUTO_UPDATE_CORE', true );
+define( 'DISABLE_WP_CRON', true );
+
+define( 'WP_REDIS_HOST', '127.0.0.1' );
+define( 'WP_REDIS_PORT', 6379 );
+define( 'WP_REDIS_USERNAME', '${WP_DB_NAME}' );
+define( 'WP_REDIS_PASSWORD', '${WP_REDIS_PASSWORD}' );
+define( 'WP_REDIS_PREFIX', '${WP_DB_NAME}:' );
+define( 'WP_REDIS_SELECTIVE_FLUSH', true );
+
+// Dietro Cloudflare PHP vede http: senza questo WordPress va in loop di redirect.
+if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https' ) {
+	$_SERVER['HTTPS'] = 'on';
+}
+
+if ( ! defined( 'ABSPATH' ) ) {
+	define( 'ABSPATH', __DIR__ . '/public/' );
+}
+require_once ABSPATH . 'wp-settings.php';

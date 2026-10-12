@@ -1,0 +1,2 @@
+# vps-site: cron di WordPress per ${WP_DOMAIN} — file generato
+*/5 * * * * ${WP_DB_NAME} ${WP_BIN} --path=${WP_ROOT}/public cron event run --due-now --quiet >/dev/null 2>&1
