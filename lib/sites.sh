@@ -154,6 +154,12 @@ site_dns_add() {
   zone="$(cf_find_zone "$d")" \
     || { site_fail "la zona di $d non è su Cloudflare o il token non la vede: serve un token con Zone: Read e DNS: Edit su tutte le zone"; return 1; }
   read -r zid zname <<<"$zone"
+  # Il certificato gratuito di Cloudflare copre la zona e un solo livello di
+  # sottodomini (*.zona): www.blog.zona non avrebbe HTTPS sul bordo di Cloudflare.
+  if [[ "$(site_reg_get "$d" .www)" == true && "$d" != "$zname" ]]; then
+    site_fail "il www si aggiunge solo al dominio principale della zona ($zname): Cloudflare non ha un certificato per www.$d"
+    return 1
+  fi
   site_reg_update "$d" '.zone = {id: $id, name: $name}' --arg id "$zid" --arg name "$zname" || return 1
   v4="$(jq -r '.ipv4 // empty' "$(manifest_path)")"
   v6="$(jq -r '.ipv6 // empty' "$(manifest_path)")"

@@ -141,6 +141,16 @@ setup() {
   [[ "$(cat "$SITE_ERROR_FILE")" == *"Zone: Read"*"DNS: Edit"* ]]
 }
 
+@test "site_dns_add: www su un sottodominio è rifiutato prima di creare record" {
+  site_reg_new blog.miosito.it static yes no
+  export CF_API_TOKEN=x SITE_ERROR_FILE="$BATS_TEST_TMPDIR/err"
+  run site_dns_add blog.miosito.it
+  [ "$status" -eq 1 ]
+  [[ "$(cat "$SITE_ERROR_FILE")" == *"dominio principale della zona (miosito.it)"* ]]
+  run grep -c '^POST ' "$BATS_TEST_TMPDIR/cf.log"
+  [ "$output" = 0 ]
+}
+
 @test "site_dns_remove toglie solo i record annotati" {
   site_reg_new miosito.it static yes no
   export CF_API_TOKEN=x

@@ -75,7 +75,7 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 
 ```json
 {
-  "installer_version": "1.2.0",
+  "installer_version": "1.2.1",
   "installed_at": "2026-10-07T15:30:00+02:00",
   "hostname": "vps-01",
   "ipv4": "203.0.113.10",
@@ -162,6 +162,7 @@ Regole di `vps-site`:
 - le operazioni brevi (`disable`, `enable`, `db-*`) rispondono "riprova" se un lavoro è in corso; un breve lucchetto sul registro serializza i comandi concorrenti (attesa fino a 5 s);
 - un lavoro interrotto da un riavvio: creazione -> `error` (si pulisce con `delete`); eliminazione ferma a `queued`/`archive` -> torna allo stato precedente, ferma a `remove` -> `error`;
 - un'eliminazione che non riesce a togliere tutto (ad es. `userdel` rifiutato) non cancella il registro: il sito va in `error` con `job.error` che elenca i resti, e un nuovo `delete` riprova senza riarchiviare;
+- `--www` vale solo per il dominio principale di una zona (`miosito.it`, non `blog.miosito.it`): il certificato gratuito di Cloudflare copre la zona e un solo livello di sottodomini, quindi `www.blog.miosito.it` non avrebbe HTTPS. La creazione si ferma al passo `dns`, prima di creare record;
 - `_run` e `_prune` sono interni (systemd e cron) e sotto sudo vengono rifiutati;
 - sotto sudo `vps-site` si rilancia subito in un'unità systemd temporanea (`systemd-run --wait --pipe --collect --quiet --service-type=exec --setenv=VPS_SITE_VIA_SYSTEMD=1 /opt/vps/bin/vps-site ...`): `php8.4-fpm.service` gira con `ProtectSystem=full` e `sudo` lanciato da PHP eredita il suo spazio dei mount, dove `/etc` è in sola lettura, quindi `disable`/`enable`/`db-*` non potrebbero scrivere vhost e configurazioni. stdin, stdout e codice d'uscita passano invariati; dentro l'unità `_run`/`_prune` restano rifiutati. Gli altri script che scrivono in `/etc` chiamati dal pannello (ad es. `vps-cf-ips-update`) hanno lo stesso limite e potranno servirsi dello stesso schema.
 
