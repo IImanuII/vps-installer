@@ -295,9 +295,18 @@ for cmd in "FLUSHALL" "FLUSHDB" "CONFIG GET maxmemory" "ACL LIST" "CLIENT LIST";
   [[ "$out" == *NOPERM* ]] || fail "$cmd non rifiutato al sito: $out"
 done
 rs DEL "$s1:e2e" >/dev/null
+apw="$(head -n 1 "$REDIS_ADMIN_SECRET")"
+# admin_keys PREFISSO — le chiavi di un prefisso, viste da vps-admin (vede tutto).
+admin_keys() { REDISCLI_AUTH="$apw" redis-cli --no-auth-warning --user vps-admin --scan --pattern "$1:*" 2>&1 || true; }
+# Il drop-in scrive davvero sotto il prefisso del sito: dopo una pagina servita
+# la cache non è vuota (ed è ciò che site_redis_purge dovrà togliere).
+c="$(code_of "$D1" /)"
+[[ "$c" == 200 ]] || fail "home di $D1 prima del controllo della cache: $c"
+n="$(admin_keys "$s1" | grep -c . || true)"
+echo "   chiavi sotto $s1:* dopo una pagina: $n"
+((n > 0)) || fail "nessuna chiave sotto $s1:*: il drop-in non scrive nella cache del sito"
 # Moduli (Redis 8 può averne di integrati): rispettano i pattern delle chiavi?
 # Solo esplorazione per il report: un modulo assente non è un errore.
-apw="$(head -n 1 "$REDIS_ADMIN_SECRET")"
 mods="$(REDISCLI_AUTH="$apw" redis-cli --no-auth-warning --user vps-admin MODULE LIST 2>&1)" || true
 echo "   MODULE LIST: $(tr '\n' ' ' <<<"${mods:-<nessun modulo>}")"
 # vectorset è integrato in Redis 8: deve rispettare il prefisso come ogni tipo.
@@ -381,6 +390,9 @@ for d in "$D1" "$D2"; do
   ls "$SITES_BACKUPS/$d"-*.sql.gz >/dev/null || fail "dump di $d"
   [[ ! -e "$SITES_WWW/$d" ]] || fail "cartella di $d ancora presente"
   id "site_${d//./_}" >/dev/null 2>&1 && fail "utente di $d ancora presente"
+  # site_redis_purge: un sito ricreato con lo stesso dominio non deve trovare la cache di questo.
+  left="$(admin_keys "site_${d//./_}")"
+  [[ -z "$left" ]] || fail "chiavi Redis di $d rimaste dopo l'eliminazione: $(head -n 5 <<<"$left")"
 done
 tarf="$(compgen -G "$SITES_BACKUPS/$D1-*.tar.gz" | head -n1)"
 [[ "$(tar -tzf "$tarf")" == *"$D1/wp-config.php"* ]] || fail "wp-config.php non è nell'archivio"
