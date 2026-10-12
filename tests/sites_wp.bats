@@ -118,3 +118,62 @@ setup() {
   grep -q 'try_files $uri $uri/ /index.php?$args;' "$f"
   grep -q "fastcgi_pass unix:/run/php/php$PHP_VERSION-fpm-site_blog_miosito_it.sock;" "$f"
 }
+
+@test "wp-config: password con apice rifiutata, nessun file scritto / file invariato" {
+  site_reg_new blog.miosito.it wordpress no yes
+  mkdir -p "$SITES_WWW/blog.miosito.it/public"
+  f="$SITES_WWW/blog.miosito.it/wp-config.php"
+  export SITE_ERROR_FILE="$BATS_TEST_TMPDIR/err"
+  run ! site_wp_config_write blog.miosito.it "Password'db-1234567890" 'Password-redis-1234567890'
+  run ! site_wp_config_write blog.miosito.it 'Password-db-1234567890' "Password'redis-1234567890"
+  [ ! -e "$f" ]
+  site_wp_config_write blog.miosito.it 'Password-db-1234567890' 'Password-redis-1234567890'
+  cp "$f" "$BATS_TEST_TMPDIR/prima"
+  run ! site_wp_config_set_db_password blog.miosito.it "Nuova'pass-1234567890"
+  cmp "$f" "$BATS_TEST_TMPDIR/prima"
+}
+
+@test "set_db_password: riga DB_PASSWORD mancante = errore e file intatto" {
+  site_reg_new blog.miosito.it wordpress no yes
+  f="$SITES_WWW/blog.miosito.it/wp-config.php"
+  mkdir -p "$SITES_WWW/blog.miosito.it"
+  printf '<?php\n// niente\n' >"$f"
+  cp "$f" "$BATS_TEST_TMPDIR/prima"
+  export SITE_ERROR_FILE="$BATS_TEST_TMPDIR/err"
+  run ! site_wp_config_set_db_password blog.miosito.it 'Nuova-password-1234567890'
+  cmp "$f" "$BATS_TEST_TMPDIR/prima"
+  [[ "$(cat "$SITE_ERROR_FILE")" == *DB_PASSWORD* ]]
+}
+
+@test "site_wp_config_write non lascia i segreti esportati" {
+  site_reg_new blog.miosito.it wordpress no yes
+  mkdir -p "$SITES_WWW/blog.miosito.it/public"
+  site_wp_config_write blog.miosito.it 'Password-db-1234567890' 'Password-redis-1234567890'
+  run bash -c 'echo "${WP_DB_PASSWORD:-}${WP_REDIS_PASSWORD:-}${WP_KEY1:-}"'
+  [ -z "$output" ]
+}
+
+@test "site_placeholder_intact: index.html symlink rifiutato" {
+  site_reg_new blog.miosito.it php no yes
+  site_user_add blog.miosito.it
+  pub="$SITES_WWW/blog.miosito.it/public"
+  mv "$pub/index.html" "$BATS_TEST_TMPDIR/vero.html"
+  ln -s "$BATS_TEST_TMPDIR/vero.html" "$pub/index.html"
+  run ! site_placeholder_intact blog.miosito.it
+}
+
+@test "validatori WordPress: lunghezze in byte" {
+  site_wp_valid_title "$(printf 'è%.0s' {1..34})"
+  run ! site_wp_valid_title "$(printf 'è%.0s' {1..51})"
+}
+
+@test "utente Redis: togliere a.miosito.it lascia la riga di ab.miosito.it" {
+  site_reg_new a.miosito.it wordpress no yes
+  site_reg_new ab.miosito.it wordpress no yes
+  site_redis_user_add a.miosito.it 'Password-redis-1234567890'
+  site_redis_user_add ab.miosito.it 'Password-redis-1234567891'
+  site_redis_user_remove a.miosito.it
+  [ "$(grep -c '^user site_ab_miosito_it ' "$REDIS_ACL_FILE")" = 1 ]
+  run grep -c '^user site_a_miosito_it ' "$REDIS_ACL_FILE"
+  [ "$output" = 0 ]
+}
