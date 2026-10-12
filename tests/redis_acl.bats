@@ -39,3 +39,55 @@ setup() {
   redis_acl_setup
   [ "$(jq -r .components.redis_acl "$VPS_OPT/manifest.json")" = true ]
 }
+
+@test "riavvio che fallisce la prima volta: conf ripristinata, Redis riavviato, ritorno 1, manifest intatto" {
+  make_stub systemctl 'echo "systemctl $*" >>"$BATS_TEST_TMPDIR/calls"
+[ "$1" = restart ] || exit 0
+n=$(grep -c "systemctl restart" "$BATS_TEST_TMPDIR/calls"); [ "$n" -ge 2 ]'
+  run redis_acl_setup
+  [ "$status" -eq 1 ]
+  ! grep -q '^aclfile' "$REDIS_CONF"
+  [ "$(cat "$REDIS_CONF")" = "port 6379" ]
+  [ ! -e "$REDIS_ACL_FILE" ]
+  [ "$(grep -c 'systemctl restart redis-server' "$BATS_TEST_TMPDIR/calls")" = 2 ]
+  [ "$(jq -r '.components.redis_acl // "no"' "$VPS_OPT/manifest.json")" = no ]
+}
+
+@test "Redis fermo con aclfile già presente: si riavvia invece di ACL LOAD" {
+  redis_acl_setup
+  : >"$BATS_TEST_TMPDIR/calls"
+  make_stub systemctl 'echo "systemctl $*" >>"$BATS_TEST_TMPDIR/calls"
+[ "$1" != is-active ]'
+  redis_acl_setup
+  grep -q 'systemctl restart redis-server' "$BATS_TEST_TMPDIR/calls"
+  ! grep -q 'redis-cli' "$BATS_TEST_TMPDIR/calls"
+}
+
+@test "ACL LOAD che fallisce: file ACL di prima ripristinato, ritorno 1" {
+  redis_acl_setup
+  echo 'user site_x on #abc ~site_x:* +@all' >>"$REDIS_ACL_FILE"
+  cp "$REDIS_ACL_FILE" "$BATS_TEST_TMPDIR/acl.prima"
+  make_stub redis-cli 'exit 1'
+  run redis_acl_setup
+  [ "$status" -eq 1 ]
+  cmp "$REDIS_ACL_FILE" "$BATS_TEST_TMPDIR/acl.prima"
+}
+
+@test "configurazione estranea in redis.conf: niente cambiato, ritorno 1" {
+  local riga
+  for riga in "aclfile /altro/file.acl" "user pippo on >x ~* +@all" "requirepass segreto" "  requirepass segreto"; do
+    printf 'port 6379\n%s\n' "$riga" >"$REDIS_CONF"
+    cp "$REDIS_CONF" "$BATS_TEST_TMPDIR/conf.prima"
+    run redis_acl_setup
+    [ "$status" -eq 1 ]
+    cmp "$REDIS_CONF" "$BATS_TEST_TMPDIR/conf.prima"
+    [ ! -e "$REDIS_ACL_FILE" ]
+    [ ! -e "$REDIS_ADMIN_SECRET" ]
+  done
+}
+
+@test "la nostra riga aclfile e i commenti non sono configurazione estranea" {
+  printf 'port 6379\n# requirepass x\naclfile %s\n' "$REDIS_ACL_FILE" >"$REDIS_CONF"
+  run redis_acl_setup
+  [ "$status" -eq 0 ]
+}

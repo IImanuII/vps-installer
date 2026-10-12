@@ -9,8 +9,8 @@
 wpcli_install() {
   local rel phar_url sha_url tmp want got
   rel="$(curl -fsSL --max-time 30 "$WPCLI_API")" || { log "WP-CLI: release non leggibile"; return 1; }
-  phar_url="$(jq -r '.assets[] | select(.name | test("^wp-cli-[0-9.]+\\.phar$")) | .browser_download_url' <<<"$rel")"
-  sha_url="$(jq -r '.assets[] | select(.name | test("^wp-cli-[0-9.]+\\.phar\\.sha512$")) | .browser_download_url' <<<"$rel")"
+  phar_url="$(jq -r '.assets[] | select(.name | test("^wp-cli-[0-9.]+\\.phar$")) | .browser_download_url' <<<"$rel" | head -n 1)"
+  sha_url="$(jq -r '.assets[] | select(.name | test("^wp-cli-[0-9.]+\\.phar\\.sha512$")) | .browser_download_url' <<<"$rel" | head -n 1)"
   [[ -n "$phar_url" && -n "$sha_url" ]] || { log "WP-CLI: file della release non trovati"; return 1; }
   tmp="$(mktemp)"
   if ! curl -fsSL --max-time 120 -o "$tmp" "$phar_url"; then

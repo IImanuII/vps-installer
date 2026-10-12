@@ -64,6 +64,6 @@ opt_system_files() {
   fi
   wpcli_install || log "ATTENZIONE: WP-CLI non installato: WordPress non sarà disponibile finché non riesce"
   if [[ "$(jq -r '.components.redis == true' "$m")" == true ]]; then
-    redis_acl_setup
+    redis_acl_setup || log "ATTENZIONE: Redis con utenti ACL non configurato: WordPress non sarà disponibile (dettagli in $VPS_LOG)"
   fi
 }

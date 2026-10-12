@@ -120,3 +120,11 @@ sys_setup() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"WP-CLI non installato"* ]]
 }
+
+@test "opt_system_files: redis_acl_setup che fallisce non ferma --tools-only" {
+  jq -n '{panel:null, cloudflare:{enabled:false}, components:{redis:true}}' >"$VPS_OPT/manifest.json"
+  redis_acl_setup() { return 1; }
+  run opt_system_files
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Redis con utenti ACL non configurato"* ]]
+}
