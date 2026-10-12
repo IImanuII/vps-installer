@@ -12,7 +12,7 @@ sites_test_setup() {
   mkdir -p "$SITES_WWW" "$NGINX_CONF_D" "$PHP_POOL_D" "$LOGROTATE_D" "$VPS_OPT/secrets"
   printf 'dns_cloudflare_api_token = %s\n' "$(printf 'a%.0s' {1..40})" >"$VPS_OPT/secrets/cloudflare.ini"
   jq -n '{installer_version:"1.2.0", admin_user:"manu", ipv4:"203.0.113.10", ipv6:null,
-    cloudflare:{enabled:true, zone:"miosito.it"},
+    cloudflare:{enabled:true, zone:"miosito.it"}, components:{redis:true, redis_acl:true},
     panel:{domain:"panel.miosito.it", path:"/var/www/panel.miosito.it"}}' >"$VPS_OPT/manifest.json"
 
   # Comandi di sistema: annotano la chiamata in $CALLS; STUB_RC_<nome> ne sceglie

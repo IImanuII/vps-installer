@@ -28,7 +28,8 @@ if [[ -n "${SUDO_USER:-}" || -n "${VPS_SITE_VIA_SYSTEMD:-}" ]]; then
   # La vera difesa è `Defaults:panel env_reset` in sudoers; questo elenco è una
   # seconda linea di difesa, nel caso l'ambiente passasse comunque.
   unset CF_API SITES_DIR SITES_WWW SITES_BACKUPS SITES_LOCK SITES_LOCK_WAIT SITES_RUN NGINX_CONF_D \
-    PHP_POOL_D LOGROTATE_D VPS_SITE_SELF VPS_NO_CHOWN SITE_ERROR_FILE
+    PHP_POOL_D LOGROTATE_D VPS_SITE_SELF VPS_NO_CHOWN SITE_ERROR_FILE \
+    WP_BIN REDIS_ACL_FILE REDIS_ADMIN_SECRET CRON_D
   [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
   chmod 640 "$VPS_LOG"
 fi
@@ -55,7 +56,7 @@ esac
 tool_init
 
 usage() {
-  json_err "uso: vps-site zones | list | show D | create D --type static|php [--www] [--db] | disable D | enable D | delete D | db-create D | db-password D (password da stdin per --db, db-create, db-password)"
+  json_err "uso: vps-site zones | list | show D | create D --type static|php [--www] [--db] | create D --type wordpress [--www] --title T --admin-user U --admin-email E --login-path P [--cloudflare] | wp-install D --title T --admin-user U --admin-email E --login-path P [--cloudflare] | disable D | enable D | delete D | db-create D | db-password D (password da stdin per --db, db-create, db-password, wp-install; due righe per create wordpress: database e admin WordPress)"
 }
 
 need_cf() {
@@ -96,6 +97,61 @@ read_password() {
     || json_err "password del database non valida: 16-128 caratteri stampabili, senza spazi né apici o barre inverse"
 }
 
+# need_wp — WordPress vuole l'utente Redis per sito (ACL) e WP-CLI installato.
+need_wp() {
+  [[ "$(jq -r '.components.redis_acl // false' "$(manifest_path)")" == true ]] \
+    || json_err "WordPress richiede Redis con gli utenti per sito: aggiorna gli script con install.sh --tools-only"
+  [[ -x "$WP_BIN" ]] || json_err "WP-CLI mancante: aggiorna gli script con install.sh --tools-only"
+}
+
+# parse_wp_opts ARG... — le opzioni WordPress, ognuna al massimo una volta.
+parse_wp_opts() {
+  WP_TITLE="" WP_ADMIN_USER="" WP_ADMIN_EMAIL="" WP_LOGIN_PATH="" WP_CLOUDFLARE=false
+  local have_t=no have_u=no have_e=no have_p=no have_c=no
+  while (($#)); do
+    case "$1" in
+      --title) [[ "$have_t" == no && $# -ge 2 ]] || usage; WP_TITLE="$2"; have_t=yes; shift 2 ;;
+      --admin-user) [[ "$have_u" == no && $# -ge 2 ]] || usage; WP_ADMIN_USER="$2"; have_u=yes; shift 2 ;;
+      --admin-email) [[ "$have_e" == no && $# -ge 2 ]] || usage; WP_ADMIN_EMAIL="$2"; have_e=yes; shift 2 ;;
+      --login-path) [[ "$have_p" == no && $# -ge 2 ]] || usage; WP_LOGIN_PATH="$2"; have_p=yes; shift 2 ;;
+      --cloudflare) [[ "$have_c" == no ]] || usage; WP_CLOUDFLARE=true; have_c=yes; shift ;;
+      *) usage ;;
+    esac
+  done
+  [[ "$have_t$have_u$have_e$have_p" == yesyesyesyes ]] \
+    || json_err "mancano opzioni di WordPress: --title, --admin-user, --admin-email, --login-path"
+  site_wp_valid_title "$WP_TITLE" || json_err "titolo non valido (1-100 caratteri, una riga)"
+  site_wp_valid_user "$WP_ADMIN_USER" || json_err "utente admin non valido (a-z 0-9 _ . -, 3-60 caratteri, non admin/root)"
+  site_wp_valid_email "$WP_ADMIN_EMAIL" || json_err "email non valida"
+  site_wp_valid_path "$WP_LOGIN_PATH" || json_err "percorso di login non valido (a-z 0-9 -, 4-40 caratteri, non wp-admin/login/admin)"
+}
+
+# check_wp_pass — la password admin WordPress segue le regole di quella del database.
+check_wp_pass() {
+  site_valid_db_password "$WP_ADMIN_PASS" \
+    || json_err "password admin di WordPress non valida: 16-128 caratteri stampabili, senza spazi né apici o barre inverse"
+}
+
+# read_wp_password — WP_ADMIN_PASS dalla prima riga di stdin.
+read_wp_password() {
+  WP_ADMIN_PASS="$(read_stdin_limited 256 | head -n 1)"
+  WP_ADMIN_PASS="${WP_ADMIN_PASS%$'\r'}"
+  check_wp_pass
+}
+
+# write_wp_files DOMINIO — password admin e argomenti in $SITES_RUN (700), file 600.
+write_wp_files() {
+  local slug
+  slug="$(site_slug "$1")"
+  install -d -m 700 "$SITES_RUN"
+  (
+    umask 077
+    printf '%s' "$WP_ADMIN_PASS" >"$SITES_RUN/$slug.wppass"
+    jq -n --arg t "$WP_TITLE" --arg u "$WP_ADMIN_USER" --arg e "$WP_ADMIN_EMAIL" --arg p "$WP_LOGIN_PATH" --argjson c "$WP_CLOUDFLARE" \
+      '{title: $t, admin_user: $u, admin_email: $e, login_path: $p, cloudflare: $c}' >"$SITES_RUN/$slug.wpargs"
+  )
+}
+
 # launch OP DOMINIO — il lavoro lungo parte come unità systemd, fuori da sudo e da PHP-FPM.
 launch() {
   local slug
@@ -121,12 +177,13 @@ case "$cmd" in
     ;;
   show)
     existing "${1:-}"
-    json_ok --argjson s "$(site_reg_get "$1" .)" '{ok: true, site: $s}'
+    json_ok --argjson s "$(site_reg_json_full "$(site_reg_path "$1")")" '{ok: true, site: $s}'
     ;;
   create)
     d="${1:-}"
     shift || true
     type="" www=no db=no
+    wp_args=()
     while (($#)); do
       case "$1" in
         --type)
@@ -144,11 +201,27 @@ case "$cmd" in
           db=yes
           shift
           ;;
+        --title | --admin-user | --admin-email | --login-path)
+          [[ $# -ge 2 ]] || usage
+          wp_args+=("$1" "$2")
+          shift 2
+          ;;
+        --cloudflare)
+          wp_args+=("$1")
+          shift
+          ;;
         *) usage ;;
       esac
     done
-    [[ "$type" == static || "$type" == php ]] || json_err "tipo non valido: usa --type static o --type php"
+    [[ "$type" == static || "$type" == php || "$type" == wordpress ]] || json_err "tipo non valido: usa --type static, php o wordpress"
+    # le opzioni di WordPress hanno senso solo con il suo tipo
+    [[ "$type" == wordpress || ${#wp_args[@]} -eq 0 ]] || usage
+    [[ "$type" != wordpress || "$db" == no ]] || json_err "WordPress ha sempre il database: togli --db"
     [[ "$db" == no || "$type" == php ]] || json_err "il database si crea solo per i siti PHP"
+    if [[ "$type" == wordpress ]]; then
+      db=yes
+      parse_wp_opts "${wp_args[@]}"
+    fi
     reg_lock
     msg="$(site_validate_new "$d")" || json_err "$msg"
     # www.<dominio> non può essere il dominio del pannello: il vhost del sito
@@ -157,8 +230,19 @@ case "$cmd" in
       json_err "www.$d è il dominio del pannello: crea il sito senza --www"
     fi
     need_cf
-    [[ "$db" == no ]] || read_password
+    if [[ "$type" == wordpress ]]; then
+      need_wp
+      # due righe: password del database, poi password admin di WordPress
+      { IFS= read -r DB_PASSWORD; IFS= read -r WP_ADMIN_PASS; } < <(read_stdin_limited 512) || true
+      DB_PASSWORD="${DB_PASSWORD%$'\r'}" WP_ADMIN_PASS="${WP_ADMIN_PASS%$'\r'}"
+      site_valid_db_password "$DB_PASSWORD" \
+        || json_err "password del database non valida: 16-128 caratteri stampabili, senza spazi né apici o barre inverse"
+      check_wp_pass
+    elif [[ "$db" == yes ]]; then
+      read_password
+    fi
     site_reg_new "$d" "$type" "$www" "$db"
+    [[ "$type" != wordpress ]] || write_wp_files "$d"
     if [[ "$db" == yes ]]; then
       install -d -m 700 "$SITES_RUN"
       (
@@ -168,6 +252,26 @@ case "$cmd" in
     fi
     launch create "$d"
     json_ok '{ok: true, state: "creating"}'
+    ;;
+  wp-install)
+    d="${1:-}"
+    shift || true
+    reg_lock
+    existing "$d"
+    [[ "$(site_reg_get "$d" .type)" == php ]] || json_err "WordPress si installa solo su un sito PHP"
+    [[ "$(site_reg_get "$d" .state)" == active ]] || json_err "il sito non è attivo"
+    [[ "$(site_reg_get "$d" .db)" == true ]] || json_err "il sito non ha un database: aggiungilo prima"
+    site_placeholder_intact "$d" || json_err "public/ non è vuota: WordPress si installa solo su un sito appena creato"
+    need_wp
+    parse_wp_opts "$@"
+    read_wp_password
+    write_wp_files "$d"
+    # stato e lavoro in un solo aggiornamento: site_run vuole "installing" e
+    # site_refresh controlla l'unità vps-site-<slug>-wpinstall da job.op/ts
+    site_reg_update "$d" '.state = "installing" | .job = {op: "wpinstall", step: "queued", error: null, updated_at: $at, ts: ($ts | tonumber)}' \
+      --arg at "$(date -Iseconds)" --arg ts "$(date +%s)"
+    launch wpinstall "$d"
+    json_ok '{ok: true, state: "installing"}'
     ;;
   disable | enable)
     d="${1:-}"
@@ -208,7 +312,12 @@ case "$cmd" in
     lock_now
     state="$(site_reg_get "$d" .state)"
     [[ "$state" == active || "$state" == disabled ]] || json_err "il sito non è pronto"
-    [[ "$(site_reg_get "$d" .type)" == php ]] || json_err "il database si crea solo per i siti PHP"
+    if [[ "$cmd" == db-create ]]; then
+      [[ "$(site_reg_get "$d" .type)" == php ]] || json_err "il database si crea solo per i siti PHP"
+    else
+      t="$(site_reg_get "$d" .type)"
+      [[ "$t" == php || "$t" == wordpress ]] || json_err "il database si gestisce solo per i siti PHP e WordPress"
+    fi
     if [[ "$cmd" == db-create ]]; then
       [[ "$(site_reg_get "$d" .db)" == false ]] || json_err "il sito ha già un database"
     else

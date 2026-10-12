@@ -778,6 +778,15 @@ site_refresh_locked() {
   fi
 }
 
+# site_reg_json_full FILE — il registro con `placeholder`: true se public/ ha ancora
+# solo il segnaposto (il pannello decide da lì se offrire "installa WordPress").
+site_reg_json_full() {
+  local d p=false
+  d="$(jq -r '.domain // empty' "$1")"
+  if [[ -n "$d" ]] && site_placeholder_intact "$d"; then p=true; fi
+  jq --argjson p "$p" '. + {placeholder: $p}' "$1"
+}
+
 site_list_json() {
   local f files=()
   for f in "$SITES_DIR"/*.json; do
@@ -799,5 +808,7 @@ site_list_json() {
     echo '[]'
     return
   fi
-  jq -s 'sort_by(.domain)' "${files[@]}"
+  for f in "${files[@]}"; do
+    site_reg_json_full "$f"
+  done | jq -s 'sort_by(.domain)'
 }

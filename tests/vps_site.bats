@@ -257,3 +257,92 @@ stub_systemd_run_pipe() {
   vs create miosito.it --type static
   [ "$status" -eq 0 ]
 }
+
+wp_opts=(--title "Il blog" --admin-user gestore --admin-email io@miosito.it --login-path accesso-7k2f)
+
+@test "create --type wordpress: due righe di stdin in file 600, argomenti in un JSON 600" {
+  run --separate-stderr bash -c "printf 'Password-db-1234567890\nPassword-admin-wp-12345\n' | bash '$T' create miosito.it --type wordpress --www --title 'Il blog' --admin-user gestore --admin-email io@miosito.it --login-path accesso-7k2f --cloudflare"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$SITES_RUN/site_miosito_it.pass")" = Password-db-1234567890 ]
+  [ "$(cat "$SITES_RUN/site_miosito_it.wppass")" = Password-admin-wp-12345 ]
+  [ "$(stat -c %a "$SITES_RUN/site_miosito_it.wppass")" = 600 ]
+  [ "$(jq -r .login_path "$SITES_RUN/site_miosito_it.wpargs")" = accesso-7k2f ]
+  [ "$(jq -r .cloudflare "$SITES_RUN/site_miosito_it.wpargs")" = true ]
+  [ "$(site_reg_get miosito.it .type)" = wordpress ]
+  [ "$(site_reg_get miosito.it .db)" = true ]
+}
+
+@test "create --type wordpress: opzioni mancanti, non valide o --db" {
+  vs create miosito.it --type wordpress "${wp_opts[@]:0:6}"
+  [[ "$(jq -r .error <<<"$output")" == *"--login-path"* ]]
+  vs create miosito.it --type wordpress --title "Il blog" --admin-user admin --admin-email io@miosito.it --login-path accesso-7k2f
+  [[ "$(jq -r .error <<<"$output")" == *"utente"* ]]
+  vs create miosito.it --type wordpress --title "Il blog" --admin-user gestore --admin-email io@miosito.it --login-path wp-admin
+  [[ "$(jq -r .error <<<"$output")" == *"percorso"* ]]
+  vs create miosito.it --type wordpress --db "${wp_opts[@]}"
+  [ "$status" -eq 1 ]
+  vs create blog.miosito.it --type php --title x
+  [[ "$(jq -r .error <<<"$output")" == uso:* ]]
+  run bash -c "printf 'Password-db-1234567890\n' | bash '$T' create miosito.it --type wordpress --title 'Il blog' --admin-user gestore --admin-email io@miosito.it --login-path accesso-7k2f"
+  [ "$status" -eq 1 ]
+  run site_reg_exists miosito.it
+  [ "$status" -eq 1 ]
+}
+
+@test "wp-install: solo su PHP attivo con DB e segnaposto; avvia il lavoro wpinstall" {
+  run bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --type php --db"
+  bash "$T" _run create blog.miosito.it
+  run --separate-stderr bash -c "printf 'Password-admin-wp-12345\n' | bash '$T' wp-install blog.miosito.it --title 'Il blog' --admin-user gestore --admin-email io@miosito.it --login-path accesso-7k2f"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .state <<<"$output")" = installing ]
+  [ "$(site_reg_get blog.miosito.it .state)" = installing ]
+  [ "$(site_reg_get blog.miosito.it .job.op)" = wpinstall ]
+  grep -q '^systemd-run --unit vps-site-site_blog_miosito_it-wpinstall ' "$CALLS"
+  [ "$(cat "$SITES_RUN/site_blog_miosito_it.wppass")" = Password-admin-wp-12345 ]
+}
+
+@test "wp-install: se il lavoro non parte, il sito torna attivo e i file di passaggio spariscono" {
+  run bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --type php --db"
+  bash "$T" _run create blog.miosito.it
+  STUB_RC_systemd_run=1 run --separate-stderr bash -c "printf 'Password-admin-wp-12345\n' | bash '$T' wp-install blog.miosito.it --title 'Il blog' --admin-user gestore --admin-email io@miosito.it --login-path accesso-7k2f"
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  [ ! -e "$SITES_RUN/site_blog_miosito_it.wppass" ]
+  [ ! -e "$SITES_RUN/site_blog_miosito_it.wpargs" ]
+}
+
+@test "wp-install rifiutato: statico, senza DB, public/ con file propri" {
+  vs create statico.miosito.it --type static
+  bash "$T" _run create statico.miosito.it
+  run bash -c "printf 'Password-admin-wp-12345\n' | bash '$T' wp-install statico.miosito.it --title T --admin-user gestore --admin-email io@miosito.it --login-path accesso-7k2f"
+  [ "$status" -eq 1 ]
+  vs create nodb.miosito.it --type php
+  bash "$T" _run create nodb.miosito.it
+  run bash -c "printf 'Password-admin-wp-12345\n' | bash '$T' wp-install nodb.miosito.it --title T --admin-user gestore --admin-email io@miosito.it --login-path accesso-7k2f"
+  [[ "$output" == *"database"* ]]
+  run bash -c "printf 'Password-db-1234567890\n' | bash '$T' create pieno.miosito.it --type php --db"
+  bash "$T" _run create pieno.miosito.it
+  echo x >"$SITES_WWW/pieno.miosito.it/public/mio.html"
+  run bash -c "printf 'Password-admin-wp-12345\n' | bash '$T' wp-install pieno.miosito.it --title T --admin-user gestore --admin-email io@miosito.it --login-path accesso-7k2f"
+  [[ "$output" == *"non è vuota"* ]]
+  [ "$(site_reg_get pieno.miosito.it .state)" = active ]
+}
+
+@test "list: placeholder vero sul sito appena creato, falso dopo un upload" {
+  vs create blog.miosito.it --type php
+  bash "$T" _run create blog.miosito.it
+  vs list
+  [ "$(jq -r '.sites[0].placeholder' <<<"$output")" = true ]
+  echo x >"$SITES_WWW/blog.miosito.it/public/mio.html"
+  vs list
+  [ "$(jq -r '.sites[0].placeholder' <<<"$output")" = false ]
+  vs show blog.miosito.it
+  [ "$(jq -r '.site.placeholder' <<<"$output")" = false ]
+}
+
+@test "WordPress richiede Redis con le ACL" {
+  jq '.components.redis_acl = false' "$VPS_OPT/manifest.json" >"$BATS_TEST_TMPDIR/m" && mv "$BATS_TEST_TMPDIR/m" "$VPS_OPT/manifest.json"
+  run --separate-stderr bash -c "printf 'Password-db-1234567890\nPassword-admin-wp-12345\n' | bash '$T' create miosito.it --type wordpress --title 'Il blog' --admin-user gestore --admin-email io@miosito.it --login-path accesso-7k2f"
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"--tools-only"* ]]
+}
