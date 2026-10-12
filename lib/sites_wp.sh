@@ -183,9 +183,12 @@ site_wp_args_read() {
 site_wp_install_files() {
   local d="$1" root redis_pw
   root="$(site_root "$d")"
-  # Primo controllo del passo, prima di toccare qualunque cosa: chi chiama si
-  # basa su questo messaggio per non disfare un public/ con file veri.
-  site_placeholder_intact "$d" || { site_fail "public/ non è vuota: WordPress si installa solo su un sito appena creato"; return 1; }
+  # Seconda difesa (la prima è in site_job_wpinstall): con file veri in public/
+  # si esce con 2, prima di toccare qualunque cosa, e chi chiama non disfa nulla.
+  site_placeholder_intact "$d" || { site_fail "public/ non è vuota: WordPress si installa solo su un sito appena creato"; return 2; }
+  # Fino alla fine di core install setup-config.php e install.php sarebbero di
+  # chiunque arrivi per primo: intanto il sito risponde 503.
+  site_vhost_add "$d" maintenance || return 1
   rm -f "$root/public/index.html"
   site_wp "$d" core download --locale=it_IT >>"$VPS_LOG" 2>&1 \
     || { site_fail "download di WordPress non riuscito (dettagli in $VPS_LOG)"; return 1; }
@@ -218,33 +221,51 @@ site_wp_plugins() {
 }
 
 # site_wp_undo DOMINIO — toglie WordPress da un sito PHP (wp-install fallito):
-# public/ torna con il solo segnaposto, il DB senza tabelle, vhost PHP.
+# public/ torna con il solo segnaposto, il DB vuoto, vhost PHP. Prova tutto e
+# restituisce 1 se qualcosa non è andato.
 site_wp_undo() {
-  local d="$1" root slug
+  local d="$1" root slug dbpass rc=0
   root="$(site_root "$d")"
   slug="$(site_reg_get "$d" .slug)"
-  site_wp_cron_remove "$d"
-  site_redis_user_remove "$d" || log "ATTENZIONE: utente Redis di $d non rimosso"
-  rm -f "$root/wp-config.php"
+  site_wp_cron_remove "$d" || rc=1
+  site_redis_user_remove "$d" || { log "ATTENZIONE: utente Redis di $d non rimosso"; rc=1; }
+  # Prima i file di WordPress, poi wp-config.php: un WordPress rimasto a metà
+  # senza wp-config offrirebbe setup-config.php a chiunque.
   # find -delete non segue i collegamenti simbolici: sicuro anche in una cartella del sito.
-  find "$root/public" -mindepth 1 -delete || log "ATTENZIONE: file di WordPress di $d non tolti tutti"
+  if find "$root/public" -mindepth 1 -delete; then
+    rm -f "$root/wp-config.php" || rc=1
+  else
+    log "ATTENZIONE: file di WordPress di $d non tolti tutti"
+    rc=1
+  fi
   # Il segnaposto lo scrive l'utente del sito, non root: public/ è sua e il pool
   # PHP è vivo, un file temporaneo di root lì dentro potrebbe essere scambiato
   # con un collegamento prima di chmod/chown.
   # shellcheck disable=SC2016
   SITE_DOMAIN="$d" envsubst '${SITE_DOMAIN}' <"$VPS_TEMPLATES/site-placeholder.html.tmpl" \
     | (cd "$root" && runuser -u "$slug" -- sh -c 'umask 002 && cat >"$1"' sh "$root/public/index.html") \
-    || log "ATTENZIONE: segnaposto di $d non ripristinato"
-  printf "SELECT CONCAT('DROP TABLE IF EXISTS \`', table_name, '\`;') FROM information_schema.tables WHERE table_schema = '%s';\n" "$slug" \
-    | mariadb -N | mariadb "$slug" >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: tabelle di WordPress di $d non tolte"
-  site_reg_update "$d" '.type = "php" | del(.wordpress)'
-  site_vhost_add "$d" normal || log "ATTENZIONE: vhost PHP di $d non ripristinato"
+    || { log "ATTENZIONE: segnaposto di $d non ripristinato"; rc=1; }
+  # DB vuoto: si ricrea da capo con la stessa password e gli stessi permessi.
+  # Niente nomi letti dal DB: le tabelle le può creare il sito, e un nome con
+  # un apice inverso diventerebbe SQL eseguito da root.
+  dbpass="$(env_get "$root/db.env" DB_PASS)"
+  if [[ -z "$dbpass" ]] || ! {
+    printf 'DROP DATABASE IF EXISTS `%s`;\n' "$slug"
+    site_db_sql "$slug" "$dbpass"
+  } | mariadb >>"$VPS_LOG" 2>&1; then
+    log "ATTENZIONE: database di $d non svuotato"
+    rc=1
+  fi
+  site_reg_update "$d" '.type = "php" | del(.wordpress)' || rc=1
+  site_vhost_add "$d" normal || { log "ATTENZIONE: vhost PHP di $d non ripristinato"; rc=1; }
+  return "$rc"
 }
 
 # site_job_wpinstall DOMINIO — lavoro "wpinstall": WordPress su un sito PHP con
-# DB appena creato. Se un passo fallisce il sito torna PHP con il segnaposto.
+# DB appena creato. Se un passo fallisce il sito torna PHP con il segnaposto;
+# se nemmeno questo riesce va in errore (da eliminare).
 site_job_wpinstall() {
-  local d="$1" dbpass="" msg step
+  local d="$1" dbpass="" msg step rc
   if [[ "$(site_reg_get "$d" .db)" == true ]]; then
     dbpass="$(env_get "$(site_root "$d")/db.env" DB_PASS)"
   fi
@@ -258,16 +279,25 @@ site_job_wpinstall() {
     fi
     return 1
   fi
+  # Un public/ con file propri non si tocca: si rifiuta prima di ogni passo.
+  if ! site_placeholder_intact "$d"; then
+    site_reg_update "$d" '.state = "active"'
+    site_job "$d" wpinstall wp "public/ non è vuota: WordPress si installa solo su un sito appena creato"
+    return 1
+  fi
   for step in wp plugins; do
+    rc=0
     case "$step" in
       wp) site_step "$d" wpinstall wp site_wp_install_files "$d" "$dbpass" ;;
       plugins) site_step "$d" wpinstall plugins site_wp_plugins "$d" ;;
-    esac && continue
+    esac || rc=$?
+    ((rc)) || continue
     msg="$(site_error_text "$step")"
-    # Un public/ con file propri non si tocca: il controllo è il primo del passo
-    # wp, e con questo messaggio nulla è stato ancora cambiato.
-    if [[ "$msg" != *"non è vuota"* ]]; then
-      (site_wp_undo "$d")
+    # rc 2: il passo wp ha trovato file veri in public/ prima di toccare nulla.
+    if ((rc != 2)) && ! (site_wp_undo "$d"); then
+      site_reg_update "$d" '.state = "error"'
+      site_job "$d" wpinstall "$step" "$msg; installazione WordPress non annullata del tutto: elimina il sito (dettagli in $VPS_LOG)"
+      return 1
     fi
     site_reg_update "$d" '.state = "active" | .type = "php"'
     site_job "$d" wpinstall "$step" "$msg"

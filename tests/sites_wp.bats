@@ -253,12 +253,17 @@ php_site() {
   [ "$(site_reg_get blog.miosito.it .state)" = active ]
   grep -q "define( 'DB_PASSWORD', 'Password-db-1234567890' );" "$SITES_WWW/blog.miosito.it/wp-config.php"
   grep -q 'location = /xmlrpc.php' "$NGINX_CONF_D/blog.miosito.it.conf"
+  run grep -c 'return 503' "$NGINX_CONF_D/blog.miosito.it.conf"
+  [ "$output" = 0 ]
+  [ "$(site_reg_get blog.miosito.it .job.step)" = done ]
+  [ -z "$(ls "$SITES_RUN")" ]
 }
 
 @test "wp-install fallito: il sito torna PHP con il segnaposto e il DB senza tabelle" {
   php_site
   site_reg_update blog.miosito.it '.state = "installing"'
   wp_args blog.miosito.it
+  : >"$BATS_TEST_TMPDIR/mariadb.sql"
   export WP_FAIL_ON="plugin install"
   run site_run wpinstall blog.miosito.it
   [ "$status" -eq 1 ]
@@ -270,7 +275,11 @@ php_site() {
   run grep -c site_blog_miosito_it "$REDIS_ACL_FILE"
   [ "$output" = 0 ]
   [ ! -e "$CRON_D/vps-site-site_blog_miosito_it" ]
-  grep -q 'information_schema.tables' "$BATS_TEST_TMPDIR/mariadb.sql"
+  grep -qF 'DROP DATABASE IF EXISTS `site_blog_miosito_it`;' "$BATS_TEST_TMPDIR/mariadb.sql"
+  grep -qF 'CREATE DATABASE IF NOT EXISTS `site_blog_miosito_it`' "$BATS_TEST_TMPDIR/mariadb.sql"
+  grep -q 'Password-db-1234567890' "$BATS_TEST_TMPDIR/mariadb.sql"
+  run grep -c 'information_schema' "$BATS_TEST_TMPDIR/mariadb.sql"
+  [ "$output" = 0 ]
   run grep -c 'location = /xmlrpc.php' "$NGINX_CONF_D/blog.miosito.it.conf"
   [ "$output" = 0 ]
 }
@@ -285,6 +294,12 @@ php_site() {
   [ -f "$SITES_WWW/blog.miosito.it/public/mio.html" ]
   [ "$(site_reg_get blog.miosito.it .type)" = php ]
   [[ "$(site_reg_get blog.miosito.it .job.error)" == *"non è vuota"* ]]
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  [ -z "$(ls "$SITES_RUN")" ]
+  run grep -c site_blog_miosito_it "$REDIS_ACL_FILE"
+  [ "$output" = 0 ]
+  run grep -c 'return 503' "$NGINX_CONF_D/blog.miosito.it.conf"
+  [ "$output" = 0 ]
   run grep -c 'core download' "$CALLS"
   [ "$output" = 0 ]
 }
@@ -361,5 +376,102 @@ php_site() {
   exec 7>&-
   [ "$status" -eq 1 ]
   [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  [ -z "$(ls "$SITES_RUN")" ]
+}
+
+# Sostituisce lo stub di wp: a "core download" copia il vhost servito in quel momento.
+wp_spia_vhost() {
+  mv "$BATS_TEST_TMPDIR/bin/wp" "$BATS_TEST_TMPDIR/bin/wp.orig"
+  # shellcheck disable=SC2016
+  make_stub wp 'if [[ "$*" == *"core download"* ]]; then cp "$NGINX_CONF_D/blog.miosito.it.conf" "$BATS_TEST_TMPDIR/vhost-durante"; fi
+exec "$BATS_TEST_TMPDIR/bin/wp.orig" "$@"'
+}
+
+@test "creazione WordPress: durante l'installazione il sito risponde 503, poi il vhost vero" {
+  site_reg_new blog.miosito.it wordpress no yes
+  mkdir -p "$SITES_RUN"; printf '%s' 'Password-db-1234567890' >"$SITES_RUN/site_blog_miosito_it.pass"
+  wp_args blog.miosito.it
+  wp_spia_vhost
+  site_run create blog.miosito.it
+  grep -q 'return 503' "$BATS_TEST_TMPDIR/vhost-durante"
+  run grep -c 'xmlrpc' "$BATS_TEST_TMPDIR/vhost-durante"
+  [ "$output" = 0 ]
+  grep -q 'location = /xmlrpc.php' "$NGINX_CONF_D/blog.miosito.it.conf"
+  run grep -c 'return 503' "$NGINX_CONF_D/blog.miosito.it.conf"
+  [ "$output" = 0 ]
+}
+
+@test "wp-install: durante l'installazione il sito risponde 503" {
+  php_site
+  site_reg_update blog.miosito.it '.state = "installing"'
+  wp_args blog.miosito.it
+  wp_spia_vhost
+  site_run wpinstall blog.miosito.it
+  grep -q 'return 503' "$BATS_TEST_TMPDIR/vhost-durante"
+  run grep -c 'return 503' "$NGINX_CONF_D/blog.miosito.it.conf"
+  [ "$output" = 0 ]
+}
+
+@test "creazione WordPress: plugin falliti dopo l'utente Redis, Redis tolto e niente cron" {
+  site_reg_new blog.miosito.it wordpress no yes
+  mkdir -p "$SITES_RUN"; printf '%s' 'Password-db-1234567890' >"$SITES_RUN/site_blog_miosito_it.pass"
+  wp_args blog.miosito.it
+  export WP_FAIL_ON="plugin install"
+  run site_run create blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = error ]
+  [ "$(site_reg_get blog.miosito.it .job.step)" = plugins ]
+  # l'utente Redis era stato aggiunto (primo ACL LOAD) e poi tolto (secondo)
+  [ "$(grep -c 'ACL LOAD' "$CALLS")" = 2 ]
+  run grep -c site_blog_miosito_it "$REDIS_ACL_FILE"
+  [ "$output" = 0 ]
+  [ ! -e "$CRON_D/vps-site-site_blog_miosito_it" ]
+  [ ! -e "$SITES_WWW/blog.miosito.it" ]
+  [ -z "$(ls "$SITES_RUN")" ]
+}
+
+@test "wp-install fallito a core install: annullato del tutto" {
+  php_site
+  site_reg_update blog.miosito.it '.state = "installing"'
+  wp_args blog.miosito.it
+  export WP_FAIL_ON="core install"
+  run site_run wpinstall blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  [ "$(site_reg_get blog.miosito.it .type)" = php ]
+  [ "$(site_reg_get blog.miosito.it .job.step)" = wp ]
+  [ "$(grep -c 'ACL LOAD' "$CALLS")" = 2 ]
+  run grep -c site_blog_miosito_it "$REDIS_ACL_FILE"
+  [ "$output" = 0 ]
+  site_placeholder_intact blog.miosito.it
+  [ ! -e "$SITES_WWW/blog.miosito.it/wp-config.php" ]
+  run grep -c 'return 503' "$NGINX_CONF_D/blog.miosito.it.conf"
+  [ "$output" = 0 ]
+  [ -z "$(ls "$SITES_RUN")" ]
+}
+
+@test "wp-install: annullamento non riuscito, il sito va in errore" {
+  php_site
+  site_reg_update blog.miosito.it '.state = "installing"'
+  wp_args blog.miosito.it
+  export WP_FAIL_ON="plugin install" STUB_RC_mariadb=1
+  run site_run wpinstall blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = error ]
+  [[ "$(site_reg_get blog.miosito.it .job.error)" == *"non annullata del tutto"* ]]
+  [[ "$(site_reg_get blog.miosito.it .job.error)" == *plugin* ]]
+}
+
+@test "site_run fuori posto: i file di passaggio non restano in /run" {
+  php_site
+  wp_args blog.miosito.it
+  run site_run wpinstall blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  [ -z "$(ls "$SITES_RUN")" ]
+  wp_args altro.miosito.it
+  printf '%s' 'Password-db-1234567890' >"$SITES_RUN/site_altro_miosito_it.pass"
+  run site_run create altro.miosito.it
+  [ "$status" -eq 1 ]
   [ -z "$(ls "$SITES_RUN")" ]
 }

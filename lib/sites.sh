@@ -450,7 +450,10 @@ site_db_password() {
     fi
     return 1
   fi
-  printf 'DB_PASS=%s\n' "$2" | env_merge "$(site_root "$d")/db.env" 640 "root:$slug"
+  if ! printf 'DB_PASS=%s\n' "$2" | env_merge "$(site_root "$d")/db.env" 640 "root:$slug"; then
+    site_fail "password del database cambiata, ma db.env non aggiornato (dettagli in $VPS_LOG)"
+    return 1
+  fi
 }
 
 site_db_remove() {
@@ -488,7 +491,15 @@ site_create_step() {
     user) site_user_add "$2" ;;
     php) site_pool_add "$2" ;;
     cert) site_cert_issue "$2" ;;
-    nginx) site_vhost_add "$2" normal ;;
+    nginx)
+      # WordPress non ancora installato: 503 finché il passo plugins non mette
+      # il vhost vero (setup-config.php non deve essere di chi arriva per primo).
+      if [[ "$(site_reg_get "$2" .type)" == wordpress ]]; then
+        site_vhost_add "$2" maintenance
+      else
+        site_vhost_add "$2" normal
+      fi
+      ;;
     db)
       if [[ -z "$3" ]]; then
         site_fail "password del database mancante"
@@ -663,10 +674,24 @@ site_abort() {
 
 # site_run OP DOMINIO — il lavoro in background (unità systemd), uno alla volta
 # su tutta la macchina: gli altri aspettano il lucchetto fino a 10 minuti.
+# site_run_files_clean OP DOMINIO — i file di passaggio di un lavoro che non
+# partirà: password e dati non restano in /run. Il nome viene da site_slug
+# perché il registro potrebbe non esserci.
+site_run_files_clean() {
+  local slug
+  valid_domain "$2" || return 0
+  slug="$(site_slug "$2")"
+  case "$1" in
+    create) rm -f "$SITES_RUN/$slug.pass" "$SITES_RUN/$slug.wpargs" "$SITES_RUN/$slug.wppass" ;;
+    wpinstall) rm -f "$SITES_RUN/$slug.wpargs" "$SITES_RUN/$slug.wppass" ;;
+  esac
+}
+
 site_run() {
   local op="$1" d="$2" rc=0 state
   if ! valid_domain "$d" || ! site_reg_exists "$d"; then
     log "vps-site _run: sito sconosciuto: $d"
+    site_run_files_clean "$op" "$d"
     return 1
   fi
   [[ "$op" == create || "$op" == delete || "$op" == wpinstall ]] || return 1
@@ -685,6 +710,7 @@ site_run() {
     || [[ "$op" == wpinstall && "$state" != installing ]]; then
     exec 9>&-
     log "vps-site _run: $d è in stato $state, $op ignorato"
+    site_run_files_clean "$op" "$d"
     return 1
   fi
   # wpinstall non parla con Cloudflare: il token serve solo a creare ed eliminare.
