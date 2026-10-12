@@ -67,7 +67,12 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | `/var/log/vps-installer.log` | log installazione (senza segreti) |
 | `/etc/nginx/conf.d/<sito>.conf` | vhost di un sito, scritto da `vps-site` |
 | `/etc/php/8.4/fpm/pool.d/site_<slug>.conf` | pool PHP di un sito |
-| `/etc/logrotate.d/vps-site-site_<slug>` | rotazione dei log di un sito |
+| `/usr/local/bin/wp` | WP-CLI (ultima release, verificata con SHA-512), installato e aggiornato dall'installer (anche con `--tools-only`) |
+| `/etc/redis/users.acl` | utenti ACL di Redis (`aclfile`): `default` spento, `vps-admin` e un utente `site_<slug>` per ogni sito WordPress, `root:redis` 640 |
+| `/opt/vps/secrets/redis-admin` | password di `vps-admin` (solo per `ACL LOAD`), `root:root` 600 |
+| `/var/www/<sito>/wp-config.php` | configurazione WordPress, `root:site_<slug>` 640 (il sito non la riscrive); contiene password DB e password Redis del sito |
+| `/etc/cron.d/vps-site-<slug>` | cron di WordPress di un sito (al posto di wp-cron via web) |
+| `/etc/logrotate.d/vps-site-site_<slug>` | rotazione dei log di un sito (nota SP2a rimandata: ruota come root, i log PHP in `logs/php/` con `su`) |
 | `/var/www/_maintenance/_maintenance.html` | pagina 503 dei siti disattivati |
 | `/var/www/<sito>/` | `root:site_<slug>` 2750 (il sito non scrive nella radice); `logs/` `root:site_<slug>` 2750 con `access.log`/`error.log` di Nginx; `logs/php/` `site_<slug>` 2770 con `php-error.log`; `public/` e `tmp/` `site_<slug>` 2770 (admin nel gruppo, `www-data` in sola lettura via ACL); `db.env` `root:site_<slug>` 640. Radice, `logs/` e `db.env` sono di root perché Nginx (root) e `vps-site` seguirebbero un link messo lì dal sito |
 
@@ -75,7 +80,7 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 
 ```json
 {
-  "installer_version": "1.2.1",
+  "installer_version": "1.3.0",
   "installed_at": "2026-10-07T15:30:00+02:00",
   "hostname": "vps-01",
   "ipv4": "203.0.113.10",
@@ -85,7 +90,7 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
   "root_login": "no",
   "components": {
     "nginx": true, "php": "8.4", "mariadb": true, "redis": true,
-    "certbot": true, "phpmyadmin": "5.2.3"
+    "certbot": true, "phpmyadmin": "5.2.3", "redis_acl": true
   },
   "cloudflare": { "enabled": true, "origin_locked": true, "zone": "miosito.it", "ips_updated_at": "2026-10-07T15:31:00+02:00" },
   "mail": { "configured": false, "alert_email": null },
@@ -105,6 +110,8 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
   }
 }
 ```
+
+`components.redis_acl` è `true` quando Redis usa gli utenti ACL (`default` spento): `vps-site` crea siti WordPress solo se è vero.
 
 `version`, `deployed_at`, `repo` li scrivono `vps-panel-install`/`vps-panel-update`; una riscrittura del manifest da parte dell'installer li conserva.
 
@@ -151,6 +158,8 @@ Forniti dall'installer v1.2 (eseguiti dal pannello, in sudoers):
 | `vps-site list` | sì | `{"ok":true,"sites":[<registro>...]}` |
 | `vps-site show <dominio>` | sì | `{"ok":true,"site":<registro>}` |
 | `vps-site create <dominio> --type static\|php [--www] [--db]` | no | `{"ok":true,"state":"creating"}` |
+| `vps-site create <dominio> --type wordpress [--www] --title T --admin-user U --admin-email E --login-path P [--cloudflare]` | no | `{"ok":true,"state":"creating"}` |
+| `vps-site wp-install <dominio> --title T --admin-user U --admin-email E --login-path P [--cloudflare]` | no | `{"ok":true,"state":"installing"}` |
 | `vps-site disable <dominio>` / `enable <dominio>` | sì | `{"ok":true,"state":"disabled"\|"active"}` |
 | `vps-site delete <dominio>` | no | `{"ok":true,"state":"deleting"}` |
 | `vps-site db-create <dominio>` | sì | `{"ok":true}` |
@@ -158,6 +167,10 @@ Forniti dall'installer v1.2 (eseguiti dal pannello, in sudoers):
 
 Regole di `vps-site`:
 - la password del database arriva **solo da stdin**, prima riga (16-128 caratteri stampabili, senza spazi né `'` `"` `\`), per `create --db`, `db-create` e `db-password`; il chiamante deve chiudere stdin;
+- `create --type wordpress` ha sempre il database (niente `--db`) e legge **due righe** da stdin: password del database, poi password dell'amministratore di WordPress (stesse regole di `db-password`); `--title` 1-100 caratteri senza caratteri di controllo, `--admin-user` `^[a-z0-9_.-]{3,60}$` e non `admin`/`administrator`/`root`, `--admin-email` ≤ 100 caratteri, `--login-path` `^[a-z0-9-]{4,40}$` e non `wp-admin`/`wp-login`/`admin`/`login`/`dashboard` (`/wp-login.php` e `/wp-admin` danno 404, il login sta solo su quel percorso), `--cloudflare` installa anche il plugin Cloudflare;
+- `wp-install` installa WordPress su un sito già esistente, con le stesse opzioni e **una riga** da stdin (password admin). È ammesso solo su un sito `php` in stato `active`, con database e con il segnaposto intatto (marcatore `<!-- vps-site:segnaposto -->` in `public/`): se ci sono file veri rifiuta prima di toccare qualunque cosa. Lo stato diventa `installing` e il lavoro è `job.op` `wpinstall`; durante l'installazione il sito serve la pagina di manutenzione 503 (chiude la finestra in cui qualcuno potrebbe prendersi l'installazione). Se fallisce, il sito torna PHP con il solo segnaposto e il database vuoto (eliminato e ricreato con la password di `db.env`); se l'annullamento è parziale finisce in `error` e il sito resta in 503 con `job.error` che elenca i resti;
+- `db-password` su un sito WordPress aggiorna anche `wp-config.php`, altrimenti il sito perderebbe il database; `list` e `show` aggiungono a ogni sito `placeholder` (`true` se `public/` ha ancora solo il segnaposto) e, per WordPress, `wordpress` (`login_path`, `admin_user`, `cloudflare_plugin`, `installed_at`);
+- Redis: un utente per sito WordPress (`site_<slug>`), con le sole chiavi che iniziano per `site_<slug>:` e senza comandi pericolosi o di amministrazione; la sua password sta in `wp-config.php`. L'utente `default` è spento; `vps-admin` (segreto in `/opt/vps/secrets/redis-admin`) serve solo a ricaricare le ACL, con la password in `REDISCLI_AUTH` e mai negli argomenti;
 - `create` e `delete` rispondono subito e lavorano in background come unità systemd (`vps-site-<slug>-<op>`); un lavoro alla volta (lucchetto globale); l'avanzamento sta nel registro (`state`, `job.step`, `job.error`);
 - le operazioni brevi (`disable`, `enable`, `db-*`) rispondono "riprova" se un lavoro è in corso; un breve lucchetto sul registro serializza i comandi concorrenti (attesa fino a 5 s);
 - un lavoro interrotto da un riavvio: creazione -> `error` (si pulisce con `delete`); eliminazione ferma a `queued`/`archive` -> torna allo stato precedente, ferma a `remove` -> `error`;
@@ -170,7 +183,6 @@ Previsti per il pannello (da scrivere con il pannello, stesse regole):
 
 | Script | Cosa farà |
 |---|---|
-| `vps-site-wp` | installazione WordPress su un sito esistente |
 | `vps-cache` | attiva/disattiva/svuota cache FastCGI di un sito |
 | `vps-service` | restart/reload di nginx, php-fpm, mariadb, redis (whitelist) |
 | `vps-backup` | configurazione rclone ed esecuzione backup |
@@ -196,7 +208,7 @@ Convenzione: DB e utenti dei siti hanno nome `site_<slug>` (es. `site_miosito_it
 - [ ] **Cloudflare:** cambio/verifica token, stato ultimo aggiornamento IP. Usa `vps-cf-token`, `vps-cf-ips-update`.
 - [ ] **phpMyAdmin:** versione installata vs ultima, aggiornamento, cambio password basic auth. Usa `vps-pma-update`, `vps-pma-pass`.
 - [ ] **Backup rclone:** configurazione OAuth Google Drive, pianificazione, retention, stato ultimo backup. Usa `vps-backup`.
-- [ ] **Siti:** creazione statico / PHP fatta con `vps-site` (installer 1.2); restano WordPress (`vps-site-wp`) e cache (`vps-cache`).
+- [ ] **Siti:** creazione statico / PHP fatta con `vps-site` (installer 1.2); WordPress fatto con `vps-site create --type wordpress` e `vps-site wp-install` (installer 1.3); resta la cache (`vps-cache`, 2c).
 - [ ] **Stato server:** dashboard da `vps-status`.
 - [ ] **Sicurezza:** IP bannati da fail2ban, sblocco. Usa `vps-f2b`.
 - [ ] **Pulizia log:** rotazione/pulizia dei log Nginx dei siti (era in `da fare.txt`).

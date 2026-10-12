@@ -8,6 +8,9 @@ setup() {
   mkdir -p "$SUDOERS_D" "$CRON_D" "$SITES_WWW"
   make_stub visudo 'exit 0'
   make_stub dpkg 'exit 0'
+  # Niente rete né Redis veri: le due funzioni di sistema annotano soltanto la chiamata.
+  wpcli_install() { echo wpcli >>"$BATS_TEST_TMPDIR/sys.calls"; }
+  redis_acl_setup() { echo acl >>"$BATS_TEST_TMPDIR/sys.calls"; }
 }
 
 @test "opt_tools_only rifiuta una macchina mai installata" {
@@ -94,4 +97,26 @@ sys_setup() {
 
 @test "sudoers del pannello: ogni script in tools/ chiamabile dal pannello è elencato" {
   grep -q '/opt/vps/bin/vps-site' "$REPO_ROOT/templates/sudoers-vps-panel"
+}
+
+@test "opt_system_files chiama wpcli_install e, con Redis, redis_acl_setup" {
+  jq -n '{panel:null, cloudflare:{enabled:false}, components:{redis:true}}' >"$VPS_OPT/manifest.json"
+  opt_system_files
+  grep -qx wpcli "$BATS_TEST_TMPDIR/sys.calls"
+  grep -qx acl "$BATS_TEST_TMPDIR/sys.calls"
+}
+
+@test "opt_system_files senza Redis non chiama redis_acl_setup" {
+  jq -n '{panel:null, cloudflare:{enabled:false}, components:{redis:false}}' >"$VPS_OPT/manifest.json"
+  opt_system_files
+  grep -qx wpcli "$BATS_TEST_TMPDIR/sys.calls"
+  ! grep -qx acl "$BATS_TEST_TMPDIR/sys.calls"
+}
+
+@test "opt_system_files: WP-CLI non installato non ferma il resto" {
+  jq -n '{panel:null, cloudflare:{enabled:false}, components:{redis:true}}' >"$VPS_OPT/manifest.json"
+  wpcli_install() { return 1; }
+  run opt_system_files
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WP-CLI non installato"* ]]
 }

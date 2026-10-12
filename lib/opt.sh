@@ -62,4 +62,8 @@ opt_system_files() {
   if ! dpkg -s acl >/dev/null 2>&1; then
     apt_install acl || die "Pacchetto acl non installato"
   fi
+  wpcli_install || log "ATTENZIONE: WP-CLI non installato: WordPress non sarà disponibile finché non riesce"
+  if [[ "$(jq -r '.components.redis == true' "$m")" == true ]]; then
+    redis_acl_setup
+  fi
 }
