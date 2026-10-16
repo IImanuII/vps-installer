@@ -518,6 +518,39 @@ sent() {
   [[ "$output" != *"$TOK"* ]]
 }
 
+@test "vps-monitor config: chat_id e healthchecks_url assenti = conserva; vuoti = cancella" {
+  tool_env
+  mon_cfg
+  echo '{"enabled":true}' >"$T/in.json"
+  run bash -c "bash '$TOOL' config <'$T/in.json' 2>/dev/null"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .telegram.chat_id "$MON_CONFIG")" = "-100123" ]
+  [ "$(jq -r .telegram.bot_token "$MON_CONFIG")" = "$TOK" ]
+  [ "$(jq -r .healthchecks_url "$MON_CONFIG")" = "https://hc-ping.com/abc-123/slug_1" ]
+  echo '{"enabled":true,"telegram":{"chat_id":"42"},"healthchecks_url":""}' >"$T/in2.json"
+  run bash -c "bash '$TOOL' config <'$T/in2.json' 2>/dev/null"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .telegram.chat_id "$MON_CONFIG")" = "42" ]
+  [ "$(jq -r .healthchecks_url "$MON_CONFIG")" = "" ]
+  echo '{"enabled":true,"telegram":{"chat_id":""}}' >"$T/in3.json"
+  run bash -c "bash '$TOOL' config <'$T/in3.json' 2>/dev/null"
+  [ "$(jq -r .telegram.chat_id "$MON_CONFIG")" = "" ]
+}
+
+@test "vps-monitor config: file scritto ma timer che non parte = ok false con saved true" {
+  tool_env
+  touch "$T/fail.enable"
+  base_cfg >"$T/in.json"
+  run bash -c "bash '$TOOL' config <'$T/in.json' 2>/dev/null"
+  [ "$status" -eq 1 ]
+  jq -e '.ok == false and .saved == true and (.error | test("timer"))' <<<"$output"
+  [ "$(jq -r .telegram.chat_id "$MON_CONFIG")" = "-100123" ]
+  rm "$T/fail.enable"; touch "$T/fail.disable"
+  echo '{"enabled":false}' >"$T/in2.json"
+  run bash -c "bash '$TOOL' config <'$T/in2.json' 2>/dev/null"
+  jq -e '.ok == false and .saved == true' <<<"$output"
+}
+
 @test "vps-monitor config: non valido o troppo lungo = errore, file invariato" {
   tool_env
   mon_cfg
@@ -544,7 +577,8 @@ sent() {
   jq -e '.thresholds.fail_count == 2' <<<"$output"
   mon_cfg
   run bash -c "bash '$TOOL' status 2>/dev/null"
-  jq -e '.enabled == true and .telegram_configured == true and .healthchecks == true and .urls[0].keyword == "Trip4Free"' <<<"$output"
+  jq -e '.enabled == true and .telegram_configured == true and .healthchecks == true and .urls[0].keyword == "Trip4Free" and .chat_id == "-100123"' <<<"$output"
+  jq -e 'has("healthchecks_url") | not' <<<"$output"
   [[ "$output" != *"$TOK"* ]]
 }
 

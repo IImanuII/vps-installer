@@ -41,6 +41,13 @@ fi
 
 tool_init
 
+# _salvata_ma MESSAGGIO — la configurazione è su disco ma il timer non è come doveva:
+# errore con "saved":true, perché il pannello la registri comunque.
+_salvata_ma() {
+  jq -nc --arg e "$1" '{ok: false, saved: true, error: $e}'
+  exit 1
+}
+
 case "${1:-}" in
   status)
     mon_status_json
@@ -58,11 +65,11 @@ case "${1:-}" in
     printf '%s\n' "$nuova" | write_file "$MON_CONFIG" 600 root:root
     if [[ "$(jq -r '.enabled' <<<"$nuova")" == true ]]; then
       if ! systemctl enable --now vps-monitor.timer >>"$VPS_LOG" 2>&1; then
-        json_err "configurazione salvata, ma il timer di vps-monitor non si è avviato (dettagli in $VPS_LOG)"
+        _salvata_ma "configurazione salvata, ma il timer di vps-monitor non si è avviato (dettagli in $VPS_LOG)"
       fi
     else
       if ! systemctl disable --now vps-monitor.timer >>"$VPS_LOG" 2>&1; then
-        json_err "configurazione salvata, ma il timer di vps-monitor non si è fermato (dettagli in $VPS_LOG)"
+        _salvata_ma "configurazione salvata, ma il timer di vps-monitor non si è fermato (dettagli in $VPS_LOG)"
       fi
     fi
     log "vps-monitor: configurazione aggiornata (attiva: $(jq -r '.enabled' <<<"$nuova"))"

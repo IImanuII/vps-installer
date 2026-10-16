@@ -28,8 +28,8 @@ mon_defaults() {
 }
 
 # Programma jq di validazione: legge la configurazione nuova, stampa la
-# configurazione risultante oppure {"err":"messaggio"}. Il token vecchio arriva
-# dall'ambiente (OLDTOK), mai dagli argomenti. I messaggi non contengono mai
+# configurazione risultante oppure {"err":"messaggio"}. Token, chat_id e indirizzo
+# di ping vecchi arrivano dall'ambiente (OLDTOK, OLDCHAT, OLDHC), mai dagli argomenti. I messaggi non contengono mai
 # valori della configurazione.
 # shellcheck disable=SC2016
 _MON_VALIDATE_JQ='
@@ -44,9 +44,9 @@ def obj(m): if type == "object" then . else error(m) end;
     | ($in | if has("telegram") then .telegram else {} end | obj("telegram deve essere un oggetto")) as $tg
     | ($tg | if has("bot_token") then .bot_token else (env.OLDTOK // "") end) as $tok
     | (if ($tok | type) == "string" and ($tok == "" or ($tok | test("^[0-9]{5,15}:[A-Za-z0-9_-]{30,60}\\z"))) then . else error("bot_token non valido") end) as $_b
-    | ($tg | if has("chat_id") then .chat_id else "" end) as $chat
+    | ($tg | if has("chat_id") then .chat_id else (env.OLDCHAT // "") end) as $chat
     | (if ($chat | type) == "string" and ($chat == "" or ($chat | test("^-?[0-9]{1,20}\\z"))) then . else error("chat_id non valido") end) as $_c
-    | ($in | if has("healthchecks_url") then .healthchecks_url else "" end) as $hc
+    | ($in | if has("healthchecks_url") then .healthchecks_url else (env.OLDHC // "") end) as $hc
     | (if ($hc | type) == "string" and ($hc == "" or ($hc | test("^https://hc-ping\\.com/[A-Za-z0-9_/-]{1,150}\\z"))) then . else error("healthchecks_url non valido") end) as $_d
     | ($in | if has("urls") then .urls else [] end) as $urls
     | (if ($urls | type) == "array" then . else error("urls deve essere un elenco") end) as $_e
@@ -87,11 +87,14 @@ def obj(m): if type == "object" then . else error(m) end;
 
 # mon_validate_config JSON_NUOVO [JSON_VECCHIO] — stampa la configurazione
 # risultante (bot_token assente nel nuovo = quello del vecchio) oppure, con
-# errore, "ERR: messaggio" su stdout. Non scrive nulla.
+# errore, "ERR: messaggio" su stdout. Non scrive nulla. Token, chat_id e indirizzo
+# di ping assenti nel nuovo = quelli del vecchio (vuoti li cancellano).
 mon_validate_config() {
-  local LC_ALL=C new="${1-}" old="${2-}" oldtok out host
+  local LC_ALL=C new="${1-}" old="${2-}" oldtok oldchat oldhc out host
   oldtok="$(jq -r '(.telegram.bot_token // "") | if type == "string" then . else "" end' <<<"$old" 2>/dev/null)" || oldtok=""
-  if ! out="$(OLDTOK="$oldtok" jq -c "$_MON_VALIDATE_JQ" <<<"$new" 2>/dev/null)" || [[ -z "$out" ]]; then
+  oldchat="$(jq -r '(.telegram.chat_id // "") | if type == "string" then . else "" end' <<<"$old" 2>/dev/null)" || oldchat=""
+  oldhc="$(jq -r '(.healthchecks_url // "") | if type == "string" then . else "" end' <<<"$old" 2>/dev/null)" || oldhc=""
+  if ! out="$(OLDTOK="$oldtok" OLDCHAT="$oldchat" OLDHC="$oldhc" jq -c "$_MON_VALIDATE_JQ" <<<"$new" 2>/dev/null)" || [[ -z "$out" ]]; then
     printf 'ERR: JSON non valido\n'
     return 1
   fi

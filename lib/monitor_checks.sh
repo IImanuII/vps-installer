@@ -568,6 +568,7 @@ mon_status_json() {
     {ok: true,
      enabled: ($c.enabled == true),
      telegram_configured: (($c.telegram.bot_token // "") != "" and ($c.telegram.chat_id // "") != ""),
+     chat_id: ($c.telegram.chat_id // ""),
      healthchecks: (($c.healthchecks_url // "") != ""),
      last_run: ($s.last_run | iso),
      checks: [$s.checks | to_entries[] | .key as $id | (.value | if type == "object" then . else {} end) as $v

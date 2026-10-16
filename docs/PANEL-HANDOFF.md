@@ -205,7 +205,7 @@ la sorveglianza della VPS con avvisi Telegram. Il giro (`_run`) lo lancia solo
 - `checks`: un elemento per controllo, nell'ordine del giro. `kind` è `url` (id `health` per `/health` del pannello, `url:<indirizzo>` per gli altri), `service` (`service:<nome>`), `disk`, `mem`, `load`, `f2b`, `cert` (`cert:<dominio>`), `cf_token`; `state` `ok`/`warn`/`down`; `since` (ISO UTC, inizio del problema, `null` se ok); `code` e `time_ms` solo per gli indirizzi (`code` `null` se non c'è risposta HTTP);
 - `alerts`: i messaggi delle ultime 24 ore (ISO UTC, testo completo con emoji e hostname), dal più vecchio; il riepilogo delle 9 non c'è;
 - `last_run`: ora dell'ultimo giro (ISO UTC) o `null`; `queued`: messaggi in coda non ancora consegnati;
-- `urls` e `thresholds` dalla configurazione, per precompilare il modulo; **mai il token** (solo `telegram_configured`).
+- `urls`, `thresholds` e `chat_id` (non è un segreto) dalla configurazione, per precompilare il modulo; **mai il token** (solo `telegram_configured`) né l'indirizzo di ping (solo `healthchecks`).
 
 `config` (stesso formato di `/opt/vps/monitor/config.json`):
 
@@ -221,9 +221,9 @@ la sorveglianza della VPS con avvisi Telegram. Il giro (`_run`) lo lancia solo
 }
 ```
 
-- `bot_token` assente = conserva quello salvato (il pannello non deve rimandarlo); vuoto = Telegram non configurato (in quel caso nessun messaggio viene accodato, gli avvisi restano solo in `status`). Gli altri campi assenti prendono i valori predefiniti (`enabled` falso, niente indirizzi, soglie qui sopra).
+- `bot_token`, `telegram.chat_id` e `healthchecks_url` assenti = conserva quelli salvati (il pannello non deve rimandarli; la stringa vuota li cancella); `bot_token` vuoto = Telegram non configurato (in quel caso nessun messaggio viene accodato, gli avvisi restano solo in `status`). Gli altri campi assenti prendono i valori predefiniti (`enabled` falso, niente indirizzi, soglie qui sopra).
 - Regole: `bot_token` `^[0-9]{5,15}:[A-Za-z0-9_-]{30,60}$`, `chat_id` `^-?[0-9]{1,20}$`, `healthchecks_url` vuoto o `https://hc-ping.com/[A-Za-z0-9_/-]{1,150}`, al massimo 20 `urls` (https, host minuscolo valido, niente porta, credenziali, spazi o caratteri di controllo, ≤ 512 byte), `keyword` ≤ 100 byte senza caratteri di controllo; soglie intere `fail_count` 1-10, `timeout_s` 2-30, `slow_s` 1-30, `slow_count` 1-30, `remind_min` 5-1440, `disk_warn_pct`/`disk_crit_pct` 50-99 con warn < crit, `mem_avail_pct` 1-50, `mem_minutes`/`load_minutes`/`f2b_minutes` 1-60, `load_factor` 1-10, `cert_days` 1-30, `f2b_bans` 1-1000. Un campo non valido rifiuta tutto e lascia la configurazione di prima.
-- Dopo il salvataggio: `systemctl enable --now vps-monitor.timer` se `enabled`, altrimenti `disable --now`.
+- Dopo il salvataggio: `systemctl enable --now vps-monitor.timer` se `enabled`, altrimenti `disable --now`. Se il file è scritto ma il timer non parte/non si ferma: `{"ok":false,"saved":true,"error":"…"}`.
 
 Un giro: indirizzi in parallelo (`/health` con `--resolve <dominio>:443:127.0.0.1`, atteso 200 e `OK`; gli altri ok se codice < 500, redirect non seguiti, e la parola attesa nel primo MiB), servizi del manifest con riavvio (al massimo 3 l'ora, poi "riavvii sospesi"), disco/RAM/carico, accessi SSH (`journalctl -u ssh`), Ban di fail2ban, ogni 6 ore certificati e `vps-cf-token test`, alle 9 (Europe/Rome) il riepilogo solo se c'è contenuto; poi stato salvato, ping a Healthchecks.io, invio della coda (dal più vecchio, al massimo 10 invii e 44 s). Messaggi in testo semplice: `<emoji> <hostname>: <testo>` (🔴 giù, 🟡 attenzione, 🟢 rientro, 🔐 SSH, 📋 riepilogo).
 

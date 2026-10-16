@@ -17,5 +17,10 @@ case "$1" in
     if [[ ! -f "$T/norestart.$2" ]]; then rm -f "$T/down.$2"; fi
     exit 0
     ;;
+  # $T/fail.enable, $T/fail.disable: l'abilitazione del timer non riesce
+  enable | disable)
+    if [[ -f "$T/fail.$1" ]]; then exit 1; fi
+    exit 0
+    ;;
   *) exit 0 ;;
 esac
