@@ -548,6 +548,7 @@ sent() {
   rm "$T/fail.enable"; touch "$T/fail.disable"
   echo '{"enabled":false}' >"$T/in2.json"
   run bash -c "bash '$TOOL' config <'$T/in2.json' 2>/dev/null"
+  [ "$status" -eq 1 ]
   jq -e '.ok == false and .saved == true' <<<"$output"
 }
 
