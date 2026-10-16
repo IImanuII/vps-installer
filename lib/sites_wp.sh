@@ -105,7 +105,7 @@ site_redis_acl_replace() {
     grep -v "^user $slug " "$REDIS_ACL_FILE"
     [[ -z "${2:-}" ]] || printf '%s\n' "$2"
   )"
-  printf '%s\n' "$new" | write_file "$REDIS_ACL_FILE" 640 root:redis || { rm -f "$bak"; return 1; }
+  printf '%s\n' "$new" | redis_acl_write 640 root:redis || { rm -f "$bak"; return 1; }
   if site_redis_reload; then
     rm -f "$bak"
     return 0
@@ -129,12 +129,14 @@ site_redis_purge() {
     0 "$slug:*" >>"$VPS_LOG" 2>&1
 }
 
+# Oltre a @dangerous e @admin il sito non ha SCRIPT KILL/FLUSH né FUNCTION:
+# agiscono su Redis intero (gli script e le funzioni di tutti i siti).
 site_redis_user_add() {
   local slug h
   slug="$(site_reg_get "$1" .slug)"
   h="$(printf '%s' "$2" | sha256sum | cut -d' ' -f1)"
   site_redis_purge "$1" || { site_fail "cache Redis di un sito precedente non svuotata (dettagli in $VPS_LOG)"; return 1; }
-  site_redis_acl_replace "$1" "user $slug on #$h ~$slug:* &$slug:* +@all -@dangerous -@admin +info"
+  site_redis_acl_replace "$1" "user $slug on #$h ~$slug:* &$slug:* +@all -@dangerous -@admin +info -script|kill -script|flush -function"
 }
 
 site_redis_user_remove() {

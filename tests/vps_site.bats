@@ -362,11 +362,11 @@ wp_opts=(--title "Il blog" --admin-user gestore --admin-email io@miosito.it --lo
   vs list
   [ "$status" -eq 0 ]
   [ "$(jq -r '[.sites[].placeholder] | unique | join(",")' <<<"$output")" = false ]
-  ! grep -q '^runuser' "$CALLS"
+  run ! grep -q '^runuser' "$CALLS"
   site_reg_update php.miosito.it '.type = "wordpress" | .state = "active"'
   vs list
   [ "$(jq -r '[.sites[].placeholder] | unique | join(",")' <<<"$output")" = false ]
-  ! grep -q '^runuser' "$CALLS"
+  run ! grep -q '^runuser' "$CALLS"
 }
 
 @test "WordPress richiede Redis con le ACL" {

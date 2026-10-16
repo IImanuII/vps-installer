@@ -47,6 +47,7 @@ setup() {
   grep -q "define( 'DB_PASSWORD', 'Password-db-1234567890' );" "$f"
   grep -q "define( 'WP_REDIS_USERNAME', 'site_blog_miosito_it' );" "$f"
   grep -q "define( 'WP_REDIS_PREFIX', 'site_blog_miosito_it:' );" "$f"
+  grep -q "define( 'WP_REDIS_MAXTTL', 604800 );" "$f"
   grep -q "define( 'WP_HOME', 'https://blog.miosito.it' );" "$f"
   grep -q '\$table_prefix = '"'"'wp_'"'"';' "$f"
   grep -q "\$_SERVER\['HTTPS'\] = 'on';" "$f"
@@ -69,7 +70,7 @@ setup() {
   site_reg_new blog.miosito.it wordpress no yes
   site_redis_user_add blog.miosito.it 'Password-redis-1234567890'
   h="$(printf %s 'Password-redis-1234567890' | sha256sum | cut -d' ' -f1)"
-  grep -qx "user site_blog_miosito_it on #$h ~site_blog_miosito_it:\* &site_blog_miosito_it:\* +@all -@dangerous -@admin +info" "$REDIS_ACL_FILE"
+  grep -qx "user site_blog_miosito_it on #$h ~site_blog_miosito_it:\* &site_blog_miosito_it:\* +@all -@dangerous -@admin +info -script|kill -script|flush -function" "$REDIS_ACL_FILE"
   grep -qx 'user default off' "$REDIS_ACL_FILE"
   grep -q '^redis-cli --user vps-admin ACL LOAD auth=si' "$CALLS"
   run grep -c 'Password-redis' "$CALLS"
@@ -608,4 +609,18 @@ exec "$BATS_TEST_TMPDIR/bin/wp.orig" "$@"'
   run ! site_placeholder_intact blog.miosito.it
   grep -q -- '-print -quit' "$CALLS"
   ! grep -q '^runuser' "$CALLS"
+}
+
+@test "utente Redis: il file temporaneo nasce fuori dalla cartella di Redis" {
+  site_reg_new blog.miosito.it wordpress no yes
+  mkdir -p "$BATS_TEST_TMPDIR/redis"
+  export REDIS_ACL_FILE="$BATS_TEST_TMPDIR/redis/users.acl"
+  printf 'user default off\n' >"$REDIS_ACL_FILE"
+  # shellcheck disable=SC2016
+  make_stub mktemp 'echo "mktemp $*" >>"$CALLS"; exec /usr/bin/mktemp "$@"'
+  site_redis_user_add blog.miosito.it 'Password-redis-1234567890'
+  grep -qxF "mktemp $BATS_TEST_TMPDIR/.vps-acl.XXXXXX" "$CALLS"
+  grep -q '^user site_blog_miosito_it ' "$REDIS_ACL_FILE"
+  [ "$(stat -c %a "$REDIS_ACL_FILE")" = 640 ]
+  [ -z "$(find "$BATS_TEST_TMPDIR" "$BATS_TEST_TMPDIR/redis" -maxdepth 1 -name '.vps-acl.*')" ]
 }

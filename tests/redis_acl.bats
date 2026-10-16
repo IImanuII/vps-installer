@@ -2,6 +2,7 @@ setup() {
   load test_helper
   setup_common
   export REDIS_CONF="$BATS_TEST_TMPDIR/redis.conf" REDIS_ACL_FILE="$BATS_TEST_TMPDIR/users.acl" REDIS_ADMIN_SECRET="$BATS_TEST_TMPDIR/secrets/redis-admin"
+  export SITES_LOCK="$BATS_TEST_TMPDIR/vps-site.lock"
   echo "port 6379" >"$REDIS_CONF"
   jq -n '{components:{redis:true}}' >"$VPS_OPT/manifest.json"
   make_stub systemctl 'echo "systemctl $*" >>"$BATS_TEST_TMPDIR/calls"'
@@ -90,4 +91,77 @@ n=$(grep -c "systemctl restart" "$BATS_TEST_TMPDIR/calls"); [ "$n" -ge 2 ]'
   printf 'port 6379\n# requirepass x\naclfile %s\n' "$REDIS_ACL_FILE" >"$REDIS_CONF"
   run redis_acl_setup
   [ "$status" -eq 0 ]
+}
+
+@test "prima volta: maxmemory 256mb con allkeys-lru, una sola volta" {
+  printf 'port 6379\n# maxmemory <bytes>\n' >"$REDIS_CONF"
+  redis_acl_setup
+  redis_acl_setup
+  [ "$(grep -cx 'maxmemory 256mb' "$REDIS_CONF")" = 1 ]
+  [ "$(grep -cx 'maxmemory-policy allkeys-lru' "$REDIS_CONF")" = 1 ]
+}
+
+@test "un maxmemory già scelto resta com'è" {
+  printf 'port 6379\nmaxmemory 1gb\n' >"$REDIS_CONF"
+  redis_acl_setup
+  grep -qx 'maxmemory 1gb' "$REDIS_CONF"
+  ! grep -q '256mb\|maxmemory-policy' "$REDIS_CONF"
+}
+
+@test "riavvio fallito: il ripristino toglie anche maxmemory" {
+  make_stub systemctl 'echo "systemctl $*" >>"$BATS_TEST_TMPDIR/calls"
+[ "$1" = restart ] || exit 0
+n=$(grep -c "systemctl restart" "$BATS_TEST_TMPDIR/calls"); [ "$n" -ge 2 ]'
+  run redis_acl_setup
+  [ "$status" -eq 1 ]
+  ! grep -q maxmemory "$REDIS_CONF"
+}
+
+@test "lucchetto dei lavori occupato: niente toccato, ritorno 1 con un messaggio" {
+  export REDIS_ACL_LOCK_WAIT=1
+  exec 7>"$SITES_LOCK"
+  flock -n 7
+  run redis_acl_setup
+  exec 7>&-
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"vps-site"* ]] || grep -q 'vps-site' "$VPS_LOG"
+  [ "$(cat "$REDIS_CONF")" = "port 6379" ]
+  [ ! -e "$REDIS_ACL_FILE" ]
+}
+
+@test "il lucchetto si libera dopo redis_acl_setup" {
+  redis_acl_setup
+  flock -n "$SITES_LOCK" true
+}
+
+@test "copia di sicurezza non riuscita: niente toccato, nessun resto, ritorno 1" {
+  redis_acl_setup
+  : >"$BATS_TEST_TMPDIR/calls"
+  cp "$REDIS_CONF" "$BATS_TEST_TMPDIR/conf.prima"
+  cp "$REDIS_ACL_FILE" "$BATS_TEST_TMPDIR/acl.prima"
+  export TMPDIR="$BATS_TEST_TMPDIR/tmp"
+  mkdir -p "$TMPDIR"
+  local quale
+  for quale in redis.conf users.acl; do
+    # shellcheck disable=SC2016
+    make_stub cp "[[ \"\$*\" == *$quale* ]] && exit 1; exec /bin/cp \"\$@\""
+    hash -r
+    run redis_acl_setup
+    [ "$status" -eq 1 ]
+    cmp "$REDIS_CONF" "$BATS_TEST_TMPDIR/conf.prima"
+    cmp "$REDIS_ACL_FILE" "$BATS_TEST_TMPDIR/acl.prima"
+    [ -z "$(ls -A "$TMPDIR")" ]
+  done
+  ! grep -q 'systemctl restart\|redis-cli' "$BATS_TEST_TMPDIR/calls"
+}
+
+@test "file ACL: il temporaneo nasce nella cartella sopra, di root" {
+  mkdir -p "$BATS_TEST_TMPDIR/redis"
+  export REDIS_ACL_FILE="$BATS_TEST_TMPDIR/redis/users.acl"
+  # shellcheck disable=SC2016
+  make_stub mktemp 'echo "mktemp $*" >>"$BATS_TEST_TMPDIR/calls"; exec /usr/bin/mktemp "$@"'
+  redis_acl_setup
+  grep -qxF "mktemp $BATS_TEST_TMPDIR/.vps-acl.XXXXXX" "$BATS_TEST_TMPDIR/calls"
+  [ "$(stat -c %a "$REDIS_ACL_FILE")" = 640 ]
+  [ -z "$(find "$BATS_TEST_TMPDIR" -maxdepth 2 -name '.vps-acl.*')" ]
 }

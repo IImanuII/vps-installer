@@ -31,6 +31,8 @@ define( 'WP_REDIS_USERNAME', '${WP_DB_NAME}' );
 define( 'WP_REDIS_PASSWORD', '${WP_REDIS_PASSWORD}' );
 define( 'WP_REDIS_PREFIX', '${WP_DB_NAME}:' );
 define( 'WP_REDIS_SELECTIVE_FLUSH', true );
+// Nessuna chiave senza scadenza: la cache di Redis è condivisa tra i siti.
+define( 'WP_REDIS_MAXTTL', 604800 );
 
 // Dietro Cloudflare PHP vede http: senza questo WordPress va in loop di redirect.
 if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https' ) {
