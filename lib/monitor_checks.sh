@@ -164,19 +164,25 @@ mon_check_urls() {
     [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
     [[ "$t" =~ ^[0-9]+(\.[0-9]+)?$ ]] || t=0
     ms="$(awk -v t="$t" 'BEGIN { printf "%d", t * 1000 }')"
-    outcome=ok detail=""
+    outcome=ok detail="" cut=0
+    # 63 = risposta oltre 2 MiB: con le intestazioni arrivate (codice ≠ 000) è
+    # una risposta normale, solo tagliata; senza codice resta un errore.
+    if ((rc == 63)) && [[ "$code" != 000 ]]; then
+      rc=0 cut=1
+    fi
     if ((rc != 0)); then
       outcome=fail
       case "$rc" in
         28) detail="nessuna risposta in $to s" ;;
-        63) detail="risposta oltre 2 MiB" ;;
         *) detail="errore di connessione" ;;
       esac
-    elif [[ "$id" == health ]] && { [[ "$code" != 200 ]] || ! head -c 1048576 "$dir/$i.body" 2>/dev/null | grep -qF OK; }; then
+    elif [[ "$id" == health ]] && { [[ "$code" != 200 ]] || { ((cut == 0)) && ! head -c 1048576 "$dir/$i.body" 2>/dev/null | grep -qF OK; }; }; then
       outcome=fail detail="HTTP $code"
     elif [[ "$code" == 000 ]] || ((10#$code >= 500)); then
       outcome=fail detail="HTTP $code"
-    elif [[ -n "$kw" ]] && ! head -c 1048576 "$dir/$i.body" 2>/dev/null | grep -qF -- "$kw"; then
+    # Con il corpo tagliato la parola potrebbe stare nella parte non scaricata:
+    # non si conta come assente.
+    elif [[ -n "$kw" ]] && ((cut == 0)) && ! head -c 1048576 "$dir/$i.body" 2>/dev/null | grep -qF -- "$kw"; then
       outcome=fail detail="parola attesa assente"
     elif awk -v t="$t" -v s="$slow" 'BEGIN { exit !(t > s) }'; then
       outcome=slow

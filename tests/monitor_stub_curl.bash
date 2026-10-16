@@ -42,3 +42,5 @@ if [[ "$code" == sleep ]]; then
 fi
 printf '%s' "$body" >"$out"
 printf '%s %s' "$code" "$time"
+# $T/url.<chiave>.rc: codice di uscita dopo la risposta (es. 63 = oltre --max-filesize)
+if [[ -f "$T/url.$key.rc" ]]; then exit "$(cat "$T/url.$key.rc")"; fi

@@ -850,3 +850,18 @@ sent() {
   run round "$NOW"
   [ "$(sent)" = '🔐 vps-test: accesso SSH di iimanuii da 1.2.3.4 (publickey)' ]
 }
+
+@test "fix: risposta oltre 2 MiB (curl 63) con codice = risposta normale; senza codice = giù" {
+  tool_env
+  mon_cfg '.urls = [{url:"https://big.test/",keyword:"Benvenuti"},{url:"https://nocode.test/",keyword:""}]'
+  set_url https://big.test/ 200 0.2 'inizio-pagina-tagliata'
+  echo 63 >"$T/url.$(printf '%s' https://big.test/ | tr -c 'A-Za-z0-9' _).rc"
+  set_url https://nocode.test/ 000 0.2 ''
+  echo 63 >"$T/url.$(printf '%s' https://nocode.test/ | tr -c 'A-Za-z0-9' _).rc"
+  run round "$NOW"
+  run round $((NOW + 60))
+  jq -e '.checks["url:https://big.test/"] | .state == "ok" and .fails == 0 and .code == 200' "$MON_STATE"
+  jq -e '.checks["url:https://nocode.test/"].state == "down"' "$MON_STATE"
+  [[ "$(sent)" != *big.test* ]]
+  [ "$(sent)" = '🔴 vps-test: https://nocode.test/ è giù da 1 min (errore di connessione)' ]
+}
