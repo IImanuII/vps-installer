@@ -204,7 +204,7 @@ wizard_cloudflare() {
     ask_input zone_domain "Dominio principale gestito su Cloudflare (es. miosito.it):" "" valid_domain "Dominio non valido."
   fi
   while true; do
-    ask_secret CF_API_TOKEN "API token Cloudflare\n(permesso Zone > DNS > Edit sulla zona di $zone_domain):" valid_cf_token \
+    ask_secret CF_API_TOKEN "API token Cloudflare (un token per questa VPS)\ncon i permessi Zone > Zone > Read, Zone > DNS > Edit e Zone > Cache Purge > Purge su tutte le zone:" valid_cf_token \
       "Formato del token non valido."
     if found="$(CF_API_TOKEN="$CF_API_TOKEN" cf_find_zone "$zone_domain" 2>/dev/null)"; then
       # shellcheck disable=SC2034

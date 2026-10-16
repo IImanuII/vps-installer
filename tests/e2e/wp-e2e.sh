@@ -178,7 +178,7 @@ mkdir -p "$VPS_OPT/secrets" "$SITES_WWW" "$LOGROTATE_D" "$CRON_D" "$work/wpcli"
 chmod 755 "$work/wpcli"
 printf 'dns_cloudflare_api_token = %s\n' "$(printf 'a%.0s' {1..40})" >"$VPS_OPT/secrets/cloudflare.ini"
 id "$ADMIN" >/dev/null 2>&1 || { useradd -m "$ADMIN" && made_admin=1; }
-jq -n --arg a "$ADMIN" '{installer_version:"1.3.0", admin_user:$a, ipv4:"127.0.0.1", ipv6:null,
+jq -n --arg a "$ADMIN" '{installer_version:"1.4.0", admin_user:$a, ipv4:"127.0.0.1", ipv6:null,
   components:{redis:true}, cloudflare:{enabled:true, zone:"e2etest.it"}, panel:{domain:"panel.e2etest.it"}}' \
   >"$VPS_OPT/manifest.json"
 

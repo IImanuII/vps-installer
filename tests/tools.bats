@@ -76,10 +76,10 @@ setup() {
 }
 
 @test "vps-cf-token set salva il token con permessi 600" {
-  make_stub curl 'echo "{\"result\":[{\"id\":\"zid\"}]}"'
+  _cf_curl_zone miosito.it
   mkdir -p "$VPS_OPT/secrets"
   tok="$(printf 'a%.0s' {1..40})"
-  run bash -c "printf '%s' '$tok' | bash '$T/vps-cf-token' set"
+  run bash -c "printf '%s' '$tok' | bash '$T/vps-cf-token' set 2>/dev/null"
   [ "$status" -eq 0 ]
   [ "$(jq -r .ok <<<"$output")" = true ]
   grep -qxF "dns_cloudflare_api_token = $tok" "$VPS_OPT/secrets/cloudflare.ini"
@@ -184,4 +184,60 @@ esac'
   _cf_curl
   run bash -c "bash '$T/vps-cf-purge' altro.it --all </dev/null 2>/dev/null"
   [ "$(jq -r .error <<<"$output")" = "zona non trovata: altro.it" ]
+}
+
+# curl finto per vps-cf-token: zone visibili in $BATS_TEST_TMPDIR/zones (una per riga).
+_cf_curl_zone() {
+  printf '%s\n' "$@" >"$BATS_TEST_TMPDIR/zones"
+  make_stub curl '
+printf "%s\n" "$@" >>"$BATS_TEST_TMPDIR/curl.args"
+for a; do last="$a"; done
+case "$last" in
+  *"/zones?status=active&per_page=50&page=1")
+    jq -Rn "{success: true, result: [inputs | {name: .}], result_info: {total_pages: 1}}" <"$BATS_TEST_TMPDIR/zones" ;;
+  *"/zones?name="*)
+    n="${last#*name=}"; n="${n%%&*}"
+    if grep -qxF "$n" "$BATS_TEST_TMPDIR/zones"; then echo "{\"success\":true,\"result\":[{\"id\":\"z-$n\"}]}"; else echo "{\"success\":true,\"result\":[]}"; fi ;;
+  *) echo "{\"success\":false}" ;;
+esac'
+}
+
+_cf_sito() {
+  mkdir -p "$VPS_OPT/sites"
+  jq -n --arg d "$1" --arg z "$2" '{domain: $d, zone: (if $z == "" then null else {id: "x", name: $z} end)}' >"$VPS_OPT/sites/$1.json"
+}
+
+@test "vps-cf-token set rifiuta un token che non vede le zone dei siti" {
+  _cf_ini; _cf_curl_zone miosito.it altro.it
+  _cf_sito blog.miosito.it miosito.it
+  _cf_sito shop.terzo.it terzo.it
+  _cf_sito quarto.it quarto.it
+  _cf_sito vecchio.it ""
+  tok="$(printf 'c%.0s' {1..40})"
+  run bash -c "printf '%s' '$tok' | bash '$T/vps-cf-token' set"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "il token non vede le zone: quarto.it, terzo.it" ]
+  grep -qxF "dns_cloudflare_api_token = $CF_TOK" "$VPS_OPT/secrets/cloudflare.ini"
+}
+
+@test "vps-cf-token set accetta un token che vede tutte le zone; test le conta" {
+  _cf_ini; _cf_curl_zone miosito.it terzo.it altro.it
+  _cf_sito shop.terzo.it terzo.it
+  tok="$(printf 'c%.0s' {1..40})"
+  run bash -c "printf '%s\n' '$tok' | bash '$T/vps-cf-token' set"
+  [ "$status" -eq 0 ]
+  grep -qxF "dns_cloudflare_api_token = $tok" "$VPS_OPT/secrets/cloudflare.ini"
+  run bash "$T/vps-cf-token" test
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .zones <<<"$output")" = 3 ]
+  ! grep -qF "$tok" "$BATS_TEST_TMPDIR/curl.args"
+  ! grep -qF "$tok" "$VPS_LOG"
+}
+
+@test "vps-cf-token test segnala le zone dei siti non più visibili" {
+  _cf_ini; _cf_curl_zone miosito.it
+  _cf_sito shop.terzo.it terzo.it
+  run bash "$T/vps-cf-token" test
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "il token non vede le zone: terzo.it" ]
 }

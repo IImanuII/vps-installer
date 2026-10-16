@@ -80,7 +80,7 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 
 ```json
 {
-  "installer_version": "1.3.0",
+  "installer_version": "1.4.0",
   "installed_at": "2026-10-07T15:30:00+02:00",
   "hostname": "vps-01",
   "ipv4": "203.0.113.10",
@@ -130,7 +130,8 @@ Forniti dall'installer (v1):
 
 | Script | Uso | Cosa fa |
 |---|---|---|
-| `vps-cf-token` | `set` (token da stdin) / `test` | sostituisce o verifica il token Cloudflare (verifica che il token acceda alla zona prima di salvarlo) |
+| `vps-cf-token` | `set` (token da stdin) / `test` | sostituisce o verifica il token Cloudflare. `set` verifica che il token veda la zona del pannello e quelle di tutti i siti registrati prima di salvarlo (`{"ok":false,"error":"il token non vede le zone: ..."}`); `test` risponde `{"ok":true,"zones":N}`. Errori: `formato del token non valido`, `Cloudflare non è attivo su questa VPS`, `il token non ha accesso alla zona ZONA`, `il token salvato non ha accesso alla zona ZONA`, `il token non è valido o Cloudflare non risponde` |
+| `vps-cf-purge` | `ZONA --all` / `ZONA` con indirizzi su stdin (1-30, https, host della zona) | svuota la cache Cloudflare: `{"ok":true,"purged":"all"\|N}`. Il pannello non tiene token Cloudflare. Errori: `zona non valida`, `Cloudflare non è attivo su questa VPS`, `zona non trovata: ZONA`, `Cloudflare non risponde`, `nessun indirizzo`, `troppi indirizzi: il limite è 30`, `indirizzo non valido: URL`, `Cloudflare ha rifiutato la richiesta: MSG` |
 | `vps-cf-ips-update` | — | scarica gli IP Cloudflare, rigenera `cloudflare-realip.conf` e regole UFW 80/443, `nginx -t` + reload. Anche da cron settimanale |
 | `vps-smtp` | `set` (config JSON da stdin) / `test <email>` / `disable` | scrive `msmtprc`, manda email di prova, aggiorna il manifest |
 | `vps-pma-pass` | `set` (password da stdin) | rigenera `.htpasswd-pma` (bcrypt) |
@@ -209,7 +210,7 @@ Convenzione: DB e utenti dei siti hanno nome `site_<slug>` (es. `site_miosito_it
 ## 6. Da fare nel pannello (rimandato dall'installer)
 
 - [ ] **Email:** pagina di configurazione SMTP (host, porta, utente, password, mittente, destinatario avvisi), pulsante "invia email di prova", link alle guide per **Gmail app password** e **Brevo** (con nota su SPF/DKIM per mittente sul proprio dominio). Usa `vps-smtp`.
-- [ ] **Cloudflare:** cambio/verifica token, stato ultimo aggiornamento IP. Usa `vps-cf-token`, `vps-cf-ips-update`.
+- [x] **Cloudflare:** fatto (Plancia 2.4.0): cambio/verifica token, svuotamento cache. Usa `vps-cf-token`, `vps-cf-purge`, `vps-cf-ips-update`.
 - [ ] **phpMyAdmin:** versione installata vs ultima, aggiornamento, cambio password basic auth. Usa `vps-pma-update`, `vps-pma-pass`.
 - [ ] **Backup rclone:** configurazione OAuth Google Drive, pianificazione, retention, stato ultimo backup. Usa `vps-backup`.
 - [ ] **Siti:** creazione statico / PHP fatta con `vps-site` (installer 1.2); WordPress fatto con `vps-site create --type wordpress` e `vps-site wp-install` (installer 1.3); resta la cache (`vps-cache`, 2c).

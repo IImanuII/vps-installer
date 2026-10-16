@@ -6,10 +6,11 @@ if [[ -n "${SUDO_USER:-}" ]]; then
   VPS_LIB=$VPS_OPT/lib
   VPS_TEMPLATES=$VPS_OPT/templates
   VPS_LOG=/var/log/vps-tools.log
-  unset MSMTPRC_LINK HTPASSWD_PMA ALIASES_FILE PMA_DIR NGINX_SNIPPETS CF_API CF_IPS_URL PMA_BASE_URL
+  unset MSMTPRC_LINK HTPASSWD_PMA ALIASES_FILE PMA_DIR NGINX_SNIPPETS CF_API CF_IPS_URL PMA_BASE_URL SITES_DIR
   [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
   chmod 640 "$VPS_LOG"
 fi
+export LC_ALL=C
 : "${VPS_OPT:=/opt/vps}" "${VPS_LOG:=/var/log/vps-tools.log}"
 : "${VPS_TEMPLATES:=$VPS_OPT/templates}"
 for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
@@ -19,13 +20,32 @@ done
 tool_init
 
 zone="$(jq -r '.cloudflare.zone // empty' "$(manifest_path)")"
+
+# cf_missing_zones — le zone che il token deve vedere (pannello + siti registrati;
+# un sito senza zona, es. di una versione vecchia, si ignora) e che non vede.
+# Stampa le mancanti in ordine, separate da ", "; 1 se Cloudflare non risponde.
+cf_missing_zones() {
+  local visibili richieste f
+  visibili="$(cf_list_zones)" || return 1
+  richieste="$({
+    printf '%s\n' "$zone"
+    for f in "$SITES_DIR"/*.json; do
+      if [[ -f "$f" ]]; then jq -r '.zone.name // empty' "$f"; fi
+    done
+  } | sort -u)"
+  comm -23 <(grep -v '^$' <<<"$richieste" || true) <(sort -u <<<"$visibili") | paste -sd, - | sed 's/,/, /g'
+}
+
 case "${1:-}" in
   set)
     token="$(trim "$(read_stdin_limited 512)")"
     valid_cf_token "$token" || json_err "formato del token non valido"
     [[ -n "$zone" ]] || json_err "Cloudflare non è attivo su questa VPS"
     CF_API_TOKEN="$token" cf_find_zone "$zone" >/dev/null || json_err "il token non ha accesso alla zona $zone"
+    mancanti="$(CF_API_TOKEN="$token" cf_missing_zones)" || json_err "il token non è valido o Cloudflare non risponde"
+    [[ -z "$mancanti" ]] || json_err "il token non vede le zone: $mancanti"
     cf_write_ini "$token"
+    log "vps-cf-token: token di sistema sostituito"
     json_ok
     ;;
   test)
@@ -33,7 +53,10 @@ case "${1:-}" in
     # shellcheck disable=SC2034
     CF_API_TOKEN="$(cf_token_from_ini)"
     cf_find_zone "$zone" >/dev/null || json_err "il token salvato non ha accesso alla zona $zone"
-    json_ok
+    mancanti="$(cf_missing_zones)" || json_err "il token non è valido o Cloudflare non risponde"
+    [[ -z "$mancanti" ]] || json_err "il token non vede le zone: $mancanti"
+    n="$(cf_list_zones | grep -c . || true)"
+    json_ok --argjson n "$n" '{ok: true, zones: $n}'
     ;;
   *)
     json_err "uso: vps-cf-token set|test (token da stdin per set)"
