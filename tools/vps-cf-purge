@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# vps-cf-purge ZONA [--all] — svuota la cache Cloudflare di ZONA con il token di
+# sistema. Senza --all gli indirizzi arrivano da stdin, uno per riga (1-30): negli
+# argomenti si vedrebbero in `ps`. Contratto in docs/PANEL-HANDOFF.md, sezione 4.
+# Sotto sudo l'ambiente del chiamante non deve influenzare lo script.
+if [[ -n "${SUDO_USER:-}" ]]; then
+  VPS_OPT=/opt/vps
+  VPS_LIB=$VPS_OPT/lib
+  VPS_TEMPLATES=$VPS_OPT/templates
+  VPS_LOG=/var/log/vps-tools.log
+  unset CF_API
+  [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
+  chmod 640 "$VPS_LOG"
+fi
+: "${VPS_OPT:=/opt/vps}" "${VPS_LOG:=/var/log/vps-tools.log}"
+: "${VPS_TEMPLATES:=$VPS_OPT/templates}"
+for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
+  # shellcheck source=/dev/null
+  source "$_lib"
+done
+tool_init
+
+USO="uso: vps-cf-purge ZONA [--all] (indirizzi da stdin senza --all)"
+(($# >= 1 && $# <= 2)) || json_err "$USO"
+zone="$1"
+all=no
+case "${2:-}" in
+  --all) all=yes ;;
+  "") ;;
+  *) json_err "$USO" ;;
+esac
+valid_domain "$zone" || json_err "zona non valida"
+[[ -f "$VPS_OPT/secrets/cloudflare.ini" ]] || json_err "Cloudflare non è attivo su questa VPS"
+# shellcheck disable=SC2034
+CF_API_TOKEN="$(cf_token_from_ini)"
+
+if [[ "$all" == yes ]]; then
+  body='{"purge_everything":true}'
+  n=all
+else
+  urls=()
+  while IFS= read -r riga || [[ -n "$riga" ]]; do
+    riga="$(trim "$riga")"
+    if [[ -n "$riga" ]]; then urls+=("$riga"); fi
+  done < <(read_stdin_limited 40000)
+  ((${#urls[@]} >= 1)) || json_err "nessun indirizzo"
+  ((${#urls[@]} <= 30)) || json_err "troppi indirizzi: il limite è 30"
+  for u in "${urls[@]}"; do
+    valid_purge_url "$u" "$zone" || json_err "indirizzo non valido: $u"
+  done
+  body="$(jq -nc '{files: $ARGS.positional}' --args "${urls[@]}")"
+  n="${#urls[@]}"
+fi
+
+zid="$(cf_zone_id "$zone")" || json_err "zona non trovata: $zone"
+resp="$(cf_api POST "/zones/$zid/purge_cache" "$body")" || json_err "Cloudflare non risponde"
+if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$resp"; then
+  msg="$(jq -r '[.errors[]?.message] | join("; ")' <<<"$resp" 2>/dev/null || true)"
+  log "vps-cf-purge: $zone rifiutato da Cloudflare: ${msg:-risposta non valida}"
+  json_err "Cloudflare ha rifiutato la richiesta: ${msg:-risposta non valida}"
+fi
+log "vps-cf-purge: $zone svuotata ($n)"
+if [[ "$n" == all ]]; then
+  json_ok '{ok: true, purged: "all"}'
+else
+  json_ok --argjson n "$n" '{ok: true, purged: $n}'
+fi

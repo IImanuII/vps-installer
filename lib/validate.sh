@@ -59,6 +59,22 @@ valid_cf_token() {
   [[ "$1" =~ ^[A-Za-z0-9_-]{30,200}$ ]]
 }
 
+# valid_purge_url URL ZONA — un indirizzo che Cloudflare può svuotare per ZONA:
+# https (schema in qualunque maiuscola), niente spazi o caratteri di controllo,
+# niente credenziali né porta, host = ZONA o un suo sottodominio a etichette intere.
+valid_purge_url() {
+  local u="$1" z="$2" rest host
+  ((${#u} >= 9 && ${#u} <= 1024)) || return 1
+  [[ "$u" != *[[:space:][:cntrl:]]* ]] || return 1
+  [[ "${u:0:8}" =~ ^[Hh][Tt][Tt][Pp][Ss]://$ ]] || return 1
+  rest="${u:8}"
+  host="${rest%%[/?#]*}"
+  [[ "$host" != *[@:]* ]] || return 1
+  host="${host,,}"
+  valid_domain "$host" || return 1
+  [[ "$host" == "$z" || "$host" == *".$z" ]]
+}
+
 valid_ssh_pubkey() {
   local key="$1" tmp info bits rc=0
   valid_line "$key" || return 1

@@ -102,3 +102,23 @@ setup() {
   ssh-keygen -q -t ed25519 -N '' -f "$BATS_TEST_TMPDIR/k"
   valid_ssh_pubkey "$(trim "  $(cat "$BATS_TEST_TMPDIR/k.pub")"$' \r\n')"
 }
+
+@test "valid_purge_url accetta indirizzi della zona e dei suoi sottodomini" {
+  valid_purge_url "https://arcomy.com/" arcomy.com
+  valid_purge_url "https://www.arcomy.com/pagina?x=1#a" arcomy.com
+  valid_purge_url "HTTPS://Blog.Arcomy.com/a" arcomy.com
+  valid_purge_url "https://arcomy.com" arcomy.com
+}
+
+@test "valid_purge_url rifiuta schema, credenziali, porta, altre zone, spazi" {
+  run valid_purge_url "http://arcomy.com/" arcomy.com; [ "$status" -ne 0 ]
+  run valid_purge_url "https://user@arcomy.com/" arcomy.com; [ "$status" -ne 0 ]
+  run valid_purge_url "https://arcomy.com:8443/" arcomy.com; [ "$status" -ne 0 ]
+  run valid_purge_url "https://xarcomy.com/" arcomy.com; [ "$status" -ne 0 ]
+  run valid_purge_url "https://arcomy.com.evil.it/" arcomy.com; [ "$status" -ne 0 ]
+  run valid_purge_url "https://arcomy.com/a b" arcomy.com; [ "$status" -ne 0 ]
+  run valid_purge_url "$(printf 'https://arcomy.com/\001')" arcomy.com; [ "$status" -ne 0 ]
+  run valid_purge_url "https://1.2.3.4/" arcomy.com; [ "$status" -ne 0 ]
+  run valid_purge_url "https://arcomy.com/$(printf 'a%.0s' {1..1010})" arcomy.com; [ "$status" -ne 0 ]
+  run valid_purge_url "" arcomy.com; [ "$status" -ne 0 ]
+}

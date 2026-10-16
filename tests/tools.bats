@@ -69,7 +69,7 @@ setup() {
   run grep -q 'ALL$' "$f"
   [ "$status" -ne 0 ]
   grep -qxF 'Defaults:panel env_reset' "$f"
-  grep -qxF 'panel ALL=(root) NOPASSWD: /opt/vps/bin/vps-status, /opt/vps/bin/vps-cf-token, /opt/vps/bin/vps-cf-ips-update, /opt/vps/bin/vps-smtp, /opt/vps/bin/vps-pma-pass, /opt/vps/bin/vps-pma-update, /opt/vps/bin/vps-site' "$f"
+  grep -qxF 'panel ALL=(root) NOPASSWD: /opt/vps/bin/vps-status, /opt/vps/bin/vps-cf-token, /opt/vps/bin/vps-cf-purge, /opt/vps/bin/vps-cf-ips-update, /opt/vps/bin/vps-smtp, /opt/vps/bin/vps-pma-pass, /opt/vps/bin/vps-pma-update, /opt/vps/bin/vps-site' "$f"
   if command -v visudo >/dev/null 2>&1; then
     visudo -cf "$f"
   fi
@@ -98,4 +98,71 @@ setup() {
   run bash -c "printf '%s' '$long' | bash '$T/vps-pma-pass' set"
   [ "$status" -eq 1 ]
   [[ "$(jq -r .error <<<"$output")" == *"72"* ]]
+}
+
+_cf_ini() {
+  mkdir -p "$VPS_OPT/secrets"
+  CF_TOK="$(printf 'b%.0s' {1..40})"
+  printf 'dns_cloudflare_api_token = %s\n' "$CF_TOK" >"$VPS_OPT/secrets/cloudflare.ini"
+}
+
+# curl finto: annota gli argomenti, risponde secondo l'URL (l'ultimo argomento).
+_cf_curl() {
+  make_stub curl '
+printf "%s\n" "$@" >>"$BATS_TEST_TMPDIR/curl.args"
+for a; do last="$a"; done
+case "$last" in
+  *"/zones?name=miosito.it&status=active") echo "{\"success\":true,\"result\":[{\"id\":\"zid1\"}]}" ;;
+  *"/zones?name="*) echo "{\"success\":true,\"result\":[]}" ;;
+  *purge_cache) cat "$BATS_TEST_TMPDIR/purge.json" 2>/dev/null || echo "{\"success\":true}" ;;
+  *) echo "{\"success\":false}" ;;
+esac'
+}
+
+@test "vps-cf-purge --all svuota la zona con purge_everything" {
+  _cf_ini; _cf_curl
+  run bash -c "bash '$T/vps-cf-purge' miosito.it --all </dev/null 2>/dev/null"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .purged <<<"$output")" = all ]
+  grep -qF '/zones/zid1/purge_cache' "$BATS_TEST_TMPDIR/curl.args"
+  grep -qF '{"purge_everything":true}' "$BATS_TEST_TMPDIR/curl.args"
+  ! grep -qF "$CF_TOK" "$BATS_TEST_TMPDIR/curl.args"
+  ! grep -qF "$CF_TOK" "$VPS_LOG"
+}
+
+@test "vps-cf-purge con indirizzi da stdin, righe vuote ignorate" {
+  _cf_ini; _cf_curl
+  run bash -c "printf 'https://miosito.it/a\n\n  HTTPS://Blog.miosito.it/b  \r\n' | bash '$T/vps-cf-purge' miosito.it 2>/dev/null"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .purged <<<"$output")" = 2 ]
+  grep -qF '{"files":["https://miosito.it/a","HTTPS://Blog.miosito.it/b"]}' "$BATS_TEST_TMPDIR/curl.args"
+}
+
+@test "vps-cf-purge rifiuta prima di chiamare purge_cache" {
+  _cf_ini; _cf_curl
+  run bash -c "printf 'https://altro.it/a\n' | bash '$T/vps-cf-purge' miosito.it"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "indirizzo non valido: https://altro.it/a" ]
+  run bash -c "printf '' | bash '$T/vps-cf-purge' miosito.it"
+  [ "$(jq -r .error <<<"$output")" = "nessun indirizzo" ]
+  run bash -c "for i in \$(seq 31); do echo https://miosito.it/\$i; done | bash '$T/vps-cf-purge' miosito.it"
+  [ "$(jq -r .error <<<"$output")" = "troppi indirizzi: il limite è 30" ]
+  run bash "$T/vps-cf-purge" altro.it --all </dev/null
+  [ "$(jq -r .error <<<"$output")" = "zona non trovata: altro.it" ]
+  run bash "$T/vps-cf-purge" 'Miosito.it' --all </dev/null
+  [ "$(jq -r .error <<<"$output")" = "zona non valida" ]
+  run bash "$T/vps-cf-purge" miosito.it --boh </dev/null
+  [[ "$(jq -r .error <<<"$output")" == uso:* ]]
+  ! grep -qF purge_cache "$BATS_TEST_TMPDIR/curl.args"
+}
+
+@test "vps-cf-purge: rifiuto di Cloudflare riportato, senza Cloudflare attivo errore" {
+  _cf_ini; _cf_curl
+  echo '{"success":false,"errors":[{"code":1134,"message":"Too many requests"}]}' >"$BATS_TEST_TMPDIR/purge.json"
+  run bash -c "bash '$T/vps-cf-purge' miosito.it --all </dev/null 2>/dev/null"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "Cloudflare ha rifiutato la richiesta: Too many requests" ]
+  rm -f "$VPS_OPT/secrets/cloudflare.ini"
+  run bash -c "bash '$T/vps-cf-purge' miosito.it --all </dev/null 2>/dev/null"
+  [ "$(jq -r .error <<<"$output")" = "Cloudflare non è attivo su questa VPS" ]
 }
