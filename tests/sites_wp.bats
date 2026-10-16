@@ -152,6 +152,34 @@ setup() {
   grep -q "fastcgi_pass unix:/run/php/php$PHP_VERSION-fpm-site_blog_miosito_it.sock;" "$f"
 }
 
+@test "il vhost wordpress: SAMEORIGIN al posto di DENY, burst 60, regola per i file statici" {
+  site_reg_new blog.miosito.it wordpress no yes
+  site_vhost_add blog.miosito.it
+  f="$NGINX_CONF_D/blog.miosito.it.conf"
+  grep -qF 'add_header X-Frame-Options "SAMEORIGIN" always;' "$f"
+  grep -qF 'add_header Strict-Transport-Security "max-age=63072000" always;' "$f"
+  grep -qF 'add_header X-Content-Type-Options "nosniff" always;' "$f"
+  grep -qF 'add_header Referrer-Policy "strict-origin-when-cross-origin" always;' "$f"
+  run grep -c 'DENY\|security-headers.conf' "$f"
+  [ "$output" = 0 ]
+  grep -qF '    limit_req zone=req_limit_per_ip burst=60 nodelay;' "$f"
+  grep -qF 'location ~* \.(?:css|js|mjs|map|png|jpe?g|gif|webp|avif|svg|ico|woff2?|ttf|otf|eot)$' "$f"
+  grep -qF 'limit_req zone=req_limit_per_ip burst=200 nodelay;' "$f"
+  grep -qF 'expires 30d;' "$f"
+}
+
+@test "i vhost non wordpress restano con le intestazioni comuni e burst 20" {
+  for t in php static; do
+    site_reg_new "$t.miosito.it" "$t" no no
+    site_vhost_add "$t.miosito.it"
+    f="$NGINX_CONF_D/$t.miosito.it.conf"
+    grep -qF 'include /etc/nginx/snippets/security-headers.conf;' "$f"
+    grep -qF '    limit_req zone=req_limit_per_ip burst=20 nodelay;' "$f"
+    run grep -c SAMEORIGIN "$f"
+    [ "$output" = 0 ]
+  done
+}
+
 @test "wp-config: password con apice rifiutata, nessun file scritto / file invariato" {
   site_reg_new blog.miosito.it wordpress no yes
   mkdir -p "$SITES_WWW/blog.miosito.it/public"

@@ -49,7 +49,7 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | `/etc/nginx/nginx.conf` | template installer |
 | `/etc/nginx/conf.d/<pannello>.conf` | vhost pannello |
 | `/etc/nginx/snippets/ssl-params.conf` | TLS Mozilla intermediate |
-| `/etc/nginx/snippets/security-headers.conf` | header di sicurezza |
+| `/etc/nginx/snippets/security-headers.conf` | header di sicurezza (siti statici e PHP; i vhost WordPress scrivono le stesse intestazioni con `X-Frame-Options SAMEORIGIN` per il Customizer, `burst=60` e una regola per i file statici con `burst=200` e cache del browser di 30 giorni) |
 | `/etc/nginx/snippets/cloudflare-realip.conf` | generato da `vps-cf-ips-update` |
 | `/etc/nginx/snippets/acme.conf` | `location /.well-known/acme-challenge/` → `/var/www/_acme` |
 | `/etc/nginx/snippets/panel.d/pma.conf` | location `/pma/` nel vhost del pannello |
@@ -80,7 +80,7 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 
 ```json
 {
-  "installer_version": "1.4.0",
+  "installer_version": "1.4.1",
   "installed_at": "2026-10-07T15:30:00+02:00",
   "hostname": "vps-01",
   "ipv4": "203.0.113.10",

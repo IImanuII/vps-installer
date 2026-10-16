@@ -19,6 +19,15 @@
         deny all;
     }
 
+    # File statici: molti insieme a ogni pagina (temi, editor a blocchi), quindi un
+    # burst largo; cache del browser e niente log di accesso.
+    location ~* \.(?:css|js|mjs|map|png|jpe?g|gif|webp|avif|svg|ico|woff2?|ttf|otf|eot)$ {
+        limit_req zone=req_limit_per_ip burst=200 nodelay;
+        expires 30d;
+        access_log off;
+        try_files $uri =404;
+    }
+
     location / {
         try_files $uri $uri/ /index.php?$args;
     }

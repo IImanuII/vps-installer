@@ -258,6 +258,11 @@ c="$(code_of "$D1" /wp-login.php)"
 [[ "$c" == 404 ]] || fail "/wp-login.php: atteso 404, trovato $(get "$D1" /wp-login.php -o /dev/null -w '%{http_code} %{redirect_url}')"
 c="$(code_of "$D1" /xmlrpc.php)"
 [[ "$c" == 403 ]] || fail "/xmlrpc.php: atteso 403, trovato $c"
+# Intestazioni del vhost WordPress: SAMEORIGIN (Customizer), mai DENY; file statici con cache.
+hdr="$(get "$D1" / -D - -o /dev/null)"
+[[ "$hdr" == *"x-frame-options: SAMEORIGIN"* && "$hdr" != *DENY* ]] || fail "X-Frame-Options del sito WordPress: $(grep -i x-frame <<<"$hdr")"
+shdr="$(get "$D1" /wp-includes/css/dashicons.min.css -D - -o /dev/null)"
+[[ "$shdr" == *"HTTP/2 200"* && "$shdr" == *"cache-control: max-age=2592000"* ]] || fail "file statico senza cache: $shdr"
 # /wp-admin/ senza sessione: WPS Hide Login rimanda a /404; alla fine dei
 # redirect deve esserci un 404, senza mai passare dal percorso di login.
 wpadmin="$(get "$D1" /wp-admin/ -o /dev/null -w '%{http_code} %{redirect_url}')"

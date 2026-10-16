@@ -18,7 +18,7 @@ server {
     ssl_certificate /etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${SITE_DOMAIN}/privkey.pem;
     include /etc/nginx/snippets/ssl-params.conf;
-    include /etc/nginx/snippets/security-headers.conf;
+${SITE_HEADERS}
 
     root ${SITE_ROOT}/public;
     index index.php index.html;
@@ -26,7 +26,7 @@ server {
     access_log ${SITE_ROOT}/logs/access.log main;
     error_log ${SITE_ROOT}/logs/error.log error;
 
-    limit_req zone=req_limit_per_ip burst=20 nodelay;
+    limit_req zone=req_limit_per_ip burst=${SITE_BURST} nodelay;
 
     location ~ /\.(?!well-known) {
         deny all;

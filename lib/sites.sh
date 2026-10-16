@@ -368,6 +368,20 @@ site_vhost_add() {
     variant="$(site_reg_get "$d" .type)"
   fi
   SITE_BODY="$(site_tmpl_text "$VPS_TEMPLATES/nginx-site-$variant.inc.tmpl" SITE_DOMAIN SITE_SLUG PHP_VERSION)"
+  # WordPress: il Customizer apre il sito in un iframe dello stesso dominio, quindi
+  # X-Frame-Options SAMEORIGIN (le stesse intestazioni del file comune, scritte qui:
+  # con l'include si manderebbero sia DENY sia SAMEORIGIN). L'editor a blocchi e
+  # admin-ajax fanno molte richieste insieme: burst più largo.
+  if [[ "$variant" == wordpress ]]; then
+    SITE_HEADERS='    add_header Strict-Transport-Security "max-age=63072000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;'
+    SITE_BURST=60
+  else
+    SITE_HEADERS='    include /etc/nginx/snippets/security-headers.conf;'
+    SITE_BURST=20
+  fi
   if [[ "$(site_reg_get "$d" .www)" == true ]]; then
     SITE_NAMES="$d www.$d"
     SITE_WWW_BLOCK="$(site_tmpl_text "$VPS_TEMPLATES/nginx-site-www.inc.tmpl" SITE_DOMAIN)"
@@ -377,7 +391,7 @@ site_vhost_add() {
     cp -p "$f" "$bak"
   fi
   render_template "$VPS_TEMPLATES/nginx-site.conf.tmpl" "$f" 644 root:root \
-    SITE_DOMAIN SITE_NAMES SITE_ROOT SITE_BODY SITE_WWW_BLOCK || return 1
+    SITE_DOMAIN SITE_NAMES SITE_ROOT SITE_BODY SITE_WWW_BLOCK SITE_HEADERS SITE_BURST || return 1
   if nginx -t >>"$VPS_LOG" 2>&1; then
     rm -f "$bak"
     systemctl reload nginx || site_fail "Nginx non si è ricaricato"
