@@ -625,7 +625,7 @@ sent() {
   run round $((NOW + 180))
   run round $((NOW + 240))
   [ "$(grep -c '^restart redis-server$' "$T/systemctl.calls")" -eq 3 ]
-  [ "$(sent | grep -c 'riavvii sospesi')" -eq 1 ]
+  [ "$(sent | grep -c 'continua a cadere: riavvii automatici sospesi per un.ora')" -eq 1 ]
   [[ "$(sent | tail -n1)" == '🔴 vps-test: redis-server'* ]]
 }
 
@@ -760,4 +760,93 @@ sent() {
   [ "$status" -eq 0 ]
   [ "$SECONDS" -lt 10 ]
   [ "$(jq '[.checks | to_entries[] | select(.key | startswith("url:https://t")) | select(.value.fails == 1)] | length' "$MON_STATE")" -eq 20 ]
+}
+
+# --- Fix round 1 ---
+
+@test "fix: indirizzi con [ ] { } rifiutati (curl li espanderebbe)" {
+  bad '.urls[0].url = "https://trip4free.org/[1-99999999]"'
+  bad '.urls[0].url = "https://trip4free.org/{a,b}"'
+  bad '.urls[0].url = "https://trip4free.org/a]"'
+  bad '.urls[0].url = "https://trip4free.org/a}"'
+}
+
+@test "fix: curl degli indirizzi e di Healthchecks con -q --globoff, corpo al massimo 2 MiB" {
+  tool_env
+  mon_cfg '.urls = [{url:"https://a.test/",keyword:""}]'
+  run round "$NOW"
+  [ "$status" -eq 0 ]
+  # primo argomento di ogni chiamata a curl = -q (letto solo se primo)
+  [ "$(awk 'NR == 1 || p == "---" { n++; if ($0 == "-q") q++ } { p = $0 } END { print n - q }' "$T/curl.args")" -eq 0 ]
+  [ "$(grep -cxF -- '--globoff' "$T/curl.args")" -eq 3 ]
+  grep -A1 -xF -- '--max-filesize' "$T/curl.args" | grep -qxF 2097152
+  [ "$(head -n1 "$T/curl.args")" = -q ]
+}
+
+@test "fix: riavvio che non finisce = giro nei tempi, riavvio già salvato nello stato" {
+  tool_env
+  mon_cfg '.urls = []'
+  touch "$T/down.nginx"
+  echo 30 >"$T/restart.sleep"
+  SECONDS=0
+  MON_RESTART_TIMEOUT=1 run round "$NOW"
+  [ "$status" -eq 0 ]
+  [ "$SECONDS" -lt 10 ]
+  grep -qxF 'restart nginx' "$T/systemctl.calls"
+  jq -e --argjson n "$NOW" '.checks["service:nginx"].restarts == [$n]' "$T/state.snap"
+  jq -e --argjson n "$NOW" '.checks["service:nginx"].restarts == [$n]' "$MON_STATE"
+  ! pgrep -f 'sleep 30' >/dev/null
+}
+
+@test "fix: oltre il tempo del giro niente riavvii, controlli delle 6 ore né riepilogo; stato e ping sì" {
+  tool_env
+  mon_cfg '.urls = []'
+  N9="$(TZ=Europe/Rome date -d '2026-10-16 09:00:30' +%s)"
+  printf 'Listing...\na/stable 2 amd64 [upgradable from: 1]\n' >"$T/apt.out"
+  touch "$T/down.nginx"
+  MON_ROUND_S=0 run round "$N9"
+  [ "$status" -eq 0 ]
+  ! grep -q '^restart' "$T/systemctl.calls"
+  jq -e '.cursor.periodic == null and .summary_day == null and .last_run != null' "$MON_STATE"
+  jq -e 'has("checks") and (.checks | has("service:nginx") | not)' "$MON_STATE"
+  [ -z "$(sent)" ]
+  grep -qxF 'https://hc-ping.com/abc-123/slug_1' "$T/pings"
+  # al giro dopo, nei tempi, tutto riparte
+  run round $((N9 + 60))
+  grep -qxF 'restart nginx' "$T/systemctl.calls"
+  jq -e '.cursor.periodic != null and .summary_day != null' "$MON_STATE"
+}
+
+@test "fix: riavvii che falliscono, al quarto 'continua a cadere' una volta sola" {
+  tool_env
+  mon_cfg '.urls = []'
+  touch "$T/down.mariadb" "$T/norestart.mariadb"
+  for i in 0 1 2 3 4; do run round $((NOW + i * 60)); done
+  [ "$(grep -c '^restart mariadb$' "$T/systemctl.calls")" -eq 3 ]
+  [ "$(sent | grep -c 'mariadb fermo, riavvio non riuscito')" -eq 1 ]
+  [ "$(sent | grep -cxF "🔴 vps-test: mariadb continua a cadere: riavvii automatici sospesi per un'ora")" -eq 1 ]
+}
+
+@test "fix: fail2ban conta solo i Ban veri, non i Restore Ban" {
+  tool_env
+  mon_cfg '.urls = []'
+  for i in $(seq 1 25); do
+    echo "$(date -d "@$((NOW - 60))" '+%F %T'),123 fail2ban.actions [1]: NOTICE  [sshd] Restore Ban 10.0.0.$i"
+  done >"$MON_F2B_LOG"
+  run round "$NOW"
+  [[ "$(sent)" != *fail2ban* ]]
+  jq -e '.checks.f2b.value == 0' "$MON_STATE"
+}
+
+@test "fix: SSH solo dalle righe di sshd/sshd-session, righe contraffatte ignorate" {
+  tool_env
+  mon_cfg '.urls = []'
+  {
+    echo "$((NOW - 10)).1 vps sshd-session[7]: Accepted publickey for iimanuii from 1.2.3.4 port 5 ssh2"
+    echo "$((NOW - 9)).1 vps sshd[3]: Invalid user Accepted publickey for evil from 6.6.6.6 port 1 from 9.9.9.9 port 2"
+    echo "$((NOW - 8)).1 vps sshd[3]: Connection closed by invalid user x Accepted password for evil from 6.6.6.6 port 1"
+    echo "$((NOW - 7)).1 vps logger[9]: Accepted publickey for evil from 6.6.6.6 port 1 ssh2"
+  } >"$T/journal"
+  run round "$NOW"
+  [ "$(sent)" = '🔐 vps-test: accesso SSH di iimanuii da 1.2.3.4 (publickey)' ]
 }

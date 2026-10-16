@@ -58,7 +58,8 @@ def obj(m): if type == "object" then . else error(m) end;
               and ($u | utf8bytelength) <= 512
               and ($u | test("^https://[a-z0-9.-]+([/?#]|\\z)"))
               and ($u | test("[[:cntrl:][:space:]]") | not)
-           then . else error("indirizzo non valido (https, senza credenziali né spazi, al massimo 512 byte)") end) as $_u
+              and ($u | test("[\\[\\]{}]") | not)
+           then . else error("indirizzo non valido (https, senza credenziali, spazi o parentesi quadre o graffe, al massimo 512 byte)") end) as $_u
         | (if has("keyword") then .keyword else "" end) as $k
         | (if ($k | type) == "string" and ($k | utf8bytelength) <= 100 and ($k | nocntrl)
            then . else error("parola attesa non valida (al massimo 100 byte, senza caratteri di controllo)") end) as $_k

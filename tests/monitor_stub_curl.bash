@@ -6,10 +6,9 @@
 #   (predefinita "200 0.100 OK"); "sleep N" dorme N secondi ed esce 28 (timeout);
 # - altrimenti (ping di Healthchecks) l'indirizzo va in $T/pings.
 T="$BATS_TEST_TMPDIR"
-{
-  printf '%s\n' "$@"
-  echo ---
-} >>"$T/curl.args"
+# una sola scrittura: i controlli in parallelo non si mescolano
+args="$(printf '%s\n' "$@" ---)"
+printf '%s\n' "$args" >>"$T/curl.args"
 for a in "$@"; do
   if [[ "$a" == -K ]]; then
     cat >>"$T/curl.stdin"

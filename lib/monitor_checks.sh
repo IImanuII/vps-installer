@@ -18,6 +18,17 @@
 MON_PERIODIC_S=21600
 MON_SSH_MAX=10
 MON_RESTARTS_MAX=3
+# Tempo di un giro: oltre MON_ROUND_S secondi dall'inizio si rimandano al giro
+# dopo riavvii, controlli delle 6 ore e riepilogo (systemd ferma il giro a 55 s).
+: "${MON_ROUND_S:=40}"
+: "${MON_RESTART_TIMEOUT:=10}"
+# Corpo di una risposta: al massimo 2 MiB (non deve riempire /tmp).
+MON_MAX_BODY=2097152
+
+# _mon_late — vero se il tempo del giro (MON_DEADLINE) è finito.
+_mon_late() {
+  (($(date +%s) >= ${MON_DEADLINE:-0}))
+}
 
 # _mon_th CHIAVE — una soglia dalla configurazione del giro.
 _mon_th() {
@@ -118,7 +129,7 @@ _mon_fetch() {
   local out rc=0
   local -a extra=()
   if [[ -n "${4:-}" ]]; then extra=(--resolve "$4"); fi
-  out="$(curl -sS -o "$3.body" -w '%{http_code} %{time_total}' --max-time "$2" "${extra[@]}" "$1" 2>/dev/null)" || rc=$?
+  out="$(curl -q -sS --globoff --max-filesize "$MON_MAX_BODY" -o "$3.body" -w '%{http_code} %{time_total}' --max-time "$2" "${extra[@]}" "$1" 2>/dev/null)" || rc=$?
   printf '%s %s\n' "$rc" "${out:-000 0}" >"$3.res"
 }
 
@@ -156,7 +167,11 @@ mon_check_urls() {
     outcome=ok detail=""
     if ((rc != 0)); then
       outcome=fail
-      if ((rc == 28)); then detail="nessuna risposta in $to s"; else detail="errore di connessione"; fi
+      case "$rc" in
+        28) detail="nessuna risposta in $to s" ;;
+        63) detail="risposta oltre 2 MiB" ;;
+        *) detail="errore di connessione" ;;
+      esac
     elif [[ "$id" == health ]] && { [[ "$code" != 200 ]] || ! head -c 1048576 "$dir/$i.body" 2>/dev/null | grep -qF OK; }; then
       outcome=fail detail="HTTP $code"
     elif [[ "$code" == 000 ]] || ((10#$code >= 500)); then
@@ -211,9 +226,12 @@ _mon_svc_extra() {
 }
 
 # _mon_service NOME — attivo = ok; fermo = un riavvio (al massimo 3 l'ora,
-# poi "riavvii sospesi" finché non passa un'ora dall'ultimo).
+# poi "riavvii sospesi" finché non passa un'ora dall'ultimo). Il riavvio si
+# registra e si salva nello stato PRIMA di lanciarlo: un giro fermato da
+# systemd a metà non perde il conto dei riavvii. Oltre la scadenza del giro
+# il riavvio si rimanda al giro dopo.
 _mon_service() {
-  local s="$1" id="service:$1" old restarts n
+  local s="$1" id="service:$1" old restarts n was
   old="$(_mon_check_get "$id")"
   restarts="$(jq -c --argjson n "$MON_NOW_S" '[(.restarts // []) | if type == "array" then .[] else empty end
     | numbers | select(. > $n - 3600)]' <<<"$old" 2>/dev/null)" || restarts='[]'
@@ -225,16 +243,26 @@ _mon_service() {
   fi
   n="$(jq 'length' <<<"$restarts")"
   if ((n >= MON_RESTARTS_MAX)); then
+    was="$(jq -r '.suspended == true' <<<"$old" 2>/dev/null)" || was=false
     _mon_level "$id" down "$(_mon_svc_extra "$s" "$restarts" true)"
-    case "$MON_EV" in
-      new) _mon_say down "$s fermo: riavvii sospesi ($n nell'ultima ora)" ;;
-      remind) _mon_say down "$s ancora fermo da $(_mon_for) min (riavvii sospesi)" ;;
-    esac
+    if [[ "$was" != true ]]; then
+      _mon_say down "$s continua a cadere: riavvii automatici sospesi per un'ora"
+    elif [[ "$MON_EV" == remind ]]; then
+      _mon_say down "$s ancora fermo da $(_mon_for) min (riavvii sospesi)"
+    fi
+    return 0
+  fi
+  if _mon_late; then
+    MON_SEEN+=("$id")
+    log "vps-monitor: $s non attivo, riavvio rimandato al prossimo giro (tempo del giro finito)"
     return 0
   fi
   log "vps-monitor: $s non attivo, lo riavvio"
-  timeout 30 systemctl restart "$s" >>"$VPS_LOG" 2>&1 || true
   restarts="$(jq -c --argjson n "$MON_NOW_S" '. + [$n]' <<<"$restarts")"
+  _mon_st --arg id "$id" --argjson x "$(_mon_svc_extra "$s" "$restarts" false)" \
+    '.checks[$id] = ((.checks[$id] // {} | if type == "object" then . else {} end) + $x)'
+  mon_state_save "$MON_ST" || log "vps-monitor: stato non salvato"
+  timeout "$MON_RESTART_TIMEOUT" systemctl restart "$s" >>"$VPS_LOG" 2>&1 || true
   if systemctl is-active --quiet "$s"; then
     _mon_level "$id" ok "$(_mon_svc_extra "$s" "$restarts" false)"
     if [[ "$MON_EV" == up ]]; then
@@ -323,7 +351,9 @@ mon_check_resources() {
 # (cursore = ora del giro precedente; si contano le righe con cursore <= ora < adesso).
 mon_check_ssh() {
   local cur out line ts n=0
-  local re='Accepted ([a-z-]+(/[a-z]+)?) for ([^ ]+) from ([0-9a-fA-F:.]+)'
+  # Solo le righe scritte da sshd stesso (sshd o sshd-session di OpenSSH ≥ 9.8):
+  # un nome utente inventato dentro un'altra riga non deve generare avvisi.
+  local re=' sshd(-session)?\[[0-9]+\]: Accepted ([a-z-]+(/[a-z]+)?) for ([^ ]+) from ([0-9a-fA-F:.]+) port [0-9]+'
   cur="$(jq -r '.cursor.ssh // empty' <<<"$MON_ST")" || cur=""
   if ! [[ "$cur" =~ ^[0-9]+$ ]] || ((cur > MON_NOW_S || MON_NOW_S - cur > 86400)); then
     cur=$((MON_NOW_S - 60))
@@ -337,7 +367,7 @@ mon_check_ssh() {
     [[ "$line" =~ $re ]] || continue
     n=$((n + 1))
     if ((n <= MON_SSH_MAX)); then
-      _mon_say ssh "accesso SSH di ${BASH_REMATCH[3]} da ${BASH_REMATCH[4]} (${BASH_REMATCH[1]})"
+      _mon_say ssh "accesso SSH di ${BASH_REMATCH[4]} da ${BASH_REMATCH[5]} (${BASH_REMATCH[2]})"
     fi
   done <<<"$out"
   if ((n > MON_SSH_MAX)); then
@@ -353,7 +383,7 @@ mon_check_f2b() {
   mins="$(_mon_th f2b_minutes)"
   lim="$(_mon_th f2b_bans)"
   from="$(date -d "@$((MON_NOW_S - mins * 60))" '+%F %T')"
-  n="$(tail -n 20000 "$MON_F2B_LOG" | awk -v f="$from" 'substr($0, 1, 19) >= f && / Ban / { c++ } END { print c + 0 }')" || n=0
+  n="$(tail -n 20000 "$MON_F2B_LOG" | awk -v f="$from" 'substr($0, 1, 19) >= f && /\] Ban / { c++ } END { print c + 0 }')" || n=0
   [[ "$n" =~ ^[0-9]+$ ]] || n=0
   lvl=ok
   if ((n >= lim)); then lvl=warn; fi
@@ -375,6 +405,11 @@ mon_check_periodic() {
   if [[ "$last" =~ ^[0-9]+$ ]] && ((last <= MON_NOW_S && MON_NOW_S - last < MON_PERIODIC_S)); then
     return 1
   fi
+  # Oltre il tempo del giro si rimanda al giro dopo. Il cursore si salva prima
+  # dei controlli: un giro fermato a metà non li fa ripartire ogni minuto.
+  if _mon_late; then return 1; fi
+  _mon_st --argjson n "$MON_NOW_S" '.cursor.periodic = $n'
+  mon_state_save "$MON_ST" || log "vps-monitor: stato non salvato"
   cd="$(_mon_th cert_days)"
   for f in "$MON_LE_LIVE"/*/cert.pem; do
     [[ -f "$f" ]] || continue
@@ -396,7 +431,7 @@ mon_check_periodic() {
     esac
   done
   if [[ "$(jq -r '.cloudflare.enabled == true' "$(manifest_path)" 2>/dev/null)" == true ]]; then
-    out="$(timeout 30 "$VPS_OPT/bin/vps-cf-token" test 2>/dev/null)" || true
+    out="$(timeout 10 "$VPS_OPT/bin/vps-cf-token" test 2>/dev/null)" || true
     if [[ "$(jq -r '.ok == true' <<<"$out" 2>/dev/null)" == true ]]; then
       lvl=ok err=""
     else
@@ -410,7 +445,7 @@ mon_check_periodic() {
       up) _mon_say up "il token Cloudflare funziona di nuovo" ;;
     esac
   fi
-  _mon_st --argjson n "$MON_NOW_S" '.cursor.periodic = $n'
+  mon_state_save "$MON_ST" || log "vps-monitor: stato non salvato"
   return 0
 }
 
@@ -424,6 +459,7 @@ mon_check_summary() {
   [[ "$(TZ=Europe/Rome date -d "@$MON_NOW_S" +%H)" == 09 ]] || return 0
   day="$(TZ=Europe/Rome date -d "@$MON_NOW_S" +%F)"
   [[ "$(jq -r '.summary_day // ""' <<<"$MON_ST")" != "$day" ]] || return 0
+  if _mon_late; then return 0; fi
   _mon_st --arg d "$day" '.summary_day = $d'
   list="$(apt list --upgradable 2>/dev/null | grep -F 'upgradable from' || true)"
   upg=0 sec=0
@@ -465,6 +501,7 @@ mon_run() {
   local start hc periodic=no m seen
   start="$(date +%s)"
   MON_NOW_S="${MON_NOW:-$start}"
+  MON_DEADLINE=$((start + MON_ROUND_S))
   MON_CFG="$(mon_config_load)"
   [[ "$(jq -r '.enabled == true' <<<"$MON_CFG")" == true ]] || return 0
   MON_TH="$(jq -c '.thresholds' <<<"$MON_CFG")"
@@ -501,7 +538,7 @@ mon_run() {
   # segnale "la VPS è viva".
   hc="$(jq -r '.healthchecks_url // ""' <<<"$MON_CFG")"
   if [[ -n "$hc" ]]; then
-    curl -fsS --max-time 10 -o /dev/null "$hc" >/dev/null 2>&1 || log "vps-monitor: ping a Healthchecks.io non riuscito"
+    curl -q -fsS --globoff --max-time 10 -o /dev/null "$hc" >/dev/null 2>&1 || log "vps-monitor: ping a Healthchecks.io non riuscito"
   fi
   if mon_telegram_ok "$MON_CFG"; then
     mon_flush_queue 10 $((start + 44))
