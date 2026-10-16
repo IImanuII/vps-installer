@@ -80,7 +80,7 @@ def obj(m): if type == "object" then . else error(m) end;
           else error("soglia non valida: " + $e.key) end)) as $_g
     | (if $th.disk_warn_pct < $th.disk_crit_pct then . else error("disk_warn_pct deve essere minore di disk_crit_pct") end) as $_h
     | {enabled: $en, telegram: {bot_token: $tok, chat_id: $chat}, healthchecks_url: $hc,
-       urls: $nurls, thresholds: $th}
+       urls: $nurls, thresholds: ($th | map_values(floor))}
   ) catch {err: .}
 '
 
@@ -112,7 +112,13 @@ mon_validate_config() {
 mon_config_load() {
   local out
   if [[ -f "$MON_CONFIG" ]] &&
-    out="$(jq -c --argjson d "$(mon_defaults)" 'if type == "object" then $d * . else error("no") end' "$MON_CONFIG" 2>/dev/null)"; then
+    out="$(jq -c --argjson d "$(mon_defaults)" '
+      def dn: with_entries(select(.value != null));
+      if type == "object" then
+        dn | (if (.telegram | type) == "object" then .telegram |= dn else del(.telegram) end)
+        | (if (.thresholds | type) == "object" then .thresholds |= dn else del(.thresholds) end)
+        | $d * .
+      else error("no") end' "$MON_CONFIG" 2>/dev/null)"; then
     printf '%s\n' "$out"
   else
     mon_defaults
@@ -144,7 +150,8 @@ mon_state_save() {
 # mon_transition STATO_CHECK ESITO ORA SOGLIE — funzione pura. ESITO: ok|fail|slow.
 # Stampa {"check":{state,fails,slows,since,last_alert},"event":"down|up|slow|remind|none","duration_s":N}.
 # since = ora del primo esito negativo del problema. Uno "slow" su un controllo
-# già giù non lo fa rientrare (serve un ok). Stato o soglie illeggibili = valori
+# già giù non lo fa rientrare (serve un ok) e non produce promemoria (voluto: il
+# promemoria di un controllo giù nasce dai nuovi "fail"). Stato o soglie illeggibili = valori
 # predefiniti (stato nuovo; fail_count 2, slow_count 5, remind_min 30).
 mon_transition() {
   jq -nc --arg s "${1-}" --arg o "${2-}" --arg now "${3-}" --arg th "${4-}" '
@@ -158,7 +165,7 @@ mon_transition() {
     | ($s | fromjson? // {} | obj) as $x
     | {state: (if $x.state == "down" or $x.state == "warn" then $x.state else "ok" end),
        fails: num($x.fails; 0), slows: num($x.slows; 0),
-       since: $x.since, last_alert: $x.last_alert} as $c
+       since: num($x.since; null), last_alert: num($x.last_alert; null)} as $c
     | def due($d): $d.last_alert == null or ($n - $d.last_alert) >= $rm * 60;
       (if $o == "ok" then
         if $c.state != "ok" then
@@ -183,7 +190,12 @@ mon_transition() {
     | .duration_s = (.duration_s // 0)' 2>/dev/null
 }
 
-# mon_message TIPO TESTO — "<emoji> <hostname>: <testo>".
+# _mon_trunc TESTO — al massimo 3900 caratteri (sotto il limite di Telegram, 4096).
+_mon_trunc() {
+  jq -nr --arg t "$1" '$t[0:3900]'
+}
+
+# mon_message TIPO TESTO — "<emoji> <hostname>: <testo>" (testo troncato a 3900 caratteri).
 mon_message() {
   local emoji
   case "$1" in
@@ -195,27 +207,43 @@ mon_message() {
     test) emoji="✅" ;;
     *) emoji="ℹ️" ;;
   esac
-  printf '%s %s: %s\n' "$emoji" "$(hostname)" "$2"
+  _mon_trunc "$(printf '%s %s: %s' "$emoji" "$(hostname)" "$2")"
 }
 
-# mon_send TESTO — 0 se Telegram ha accettato il messaggio. Il token sta
-# nell'indirizzo: passa a curl da stdin (-K -), mai negli argomenti.
+# mon_send TESTO — il token sta nell'indirizzo: passa a curl da stdin (-K -),
+# mai negli argomenti. Codici: 0 inviato; 1 errore transitorio (curl, 429, 5xx,
+# risposta senza JSON, configurazione mancante o non valida: curl non viene
+# chiamato); 2 rifiuto permanente (error_code 400/403/404, testo vuoto).
 mon_send() {
-  local cfg tok chat resp
+  local cfg tok chat resp text code
   cfg="$(mon_config_load)"
   tok="$(jq -r '.telegram.bot_token // empty' <<<"$cfg")"
   chat="$(jq -r '.telegram.chat_id // empty' <<<"$cfg")"
   [[ -n "$tok" && -n "$chat" ]] || return 1
+  # Difesa in profondità: niente virgolette o a capo nella configurazione di curl.
+  [[ "$tok" =~ ^[0-9]{5,15}:[A-Za-z0-9_-]{30,60}$ ]] || return 1
+  [[ "$chat" =~ ^-?[0-9]{1,20}$ ]] || return 1
+  text="$(_mon_trunc "$1")"
+  [[ -n "$text" ]] || return 2
   resp="$(printf 'url = "%s/bot%s/sendMessage"\n' "$TELEGRAM_API" "$tok" \
-    | curl -sS --max-time 10 -K - --data-urlencode "chat_id=$chat" --data-urlencode "text=$1" 2>/dev/null)" || return 1
-  jq -e '.ok == true' >/dev/null 2>&1 <<<"$resp"
+    | curl -sS --max-time 10 -K - --data-urlencode "chat_id=$chat" --data-urlencode "text=$text" 2>/dev/null)" || return 1
+  if jq -e '.ok == true' >/dev/null 2>&1 <<<"$resp"; then
+    return 0
+  fi
+  code="$(jq -r '.error_code // empty' 2>/dev/null <<<"$resp")" || code=""
+  case "$code" in
+    400 | 403 | 404) return 2 ;;
+    *) return 1 ;;
+  esac
 }
 
-# mon_enqueue TESTO — accoda un messaggio non consegnato (al massimo 500, i più vecchi si scartano).
+# mon_enqueue TESTO — accoda un messaggio non consegnato (al massimo 500, i più
+# vecchi si scartano); elimina i temporanei abbandonati da più di un'ora.
 mon_enqueue() {
   local name tmp n
   local -a files
   install -d -m 700 "$MON_STATE_DIR" "$MON_QUEUE"
+  find "$MON_QUEUE" -maxdepth 1 -name '.tmp.*' -mmin +60 -delete 2>/dev/null || true
   name="$(date +%s%N)"
   while [[ -e "$MON_QUEUE/$name" ]]; do name=$((name + 1)); done
   tmp="$MON_QUEUE/.tmp.$name"
@@ -232,21 +260,31 @@ mon_enqueue() {
   return 0
 }
 
-# mon_flush_queue [MAX] — invia i messaggi in coda dal più vecchio; si ferma al
-# primo fallimento o dopo MAX invii (default 20). Ritorna sempre 0.
+# mon_flush_queue [MAX] [SCADENZA_EPOCH] — invia i messaggi in coda dal più
+# vecchio. Si ferma al primo errore transitorio, dopo MAX tentativi (default 20)
+# o quando l'ora raggiunge SCADENZA_EPOCH (se data). I rifiuti permanenti e i
+# file vuoti vengono eliminati. Ritorna sempre 0.
 mon_flush_queue() {
-  local max="${1:-20}" f sent=0 msg
+  local max="${1:-20}" deadline="${2:-}" f tries=0 msg rc
   [[ -d "$MON_QUEUE" ]] || return 0
   for f in "$MON_QUEUE"/[0-9]*; do
     [[ -f "$f" ]] || continue
-    ((sent < max)) || break
-    msg="$(cat "$f")"
-    if mon_send "$msg"; then
+    if [[ ! -s "$f" ]]; then
       rm -f "$f"
-      sent=$((sent + 1))
-    else
+      continue
+    fi
+    ((tries < max)) || break
+    if [[ -n "$deadline" ]] && (($(date +%s) >= deadline)); then
       break
     fi
+    tries=$((tries + 1))
+    msg="$(cat "$f")"
+    rc=0
+    mon_send "$msg" || rc=$?
+    case "$rc" in
+      0 | 2) rm -f "$f" ;;
+      *) break ;;
+    esac
   done
   return 0
 }

@@ -316,3 +316,123 @@ with_telegram() { base_cfg >"$MON_CONFIG"; }
   run mon_flush_queue
   [ "$status" -eq 0 ]
 }
+
+@test "fix: soglie float normalizzate a interi nella configurazione salvata" {
+  c="$(base_cfg | jq -c '.thresholds.fail_count = 2.0 | .thresholds.f2b_bans = 20.0')"
+  run mon_validate_config "$c" '{}'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"fail_count":2,'* ]]
+  [[ "$output" == *'"f2b_bans":20,'* ]]
+  [[ "$output" != *'.0'* ]]
+}
+
+@test "mon_message: testo troncato a 3900 caratteri" {
+  t="$(printf 'è%.0s' {1..5000})"
+  m="$(mon_message down "$t")"
+  [ "$(printf %s "$m" | wc -m)" -eq 3900 ]
+}
+
+@test "mon_send: testo lungo troncato, vuoto = permanente senza curl" {
+  with_telegram
+  curl_stub '{"ok":true}'
+  mon_send "$(printf 'a%.0s' {1..5000})"
+  t="$(grep '^text=' "$BATS_TEST_TMPDIR/curl.args")"
+  [ "${#t}" -eq 3905 ]
+  : >"$BATS_TEST_TMPDIR/curl.args"
+  run mon_send ""
+  [ "$status" -eq 2 ]
+  [ ! -s "$BATS_TEST_TMPDIR/curl.args" ]
+}
+
+@test "mon_send: codici 1 transitorio, 2 permanente" {
+  with_telegram
+  curl_stub '{"ok":false,"error_code":400,"description":"x"}'
+  run mon_send x
+  [ "$status" -eq 2 ]
+  curl_stub '{"ok":false,"error_code":403}'
+  run mon_send x
+  [ "$status" -eq 2 ]
+  curl_stub '{"ok":false,"error_code":404}'
+  run mon_send x
+  [ "$status" -eq 2 ]
+  curl_stub '{"ok":false,"error_code":429}'
+  run mon_send x
+  [ "$status" -eq 1 ]
+  curl_stub '{"ok":false,"error_code":502}'
+  run mon_send x
+  [ "$status" -eq 1 ]
+  curl_stub 'nojson'
+  run mon_send x
+  [ "$status" -eq 1 ]
+  curl_stub '' 7
+  run mon_send x
+  [ "$status" -eq 1 ]
+}
+
+@test "mon_send: token o chat_id non validi nel file = 1 senza chiamare curl" {
+  base_cfg | jq '.telegram.bot_token = "1\"\nurl = \"file:///etc/passwd"' >"$MON_CONFIG"
+  curl_stub '{"ok":true}'
+  run mon_send x
+  [ "$status" -eq 1 ]
+  [ ! -e "$BATS_TEST_TMPDIR/curl.args" ]
+  base_cfg | jq '.telegram.chat_id = "12 34"' >"$MON_CONFIG"
+  run mon_send x
+  [ "$status" -eq 1 ]
+  [ ! -e "$BATS_TEST_TMPDIR/curl.args" ]
+}
+
+@test "mon_flush_queue: il permanente e il vuoto vengono eliminati, si prosegue" {
+  with_telegram
+  mon_enqueue "veleno"
+  : >"$MON_QUEUE/1"
+  mon_enqueue "buono"
+  # il primo invio risponde 400, il secondo ok
+  make_stub curl 'cat >/dev/null; n=$(cat "$BATS_TEST_TMPDIR/n" 2>/dev/null || echo 0); echo $((n+1)) >"$BATS_TEST_TMPDIR/n"
+if [ "$n" = 0 ]; then printf "{\"ok\":false,\"error_code\":400}"; else printf "{\"ok\":true}"; fi'
+  mon_flush_queue
+  [ "$(find "$MON_QUEUE" -type f | wc -l)" -eq 0 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/n")" -eq 2 ]
+}
+
+@test "mon_flush_queue: MAX conta i tentativi, non solo i successi" {
+  with_telegram
+  make_stub curl 'cat >/dev/null; echo x >>"$BATS_TEST_TMPDIR/calls"; printf "{\"ok\":false,\"error_code\":400}"'
+  for i in 1 2 3 4 5; do mon_enqueue "m$i"; done
+  mon_flush_queue 3
+  [ "$(wc -l <"$BATS_TEST_TMPDIR/calls")" -eq 3 ]
+  [ "$(find "$MON_QUEUE" -type f | wc -l)" -eq 2 ]
+}
+
+@test "mon_flush_queue: la scadenza ferma l'invio (curl lento)" {
+  with_telegram
+  make_stub curl 'cat >/dev/null; sleep 2; echo x >>"$BATS_TEST_TMPDIR/calls"; printf "{\"ok\":true}"'
+  for i in 1 2 3 4 5; do mon_enqueue "m$i"; done
+  mon_flush_queue 20 $(($(date +%s) + 1))
+  [ "$(wc -l <"$BATS_TEST_TMPDIR/calls")" -eq 1 ]
+  [ "$(find "$MON_QUEUE" -type f | wc -l)" -eq 4 ]
+}
+
+@test "mon_transition: since e last_alert corrotti non danno errore" {
+  r="$(mon_transition '{"state":"down","fails":1,"since":"x","last_alert":"y"}' fail 1000 "$TH")"
+  [ "$(jq -r .event <<<"$r")" = remind ]
+  r="$(mon_transition '{"state":"down","since":"x"}' ok 1000 "$TH")"
+  [ "$(jq -r .event <<<"$r")" = up ]
+  [ "$(jq -r .duration_s <<<"$r")" = 0 ]
+}
+
+@test "mon_config_load: null nel file non sovrascrive i predefiniti" {
+  echo '{"enabled":true,"urls":null,"thresholds":null,"telegram":null}' >"$MON_CONFIG"
+  r="$(mon_config_load)"
+  jq -e '.enabled == true and .urls == [] and .thresholds.fail_count == 2 and .telegram.chat_id == ""' <<<"$r"
+  echo '{"thresholds":{"fail_count":null,"timeout_s":7},"telegram":{"chat_id":null}}' >"$MON_CONFIG"
+  jq -e '.thresholds.fail_count == 2 and .thresholds.timeout_s == 7 and .telegram.chat_id == ""' <<<"$(mon_config_load)"
+}
+
+@test "mon_enqueue: temporanei vecchi di oltre un'ora eliminati" {
+  mon_enqueue a
+  touch -d '2 hours ago' "$MON_QUEUE/.tmp.vecchio"
+  touch "$MON_QUEUE/.tmp.recente"
+  mon_enqueue b
+  [ ! -e "$MON_QUEUE/.tmp.vecchio" ]
+  [ -e "$MON_QUEUE/.tmp.recente" ]
+}
