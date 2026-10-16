@@ -340,6 +340,35 @@ wp_opts=(--title "Il blog" --admin-user gestore --admin-email io@miosito.it --lo
   [ "$(jq -r '.site.placeholder' <<<"$output")" = false ]
 }
 
+@test "list: index.html collegato a una FIFO, risposta subito con placeholder false" {
+  vs create blog.miosito.it --type php
+  bash "$T" _run create blog.miosito.it
+  pub="$SITES_WWW/blog.miosito.it/public"
+  rm "$pub/index.html"
+  mkfifo "$BATS_TEST_TMPDIR/fifo"
+  ln -s "$BATS_TEST_TMPDIR/fifo" "$pub/index.html"
+  run --separate-stderr timeout 10 bash "$T" list
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '.sites[0].placeholder' <<<"$output")" = false ]
+}
+
+@test "list: siti statici, WordPress o non attivi hanno placeholder false senza leggere public/" {
+  vs create blog.miosito.it --type static
+  bash "$T" _run create blog.miosito.it
+  vs create php.miosito.it --type php
+  bash "$T" _run create php.miosito.it
+  vs disable php.miosito.it
+  : >"$CALLS"
+  vs list
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '[.sites[].placeholder] | unique | join(",")' <<<"$output")" = false ]
+  ! grep -q '^runuser' "$CALLS"
+  site_reg_update php.miosito.it '.type = "wordpress" | .state = "active"'
+  vs list
+  [ "$(jq -r '[.sites[].placeholder] | unique | join(",")' <<<"$output")" = false ]
+  ! grep -q '^runuser' "$CALLS"
+}
+
 @test "WordPress richiede Redis con le ACL" {
   jq '.components.redis_acl = false' "$VPS_OPT/manifest.json" >"$BATS_TEST_TMPDIR/m" && mv "$BATS_TEST_TMPDIR/m" "$VPS_OPT/manifest.json"
   run --separate-stderr bash -c "printf 'Password-db-1234567890\nPassword-admin-wp-12345\n' | bash '$T' create miosito.it --type wordpress --title 'Il blog' --admin-user gestore --admin-email io@miosito.it --login-path accesso-7k2f"

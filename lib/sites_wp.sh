@@ -32,12 +32,18 @@ site_wp_valid_path() {
 
 # site_placeholder_intact DOMINIO — public/ contiene solo il segnaposto di vps-site:
 # WordPress si installa solo lì, mai sopra un sito con file veri.
+# public/ è del sito: root non apre mai index.html (un link a /dev/zero o una FIFO
+# messi lì apposta lo bloccherebbero o gli riempirebbero la memoria). Lo legge
+# l'utente del sito, al massimo 8 KiB e per al massimo 5 s; find si ferma al
+# primo file in più, così una cartella enorme non costa nulla.
 site_placeholder_intact() {
-  local pub
+  local pub slug
   pub="$(site_root "$1")/public"
+  slug="$(site_reg_get "$1" .slug)"
+  [[ -n "$slug" ]] || return 1
   [[ -f "$pub/index.html" && ! -L "$pub/index.html" ]] || return 1
-  [[ "$(find "$pub" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ]] || return 1
-  grep -qF "$SITE_PLACEHOLDER_MARK" "$pub/index.html"
+  [[ -z "$(find "$pub" -mindepth 1 -maxdepth 1 ! -name index.html -print -quit 2>/dev/null)" ]] || return 1
+  timeout 5 runuser -u "$slug" -- head -c 8192 -- "$pub/index.html" 2>/dev/null | grep -qF -- "$SITE_PLACEHOLDER_MARK"
 }
 
 # site_wp_config_write DOMINIO DB_PASSWORD REDIS_PASSWORD — wp-config.php nella

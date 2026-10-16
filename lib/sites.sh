@@ -780,9 +780,12 @@ site_refresh_locked() {
 
 # site_reg_json_full FILE — il registro con `placeholder`: true se public/ ha ancora
 # solo il segnaposto (il pannello decide da lì se offrire "installa WordPress").
+# Si guarda public/ solo per i siti PHP attivi, gli unici su cui wp-install è
+# ammesso: per gli altri è false senza toccare il disco (il pannello chiede la
+# lista ogni 3 s).
 site_reg_json_full() {
   local d p=false
-  d="$(jq -r '.domain // empty' "$1")"
+  d="$(jq -r 'select(.type == "php" and .state == "active") | .domain // empty' "$1")"
   if [[ -n "$d" ]] && site_placeholder_intact "$d"; then p=true; fi
   jq --argjson p "$p" '. + {placeholder: $p}' "$1"
 }

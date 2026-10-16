@@ -558,3 +558,54 @@ exec "$BATS_TEST_TMPDIR/bin/wp.orig" "$@"'
   [ "$(site_reg_get blog.miosito.it .state)" = error ]
   grep -q 'return 503' "$NGINX_CONF_D/blog.miosito.it.conf"
 }
+
+@test "site_placeholder_intact: index.html che punta a una FIFO non blocca" {
+  site_reg_new blog.miosito.it php no yes
+  site_user_add blog.miosito.it
+  pub="$SITES_WWW/blog.miosito.it/public"
+  rm "$pub/index.html"
+  mkfifo "$BATS_TEST_TMPDIR/fifo"
+  ln -s "$BATS_TEST_TMPDIR/fifo" "$pub/index.html"
+  SECONDS=0
+  run ! site_placeholder_intact blog.miosito.it
+  rm "$pub/index.html"
+  mkfifo "$pub/index.html"
+  run ! site_placeholder_intact blog.miosito.it
+  ((SECONDS < 3))
+}
+
+@test "site_placeholder_intact: una lettura che si blocca (scambio con una FIFO) finisce entro 5 s" {
+  site_reg_new blog.miosito.it php no yes
+  site_user_add blog.miosito.it
+  # L'utente del sito che legge resta appeso: timeout lo ferma.
+  make_stub runuser 'exec sleep 60'
+  SECONDS=0
+  run ! site_placeholder_intact blog.miosito.it
+  ((SECONDS < 10))
+}
+
+@test "site_placeholder_intact: il marcatore lo legge l'utente del sito, al massimo 8 KiB" {
+  site_reg_new blog.miosito.it php no yes
+  site_user_add blog.miosito.it
+  pub="$SITES_WWW/blog.miosito.it/public"
+  : >"$CALLS"
+  site_placeholder_intact blog.miosito.it
+  grep -qx 'runuser -u site_blog_miosito_it' "$CALLS"
+  # Marcatore oltre i primi 8 KiB: non letto.
+  { head -c 9000 /dev/zero | tr '\0' x; cat "$pub/index.html"; } >"$BATS_TEST_TMPDIR/grande.html"
+  cp "$BATS_TEST_TMPDIR/grande.html" "$pub/index.html"
+  run ! site_placeholder_intact blog.miosito.it
+}
+
+@test "site_placeholder_intact: con molti file find si ferma al primo" {
+  site_reg_new blog.miosito.it php no yes
+  site_user_add blog.miosito.it
+  pub="$SITES_WWW/blog.miosito.it/public"
+  for i in $(seq 1 300); do : >"$pub/f$i.html"; done
+  # shellcheck disable=SC2016
+  make_stub find 'echo "find $*" >>"$CALLS"; exec /usr/bin/find "$@"'
+  : >"$CALLS"
+  run ! site_placeholder_intact blog.miosito.it
+  grep -q -- '-print -quit' "$CALLS"
+  ! grep -q '^runuser' "$CALLS"
+}
