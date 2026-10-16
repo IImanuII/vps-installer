@@ -166,3 +166,22 @@ esac'
   run bash -c "bash '$T/vps-cf-purge' miosito.it --all </dev/null 2>/dev/null"
   [ "$(jq -r .error <<<"$output")" = "Cloudflare non è attivo su questa VPS" ]
 }
+
+@test "vps-cf-purge: più di 40000 byte su stdin sono troppi indirizzi" {
+  _cf_ini; _cf_curl
+  run bash -c "{ echo https://miosito.it/a; head -c 40010 /dev/zero | tr '\0' x; } | bash '$T/vps-cf-purge' miosito.it 2>/dev/null"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "troppi indirizzi: il limite è 30" ]
+  ! grep -qF purge_cache "$BATS_TEST_TMPDIR/curl.args"
+}
+
+@test "vps-cf-purge: rete assente e zona assente hanno errori diversi" {
+  _cf_ini
+  make_stub curl 'exit 7'
+  run bash -c "bash '$T/vps-cf-purge' miosito.it --all </dev/null 2>/dev/null"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "Cloudflare non risponde" ]
+  _cf_curl
+  run bash -c "bash '$T/vps-cf-purge' altro.it --all </dev/null 2>/dev/null"
+  [ "$(jq -r .error <<<"$output")" = "zona non trovata: altro.it" ]
+}

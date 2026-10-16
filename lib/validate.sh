@@ -63,7 +63,7 @@ valid_cf_token() {
 # https (schema in qualunque maiuscola), niente spazi o caratteri di controllo,
 # niente credenziali né porta, host = ZONA o un suo sottodominio a etichette intere.
 valid_purge_url() {
-  local u="$1" z="$2" rest host
+  local LC_ALL=C u="$1" z="$2" rest host
   ((${#u} >= 9 && ${#u} <= 1024)) || return 1
   [[ "$u" != *[[:space:][:cntrl:]]* ]] || return 1
   [[ "${u:0:8}" =~ ^[Hh][Tt][Tt][Pp][Ss]://$ ]] || return 1

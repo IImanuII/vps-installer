@@ -33,10 +33,11 @@ cf_find_zone() {
   return 1
 }
 
-# cf_zone_id ZONA → id della zona attiva con esattamente quel nome (1 se assente).
+# cf_zone_id ZONA → id della zona attiva con esattamente quel nome
+# (1 se assente, 2 se Cloudflare non risponde).
 cf_zone_id() {
   local resp id
-  resp="$(cf_api GET "/zones?name=$1&status=active")" || return 1
+  resp="$(cf_api GET "/zones?name=$1&status=active")" || return 2
   id="$(jq -r '.result[0].id // empty' <<<"$resp" 2>/dev/null || true)"
   [[ -n "$id" ]] || return 1
   printf '%s\n' "$id"

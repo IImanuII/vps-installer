@@ -14,6 +14,7 @@ if [[ -n "${SUDO_USER:-}" ]]; then
 fi
 : "${VPS_OPT:=/opt/vps}" "${VPS_LOG:=/var/log/vps-tools.log}"
 : "${VPS_TEMPLATES:=$VPS_OPT/templates}"
+export LC_ALL=C
 for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
   # shellcheck source=/dev/null
   source "$_lib"
@@ -39,10 +40,13 @@ if [[ "$all" == yes ]]; then
   n=all
 else
   urls=()
+  # Si leggono 40001 byte: se arrivano più di 40000 l'elenco è troppo lungo.
+  dati="$(read_stdin_limited 40001)"
+  ((${#dati} <= 40000)) || json_err "troppi indirizzi: il limite è 30"
   while IFS= read -r riga || [[ -n "$riga" ]]; do
     riga="$(trim "$riga")"
     if [[ -n "$riga" ]]; then urls+=("$riga"); fi
-  done < <(read_stdin_limited 40000)
+  done <<<"$dati"
   ((${#urls[@]} >= 1)) || json_err "nessun indirizzo"
   ((${#urls[@]} <= 30)) || json_err "troppi indirizzi: il limite è 30"
   for u in "${urls[@]}"; do
@@ -52,7 +56,10 @@ else
   n="${#urls[@]}"
 fi
 
-zid="$(cf_zone_id "$zone")" || json_err "zona non trovata: $zone"
+zrc=0
+zid="$(cf_zone_id "$zone")" || zrc=$?
+if ((zrc == 2)); then json_err "Cloudflare non risponde"; fi
+if ((zrc != 0)); then json_err "zona non trovata: $zone"; fi
 resp="$(cf_api POST "/zones/$zid/purge_cache" "$body")" || json_err "Cloudflare non risponde"
 if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$resp"; then
   msg="$(jq -r '[.errors[]?.message] | join("; ")' <<<"$resp" 2>/dev/null || true)"

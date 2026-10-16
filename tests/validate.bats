@@ -122,3 +122,9 @@ setup() {
   run valid_purge_url "https://arcomy.com/$(printf 'a%.0s' {1..1010})" arcomy.com; [ "$status" -ne 0 ]
   run valid_purge_url "" arcomy.com; [ "$status" -ne 0 ]
 }
+
+@test "valid_purge_url conta byte, anche con una locale UTF-8" {
+  export LC_ALL=C.UTF-8
+  run valid_purge_url "https://arcomy.com/$(printf 'é%.0s' {1..1000})" arcomy.com; [ "$status" -ne 0 ]
+  valid_purge_url "https://arcomy.com/caffé" arcomy.com
+}
