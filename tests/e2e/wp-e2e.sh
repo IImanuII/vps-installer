@@ -228,6 +228,13 @@ grep -qxF "aclfile $REDIS_ACL_FILE" "$REDIS_CONF" || fail "aclfile non in redis.
 # Seconda esecuzione: idempotente, niente riavvio, solo ACL LOAD.
 vlib redis_acl_setup || fail "redis_acl_setup (seconda volta)"
 [[ "$(grep -c '^aclfile ' "$REDIS_CONF")" == 1 ]] || fail "aclfile ripetuto in redis.conf"
+# Cache limitata: se il redis.conf di WSL non ha maxmemory lo aggiunge la prima volta.
+if ! grep -qE '^[[:space:]]*maxmemory[[:space:]]' "$REDIS_BAK"; then
+  [[ "$(grep -cx 'maxmemory 256mb' "$REDIS_CONF")" == 1 ]] || fail "maxmemory 256mb non aggiunto una volta sola"
+  mm="$(REDISCLI_AUTH="$(head -n 1 "$REDIS_ADMIN_SECRET")" redis-cli --no-auth-warning --user vps-admin CONFIG GET maxmemory-policy | tail -n 1)"
+  echo "   maxmemory-policy: $mm"
+  [[ "$mm" == allkeys-lru ]] || fail "maxmemory-policy: $mm"
+fi
 
 echo "== crea $D1 (WordPress)"
 s1="site_${D1//./_}"
@@ -289,7 +296,8 @@ out="$(rs KEYS 'altro:*')"
 echo "   KEYS altro:* come sito: ${out:-<vuoto>}"
 [[ -z "$out" || "$out" == *NOPERM* ]] || fail "KEYS altro:* restituisce chiavi: $out"
 # Comandi @dangerous/@admin (DEBUG no: Redis lo rifiuta comunque, con ERR).
-for cmd in "FLUSHALL" "FLUSHDB" "CONFIG GET maxmemory" "ACL LIST" "CLIENT LIST"; do
+# SCRIPT KILL/FLUSH e FUNCTION agiscono su tutto Redis: tolti anche quelli.
+for cmd in "FLUSHALL" "FLUSHDB" "CONFIG GET maxmemory" "ACL LIST" "CLIENT LIST" "SCRIPT FLUSH" "SCRIPT KILL" "FUNCTION FLUSH" "FUNCTION LIST"; do
   # shellcheck disable=SC2086
   out="$(rs $cmd)"
   [[ "$out" == *NOPERM* ]] || fail "$cmd non rifiutato al sito: $out"
@@ -398,5 +406,11 @@ tarf="$(compgen -G "$SITES_BACKUPS/$D1-*.tar.gz" | head -n1)"
 [[ "$(tar -tzf "$tarf")" == *"$D1/wp-config.php"* ]] || fail "wp-config.php non è nell'archivio"
 sqlf="$(compgen -G "$SITES_BACKUPS/$D1-*.sql.gz" | head -n1)"
 [[ "$(zcat "$sqlf")" == *wp_options* ]] || fail "il dump non contiene le tabelle di WordPress"
+
+# Le password non finiscono mai nel registro degli strumenti.
+for v in WPPASS DBPASS DBPASS2; do
+  ! grep -qF -- "${!v}" "$VPS_LOG" \
+    || fail "$v è finita in $VPS_LOG: $(grep -nF -- "${!v}" "$VPS_LOG" | sed "s/${!v}/<$v>/g" | head -n 3)"
+done
 
 echo "E2E WORDPRESS OK"

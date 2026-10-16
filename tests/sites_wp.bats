@@ -232,6 +232,10 @@ wp_args() { # DOMINIO [cloudflare true|false]
   grep -q 'Password-admin-wp-12345' "$BATS_TEST_TMPDIR/wp.stdin"
   run grep -c 'Password-admin-wp-12345\|Password-db-1234567890' "$CALLS"
   [ "$output" = 0 ]
+  # WP-CLI con --prompt ristampa la password: nel registro arriva nascosta.
+  run grep -c 'Password-admin-wp-12345\|Password-db-1234567890' "$VPS_LOG"
+  [ "$output" = 0 ]
+  grep -qF -- '--admin_password=<password nascosta>' "$VPS_LOG"
   grep -q 'wp --path=.* plugin install wps-hide-login redis-cache --activate' "$CALLS"
   grep -q 'wp --path=.* option update whl_page accesso-7k2f' "$CALLS"
   # permalink belli: senza, /wp-login.php finisce sulla home con 200 invece di 404

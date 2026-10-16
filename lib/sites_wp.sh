@@ -213,7 +213,7 @@ site_wp_args_read() {
 # site_wp_install_files DOMINIO DB_PASSWORD — passo "wp": WordPress in public/,
 # wp-config.php, utente Redis, installazione con la password admin su stdin.
 site_wp_install_files() {
-  local d="$1" root redis_pw
+  local d="$1" root redis_pw out rc=0
   root="$(site_root "$d")"
   # Seconda difesa (la prima è in site_job_wpinstall): con file veri in public/
   # si esce con 2, prima di toccare qualunque cosa, e chi chiama non disfa nulla.
@@ -227,10 +227,13 @@ site_wp_install_files() {
   redis_pw="$(rand_secret 48)"
   site_wp_config_write "$d" "$2" "$redis_pw" || return 1
   site_redis_user_add "$d" "$redis_pw" || return 1
-  printf '%s\n' "$WP_ADMIN_PASS" | site_wp "$d" core install --url="https://$d" --title="$WP_TITLE" \
+  # Con --prompt WP-CLI ristampa il comando completo, password admin compresa:
+  # nel registro va solo con la password tolta.
+  out="$(printf '%s\n' "$WP_ADMIN_PASS" | site_wp "$d" core install --url="https://$d" --title="$WP_TITLE" \
     --admin_user="$WP_ADMIN_USER" --admin_email="$WP_ADMIN_EMAIL" --skip-email --locale=it_IT \
-    --prompt=admin_password >>"$VPS_LOG" 2>&1 \
-    || { site_fail "installazione di WordPress non riuscita (dettagli in $VPS_LOG)"; return 1; }
+    --prompt=admin_password 2>&1)" || rc=1
+  printf '%s\n' "${out//"$WP_ADMIN_PASS"/<password nascosta>}" >>"$VPS_LOG"
+  ((rc == 0)) || { site_fail "installazione di WordPress non riuscita (dettagli in $VPS_LOG)"; return 1; }
 }
 
 # site_wp_redis_dropin DOMINIO — attiva la cache Redis copiando il drop-in del

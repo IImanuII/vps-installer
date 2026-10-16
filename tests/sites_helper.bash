@@ -78,8 +78,9 @@ if [[ "$1" == env ]]; then shift; while [[ "$1" == -i || "$1" == *=* ]]; do shif
 exec "$@"'
   # wp (WP-CLI): annota la chiamata; legge stdin solo con --prompt (altrimenti
   # potrebbe bloccarsi su uno stdin mai chiuso); WP_FAIL_ON="core download" fa fallire quel comando.
+  # Con --prompt ristampa il valore letto, come fa WP-CLI vero (--admin_password=...).
   # shellcheck disable=SC2016
-  make_stub wp 'echo "wp $*" >>"$CALLS"; if [[ "$*" == *--prompt=* ]]; then cat >>"$BATS_TEST_TMPDIR/wp.stdin"; fi
+  make_stub wp 'echo "wp $*" >>"$CALLS"; if [[ "$*" == *--prompt=* ]]; then in="$(cat)"; printf "%s\n" "$in" >>"$BATS_TEST_TMPDIR/wp.stdin"; echo "wp core install --admin_password=$in"; fi
 if [[ -n "${WP_FAIL_ON:-}" && "$*" == *"$WP_FAIL_ON"* ]]; then exit 1; fi
 p="${*##*--path=}"; p="${p%% *}"
 if [[ "$*" == *"core download"* ]]; then mkdir -p "$p/wp-content"; echo "<?php" >"$p/index.php"; fi
