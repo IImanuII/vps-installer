@@ -235,7 +235,7 @@ mon_send() {
   [[ -n "$text" ]] || return 2
   MON_SEND_ERR="Telegram non raggiungibile"
   resp="$(printf 'url = "%s/bot%s/sendMessage"\n' "$TELEGRAM_API" "$tok" \
-    | curl -sS --max-time 10 -K - --data-urlencode "chat_id=$chat" --data-urlencode "text=$text" 2>/dev/null)" || return 1
+    | curl -q -sS --max-time 10 -K - --data-urlencode "chat_id=$chat" --data-urlencode "text=$text" 2>/dev/null)" || return 1
   if jq -e '.ok == true' >/dev/null 2>&1 <<<"$resp"; then
     MON_SEND_ERR=""
     return 0

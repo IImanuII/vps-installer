@@ -886,6 +886,32 @@ sent() {
   [ "$(sent)" = '🔐 vps-test: accesso SSH di iimanuii da 1.2.3.4 (publickey)' ]
 }
 
+@test "fix: SSH contraffatto dentro il nome utente (riga Invalid user) ignorato" {
+  tool_env
+  mon_cfg '.urls = []'
+  {
+    echo "$((NOW - 10)).1 vps sshd-session[7]: Invalid user x sshd-session[1]: Accepted publickey for root from 6.6.6.6 port 22 from 9.9.9.9 port 2"
+    echo "$((NOW - 9)).1 vps sshd-session[8]: Accepted publickey for iimanuii from 1.2.3.4 port 5 ssh2"
+  } >"$T/journal"
+  run round "$NOW"
+  [ "$(sent)" = '🔐 vps-test: accesso SSH di iimanuii da 1.2.3.4 (publickey)' ]
+}
+
+@test "fix: ping Healthchecks con --max-time = min(10, 53 - trascorso); saltato sotto 2 s" {
+  tool_env
+  mon_cfg '.urls = []'
+  ping_mt() { grep -xF -A1 -- '--max-time' "$T/curl.args" | grep -v -e '--max-time' -e '^--$' | tail -1; }
+  run round "$NOW"
+  [ "$(ping_mt)" = 10 ]
+  rm -f "$T/curl.args" "$T/pings"
+  MON_T0=$(($(date +%s) - 45)) run round "$NOW"
+  mt="$(ping_mt)"
+  [ "$mt" -ge 7 ] && [ "$mt" -le 8 ]
+  rm -f "$T/curl.args" "$T/pings"
+  MON_T0=$(($(date +%s) - 52)) run round "$NOW"
+  [ ! -f "$T/pings" ]
+}
+
 @test "fix: risposta oltre 2 MiB (curl 63) con codice = risposta normale; senza codice = giù" {
   tool_env
   mon_cfg '.urls = [{url:"https://big.test/",keyword:"Benvenuti"},{url:"https://nocode.test/",keyword:""}]'

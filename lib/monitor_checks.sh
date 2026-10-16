@@ -359,7 +359,9 @@ mon_check_ssh() {
   local cur out line ts n=0
   # Solo le righe scritte da sshd stesso (sshd o sshd-session di OpenSSH ≥ 9.8):
   # un nome utente inventato dentro un'altra riga non deve generare avvisi.
-  local re=' sshd(-session)?\[[0-9]+\]: Accepted ([a-z-]+(/[a-z]+)?) for ([^ ]+) from ([0-9a-fA-F:.]+) port [0-9]+'
+  # Ancorata all'inizio della riga di `journalctl -o short-unix` (ora, host,
+  # programma): un nome utente che contiene "sshd[1]: Accepted ..." non passa.
+  local re='^[0-9]+(\.[0-9]+)? [^ ]+ sshd(-session)?\[[0-9]+\]: Accepted ([a-z-]+(/[a-z]+)?) for ([^ ]+) from ([0-9a-fA-F:.]+) port [0-9]+'
   cur="$(jq -r '.cursor.ssh // empty' <<<"$MON_ST")" || cur=""
   if ! [[ "$cur" =~ ^[0-9]+$ ]] || ((cur > MON_NOW_S || MON_NOW_S - cur > 86400)); then
     cur=$((MON_NOW_S - 60))
@@ -373,7 +375,7 @@ mon_check_ssh() {
     [[ "$line" =~ $re ]] || continue
     n=$((n + 1))
     if ((n <= MON_SSH_MAX)); then
-      _mon_say ssh "accesso SSH di ${BASH_REMATCH[4]} da ${BASH_REMATCH[5]} (${BASH_REMATCH[2]})"
+      _mon_say ssh "accesso SSH di ${BASH_REMATCH[5]} da ${BASH_REMATCH[6]} (${BASH_REMATCH[3]})"
     fi
   done <<<"$out"
   if ((n > MON_SSH_MAX)); then
@@ -504,8 +506,8 @@ mon_telegram_ok() {
 # l'ordine resta quello degli eventi; massimo 10 invii e non oltre 44 s
 # dall'inizio del giro (systemd lo ferma a 55).
 mon_run() {
-  local start hc periodic=no m seen
-  start="$(date +%s)"
+  local start hc periodic=no m seen left
+  start="${MON_T0:-$(date +%s)}"
   MON_NOW_S="${MON_NOW:-$start}"
   MON_DEADLINE=$((start + MON_ROUND_S))
   MON_CFG="$(mon_config_load)"
@@ -544,7 +546,14 @@ mon_run() {
   # segnale "la VPS è viva".
   hc="$(jq -r '.healthchecks_url // ""' <<<"$MON_CFG")"
   if [[ -n "$hc" ]]; then
-    curl -q -fsS --globoff --max-time 10 -o /dev/null "$hc" >/dev/null 2>&1 || log "vps-monitor: ping a Healthchecks.io non riuscito"
+    # Il giro deve chiudersi entro 53 s (systemd lo ferma a 55): il ping prende
+    # al massimo 10 s e solo il tempo che resta; sotto i 2 s non parte.
+    left=$((53 - ($(date +%s) - start)))
+    if ((left >= 2)); then
+      curl -q -fsS --globoff --max-time $((left < 10 ? left : 10)) -o /dev/null "$hc" >/dev/null 2>&1 || log "vps-monitor: ping a Healthchecks.io non riuscito"
+    else
+      log "vps-monitor: ping a Healthchecks.io saltato (giro troppo lungo)"
+    fi
   fi
   if mon_telegram_ok "$MON_CFG"; then
     mon_flush_queue 10 $((start + 44))

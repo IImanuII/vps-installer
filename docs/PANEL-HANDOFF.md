@@ -197,7 +197,7 @@ la sorveglianza della VPS con avvisi Telegram. Il giro (`_run`) lo lancia solo
 
 | Comando | stdin | Risposta |
 |---|---|---|
-| `vps-monitor status` | — | `{"ok":true,"enabled":bool,"telegram_configured":bool,"healthchecks":bool,"last_run":"ISO"\|null,"checks":[{"id","kind","label","state","since","code","time_ms"}],"alerts":[{"at","text"}],"urls":[{"url","keyword"}],"thresholds":{…},"queued":N}` |
+| `vps-monitor status` | — | `{"ok":true,"enabled":bool,"telegram_configured":bool,"healthchecks":bool,"chat_id":"…","last_run":"ISO"\|null,"checks":[{"id","kind","label","state","since","code","time_ms"}],"alerts":[{"at","text"}],"urls":[{"url","keyword"}],"thresholds":{…},"queued":N}` |
 | `vps-monitor config` | JSON della configurazione (≤ 64 KiB) | `{"ok":true}` / `{"ok":false,"error":"…"}` |
 | `vps-monitor test` | — | invia "✅ <hostname>: messaggio di prova"; `{"ok":true}` o `{"ok":false,"error":"Telegram: <descrizione di Telegram>"}` (anche `Telegram non configurato`, `Telegram: Telegram non raggiungibile`) |
 
