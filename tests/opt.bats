@@ -1,6 +1,11 @@
 setup() {
   load test_helper
+  # Cartelle di vps-monitor nel tmp del test (calcolate al caricamento delle librerie).
+  export MON_DIR="$BATS_TEST_TMPDIR/mon" MON_STATE_DIR="$BATS_TEST_TMPDIR/mon-state"
+  export SYSTEMD_DIR="$BATS_TEST_TMPDIR/systemd"
   setup_common
+  mkdir -p "$SYSTEMD_DIR"
+  make_stub systemctl 'echo "$*" >>"$BATS_TEST_TMPDIR/systemctl.calls"'
   VPS_ROOT="$REPO_ROOT"
   # Mai toccare /etc, /opt/vps/sites ecc. veri: tutto nel tmp del test.
   export SUDOERS_D="$BATS_TEST_TMPDIR/sudoers.d" CRON_D="$BATS_TEST_TMPDIR/cron.d"
@@ -127,4 +132,26 @@ sys_setup() {
   run opt_system_files
   [ "$status" -eq 0 ]
   [[ "$output" == *"Redis con utenti ACL non configurato"* ]]
+}
+
+@test "opt_system_files: unità di vps-monitor, cartelle 700, daemon-reload, timer non abilitato" {
+  sys_setup
+  opt_system_files
+  [ "$(stat -c %a "$SYSTEMD_DIR/vps-monitor.service")" = 644 ]
+  [ "$(stat -c %a "$SYSTEMD_DIR/vps-monitor.timer")" = 644 ]
+  grep -qxF 'ExecStart=/opt/vps/bin/vps-monitor _run' "$SYSTEMD_DIR/vps-monitor.service"
+  grep -qxF 'TimeoutStartSec=55' "$SYSTEMD_DIR/vps-monitor.service"
+  grep -qxF 'OnCalendar=*:*:00' "$SYSTEMD_DIR/vps-monitor.timer"
+  [ "$(stat -c %a "$MON_DIR")" = 700 ]
+  [ "$(stat -c %a "$MON_STATE_DIR")" = 700 ]
+  grep -qxF 'daemon-reload' "$BATS_TEST_TMPDIR/systemctl.calls"
+  ! grep -q 'enable' "$BATS_TEST_TMPDIR/systemctl.calls"
+}
+
+@test "opt_system_files: configurazione già attiva (aggiornamento) = timer abilitato" {
+  sys_setup
+  mkdir -p "$MON_DIR"
+  echo '{"enabled":true}' >"$MON_DIR/config.json"
+  opt_system_files
+  grep -qxF 'enable --now vps-monitor.timer' "$BATS_TEST_TMPDIR/systemctl.calls"
 }

@@ -41,6 +41,7 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | `/opt/vps/phpmyadmin/` | `root:panel` 750 / file 640 | phpMyAdmin |
 | `/opt/vps/sites/` | `root:panel` 750 / file 640 | registro dei siti di `vps-site` (un JSON per sito, nessun segreto) |
 | `/opt/vps/backups/sites/` | `root:root` 700 / file 600 | archivi dei siti eliminati (file + dump), cancellati dopo 30 giorni |
+| `/opt/vps/monitor/config.json` | `root:root` 600 (cartella 700) | configurazione di `vps-monitor` (con il token del bot: il pannello non la legge, usa `vps-monitor status`) |
 
 ### File di sistema (posizioni obbligate)
 
@@ -74,13 +75,18 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | `/etc/cron.d/vps-site-<slug>` | cron di WordPress di un sito (al posto di wp-cron via web) |
 | `/etc/logrotate.d/vps-site-site_<slug>` | rotazione dei log di un sito (nota SP2a rimandata: ruota come root, i log PHP in `logs/php/` con `su`) |
 | `/var/www/_maintenance/_maintenance.html` | pagina 503 dei siti disattivati |
+| `/etc/systemd/system/vps-monitor.service` | `root:root` 644: `Type=oneshot`, `ExecStart=/opt/vps/bin/vps-monitor _run`, `TimeoutStartSec=55`, `Nice=5` |
+| `/etc/systemd/system/vps-monitor.timer` | `root:root` 644: `OnCalendar=*:*:00`, `AccuracySec=5s`, `Persistent=false`; installato spento, lo abilita/ferma `vps-monitor config` |
+| `/var/lib/vps-monitor/state.json` | `root:root` 600 (cartella 700): stato dei controlli, avvisi delle ultime 24 ore (al massimo 200), cursori |
+| `/var/lib/vps-monitor/queue/` | `root:root` 700: messaggi Telegram non ancora consegnati (un file per messaggio, al massimo 500) |
+| `/run/vps-monitor.lock` | lucchetto di un giro (`flock -n`: un giro ancora in corso fa saltare il successivo) |
 | `/var/www/<sito>/` | `root:site_<slug>` 2750 (il sito non scrive nella radice); `logs/` `root:site_<slug>` 2750 con `access.log`/`error.log` di Nginx; `logs/php/` `site_<slug>` 2770 con `php-error.log`; `public/` e `tmp/` `site_<slug>` 2770 (admin nel gruppo, `www-data` in sola lettura via ACL); `db.env` `root:site_<slug>` 640. Radice, `logs/` e `db.env` sono di root perché Nginx (root) e `vps-site` seguirebbero un link messo lì dal sito |
 
 ## 3. `manifest.json`
 
 ```json
 {
-  "installer_version": "1.4.1",
+  "installer_version": "1.5.0",
   "installed_at": "2026-10-07T15:30:00+02:00",
   "hostname": "vps-01",
   "ipv4": "203.0.113.10",
@@ -184,6 +190,43 @@ Regole di `vps-site`:
 - `_run` e `_prune` sono interni (systemd e cron) e sotto sudo vengono rifiutati;
 - sotto sudo `vps-site` si rilancia subito in un'unità systemd temporanea (`systemd-run --wait --pipe --collect --quiet --service-type=exec --setenv=VPS_SITE_VIA_SYSTEMD=1 /opt/vps/bin/vps-site ...`): `php8.4-fpm.service` gira con `ProtectSystem=full` e `sudo` lanciato da PHP eredita il suo spazio dei mount, dove `/etc` è in sola lettura, quindi `disable`/`enable`/`db-*` non potrebbero scrivere vhost e configurazioni. stdin, stdout e codice d'uscita passano invariati; dentro l'unità `_run`/`_prune` restano rifiutati. Gli altri script che scrivono in `/etc` chiamati dal pannello (ad es. `vps-cf-ips-update`) hanno lo stesso limite e potranno servirsi dello stesso schema.
 
+Forniti dall'installer v1.5 (eseguiti dal pannello, in sudoers): `vps-monitor`,
+la sorveglianza della VPS con avvisi Telegram. Il giro (`_run`) lo lancia solo
+`vps-monitor.timer` ogni minuto come root; sotto sudo `_run` risponde
+`{"ok":false,"error":"comando interno"}`.
+
+| Comando | stdin | Risposta |
+|---|---|---|
+| `vps-monitor status` | — | `{"ok":true,"enabled":bool,"telegram_configured":bool,"healthchecks":bool,"last_run":"ISO"\|null,"checks":[{"id","kind","label","state","since","code","time_ms"}],"alerts":[{"at","text"}],"urls":[{"url","keyword"}],"thresholds":{…},"queued":N}` |
+| `vps-monitor config` | JSON della configurazione (≤ 64 KiB) | `{"ok":true}` / `{"ok":false,"error":"…"}` |
+| `vps-monitor test` | — | invia "✅ <hostname>: messaggio di prova"; `{"ok":true}` o `{"ok":false,"error":"Telegram: <descrizione di Telegram>"}` (anche `Telegram non configurato`, `Telegram: Telegram non raggiungibile`) |
+
+`status`:
+- `checks`: un elemento per controllo, nell'ordine del giro. `kind` è `url` (id `health` per `/health` del pannello, `url:<indirizzo>` per gli altri), `service` (`service:<nome>`), `disk`, `mem`, `load`, `f2b`, `cert` (`cert:<dominio>`), `cf_token`; `state` `ok`/`warn`/`down`; `since` (ISO UTC, inizio del problema, `null` se ok); `code` e `time_ms` solo per gli indirizzi (`code` `null` se non c'è risposta HTTP);
+- `alerts`: i messaggi delle ultime 24 ore (ISO UTC, testo completo con emoji e hostname), dal più vecchio; il riepilogo delle 9 non c'è;
+- `last_run`: ora dell'ultimo giro (ISO UTC) o `null`; `queued`: messaggi in coda non ancora consegnati;
+- `urls` e `thresholds` dalla configurazione, per precompilare il modulo; **mai il token** (solo `telegram_configured`).
+
+`config` (stesso formato di `/opt/vps/monitor/config.json`):
+
+```json
+{
+  "enabled": true,
+  "telegram": {"bot_token": "123456:ABC...", "chat_id": "123456789"},
+  "healthchecks_url": "https://hc-ping.com/<uuid>",
+  "urls": [{"url": "https://trip4free.org/", "keyword": "Trip4Free"}],
+  "thresholds": {"fail_count": 2, "timeout_s": 10, "slow_s": 3, "slow_count": 5, "remind_min": 30,
+    "disk_warn_pct": 85, "disk_crit_pct": 95, "mem_avail_pct": 10, "mem_minutes": 5,
+    "load_factor": 2, "load_minutes": 10, "cert_days": 14, "f2b_bans": 20, "f2b_minutes": 10}
+}
+```
+
+- `bot_token` assente = conserva quello salvato (il pannello non deve rimandarlo); vuoto = Telegram non configurato (in quel caso nessun messaggio viene accodato, gli avvisi restano solo in `status`). Gli altri campi assenti prendono i valori predefiniti (`enabled` falso, niente indirizzi, soglie qui sopra).
+- Regole: `bot_token` `^[0-9]{5,15}:[A-Za-z0-9_-]{30,60}$`, `chat_id` `^-?[0-9]{1,20}$`, `healthchecks_url` vuoto o `https://hc-ping.com/[A-Za-z0-9_/-]{1,150}`, al massimo 20 `urls` (https, host minuscolo valido, niente porta, credenziali, spazi o caratteri di controllo, ≤ 512 byte), `keyword` ≤ 100 byte senza caratteri di controllo; soglie intere `fail_count` 1-10, `timeout_s` 2-30, `slow_s` 1-30, `slow_count` 1-30, `remind_min` 5-1440, `disk_warn_pct`/`disk_crit_pct` 50-99 con warn < crit, `mem_avail_pct` 1-50, `mem_minutes`/`load_minutes`/`f2b_minutes` 1-60, `load_factor` 1-10, `cert_days` 1-30, `f2b_bans` 1-1000. Un campo non valido rifiuta tutto e lascia la configurazione di prima.
+- Dopo il salvataggio: `systemctl enable --now vps-monitor.timer` se `enabled`, altrimenti `disable --now`.
+
+Un giro: indirizzi in parallelo (`/health` con `--resolve <dominio>:443:127.0.0.1`, atteso 200 e `OK`; gli altri ok se codice < 500, redirect non seguiti, e la parola attesa nel primo MiB), servizi del manifest con riavvio (al massimo 3 l'ora, poi "riavvii sospesi"), disco/RAM/carico, accessi SSH (`journalctl -u ssh`), Ban di fail2ban, ogni 6 ore certificati e `vps-cf-token test`, alle 9 (Europe/Rome) il riepilogo solo se c'è contenuto; poi stato salvato, ping a Healthchecks.io, invio della coda (dal più vecchio, al massimo 10 invii e 44 s). Messaggi in testo semplice: `<emoji> <hostname>: <testo>` (🔴 giù, 🟡 attenzione, 🟢 rientro, 🔐 SSH, 📋 riepilogo).
+
 Previsti per il pannello (da scrivere con il pannello, stesse regole):
 
 | Script | Cosa farà |
@@ -214,6 +257,6 @@ Convenzione: DB e utenti dei siti hanno nome `site_<slug>` (es. `site_miosito_it
 - [ ] **phpMyAdmin:** versione installata vs ultima, aggiornamento, cambio password basic auth. Usa `vps-pma-update`, `vps-pma-pass`.
 - [ ] **Backup rclone:** configurazione OAuth Google Drive, pianificazione, retention, stato ultimo backup. Usa `vps-backup`.
 - [ ] **Siti:** creazione statico / PHP fatta con `vps-site` (installer 1.2); WordPress fatto con `vps-site create --type wordpress` e `vps-site wp-install` (installer 1.3); resta la cache (`vps-cache`, 2c).
-- [ ] **Stato server:** dashboard da `vps-status`.
+- [x] **Stato server:** fatto (Plancia 2.5.0): dashboard da `vps-status` e `vps-monitor status`, pagina Avvisi con `vps-monitor config`/`test`.
 - [ ] **Sicurezza:** IP bannati da fail2ban, sblocco. Usa `vps-f2b`.
 - [ ] **Pulizia log:** rotazione/pulizia dei log Nginx dei siti (era in `da fare.txt`).

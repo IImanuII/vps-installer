@@ -6,6 +6,7 @@
 : "${VPS_SBIN:=/usr/local/sbin}"
 : "${SUDOERS_D:=/etc/sudoers.d}"
 : "${CRON_D:=/etc/cron.d}"
+: "${SYSTEMD_DIR:=/etc/systemd/system}"
 
 opt_install_files() {
   local t
@@ -65,5 +66,22 @@ opt_system_files() {
   wpcli_install || log "ATTENZIONE: WP-CLI non installato: WordPress non sarà disponibile finché non riesce"
   if [[ "$(jq -r '.components.redis == true' "$m")" == true ]]; then
     redis_acl_setup || log "ATTENZIONE: Redis con utenti ACL non configurato: WordPress non sarà disponibile (dettagli in $VPS_LOG)"
+  fi
+  opt_monitor_files
+}
+
+# opt_monitor_files — unità systemd e cartelle di vps-monitor. Il timer resta
+# spento finché `vps-monitor config` non riceve enabled:true; in un aggiornamento
+# (--tools-only) con la sorveglianza già attiva lo si riabilita.
+opt_monitor_files() {
+  local u
+  for u in vps-monitor.service vps-monitor.timer; do
+    install -m 644 "$VPS_TEMPLATES/$u" "$SYSTEMD_DIR/$u"
+    own root:root "$SYSTEMD_DIR/$u"
+  done
+  install -d -m 700 "$MON_DIR" "$MON_STATE_DIR" "$MON_QUEUE"
+  systemctl daemon-reload >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: systemctl daemon-reload non riuscito"
+  if [[ -f "$MON_CONFIG" && "$(jq -r '.enabled == true' "$MON_CONFIG" 2>/dev/null)" == true ]]; then
+    systemctl enable --now vps-monitor.timer >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: timer di vps-monitor non abilitato"
   fi
 }

@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# vps-monitor — sorveglianza della VPS e avvisi Telegram: status, config, test (_run lo lancia il timer)
+# Contratto in docs/PANEL-HANDOFF.md. Lo esegue il pannello con sudo; _run lo
+# lancia solo il timer systemd (come root, ogni minuto), quindi attraverso sudo
+# si rifiuta prima ancora di caricare le librerie. Questo controllo deve restare il primo.
+if [[ "${1:-}" == _run && -n "${SUDO_USER:-}" ]]; then
+  printf '{"ok":false,"error":"comando interno"}\n'
+  exit 1
+fi
+# Chiamata del pannello: l'ambiente del chiamante non deve influenzare lo script.
+# La vera difesa è `Defaults:panel env_reset` in sudoers; questo elenco è una
+# seconda linea di difesa.
+if [[ -n "${SUDO_USER:-}" ]]; then
+  VPS_OPT=/opt/vps
+  VPS_LIB=$VPS_OPT/lib
+  VPS_TEMPLATES=$VPS_OPT/templates
+  VPS_LOG=/var/log/vps-tools.log
+  unset MON_DIR MON_CONFIG MON_STATE_DIR MON_STATE MON_QUEUE MON_LOCK TELEGRAM_API MON_PROC SYSTEMD_DIR \
+    MON_NOW MON_LE_LIVE MON_F2B_LOG MON_REBOOT_FILE SITES_DIR
+  [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
+  chmod 640 "$VPS_LOG"
+fi
+: "${VPS_OPT:=/opt/vps}" "${VPS_LOG:=/var/log/vps-tools.log}"
+: "${VPS_TEMPLATES:=$VPS_OPT/templates}"
+export LC_ALL=C
+for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
+  # shellcheck source=/dev/null
+  source "$_lib"
+done
+
+# Il giro: niente `set -e` né trap ERR (un controllo che fallisce non deve
+# fermare gli altri né lasciare lo stato non salvato). Un giro ancora in corso
+# fa saltare questo.
+if [[ "${1:-}" == _run ]]; then
+  set -uo pipefail
+  exec 9>"$MON_LOCK" || exit 1
+  flock -n 9 || exit 0
+  mon_run
+  exit 0
+fi
+
+tool_init
+
+case "${1:-}" in
+  status)
+    mon_status_json
+    ;;
+  config)
+    # Si leggono 65537 byte: se ne arrivano più di 65536 la configurazione è troppo lunga.
+    dati="$(read_stdin_limited 65537)"
+    ((${#dati} <= 65536)) || json_err "configurazione troppo lunga (al massimo 64 KiB)"
+    vecchia='{}'
+    if [[ -f "$MON_CONFIG" ]]; then vecchia="$(cat "$MON_CONFIG")"; fi
+    if ! nuova="$(mon_validate_config "$dati" "$vecchia")"; then
+      json_err "${nuova#ERR: }"
+    fi
+    install -d -m 700 "$MON_DIR"
+    printf '%s\n' "$nuova" | write_file "$MON_CONFIG" 600 root:root
+    if [[ "$(jq -r '.enabled' <<<"$nuova")" == true ]]; then
+      if ! systemctl enable --now vps-monitor.timer >>"$VPS_LOG" 2>&1; then
+        json_err "configurazione salvata, ma il timer di vps-monitor non si è avviato (dettagli in $VPS_LOG)"
+      fi
+    else
+      if ! systemctl disable --now vps-monitor.timer >>"$VPS_LOG" 2>&1; then
+        json_err "configurazione salvata, ma il timer di vps-monitor non si è fermato (dettagli in $VPS_LOG)"
+      fi
+    fi
+    log "vps-monitor: configurazione aggiornata (attiva: $(jq -r '.enabled' <<<"$nuova"))"
+    json_ok
+    ;;
+  test)
+    mon_telegram_ok "$(mon_config_load)" || json_err "Telegram non configurato"
+    rc=0
+    mon_send "$(mon_message test "messaggio di prova")" || rc=$?
+    if ((rc != 0)); then
+      json_err "Telegram: ${MON_SEND_ERR:-invio non riuscito}"
+    fi
+    json_ok
+    ;;
+  *)
+    json_err "uso: vps-monitor status | config (JSON da stdin) | test"
+    ;;
+esac

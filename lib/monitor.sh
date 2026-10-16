@@ -214,8 +214,11 @@ mon_message() {
 # mai negli argomenti. Codici: 0 inviato; 1 errore transitorio (curl, 429, 5xx,
 # risposta senza JSON, configurazione mancante o non valida: curl non viene
 # chiamato); 2 rifiuto permanente (error_code 400/403/404, testo vuoto).
+# In caso di errore MON_SEND_ERR spiega il motivo (per `vps-monitor test`); la
+# descrizione di Telegram non contiene mai il token.
 mon_send() {
   local cfg tok chat resp text code
+  MON_SEND_ERR="Telegram non configurato"
   cfg="$(mon_config_load)"
   tok="$(jq -r '.telegram.bot_token // empty' <<<"$cfg")"
   chat="$(jq -r '.telegram.chat_id // empty' <<<"$cfg")"
@@ -223,13 +226,18 @@ mon_send() {
   # Difesa in profondità: niente virgolette o a capo nella configurazione di curl.
   [[ "$tok" =~ ^[0-9]{5,15}:[A-Za-z0-9_-]{30,60}$ ]] || return 1
   [[ "$chat" =~ ^-?[0-9]{1,20}$ ]] || return 1
+  MON_SEND_ERR="messaggio vuoto"
   text="$(_mon_trunc "$1")"
   [[ -n "$text" ]] || return 2
+  MON_SEND_ERR="Telegram non raggiungibile"
   resp="$(printf 'url = "%s/bot%s/sendMessage"\n' "$TELEGRAM_API" "$tok" \
     | curl -sS --max-time 10 -K - --data-urlencode "chat_id=$chat" --data-urlencode "text=$text" 2>/dev/null)" || return 1
   if jq -e '.ok == true' >/dev/null 2>&1 <<<"$resp"; then
+    MON_SEND_ERR=""
     return 0
   fi
+  MON_SEND_ERR="$(jq -r '(.description // empty) | tostring | .[0:300]' 2>/dev/null <<<"$resp")" || MON_SEND_ERR=""
+  if [[ -z "$MON_SEND_ERR" ]]; then MON_SEND_ERR="risposta non valida da Telegram"; fi
   code="$(jq -r '.error_code // empty' 2>/dev/null <<<"$resp")" || code=""
   case "$code" in
     400 | 403 | 404) return 2 ;;

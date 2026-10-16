@@ -44,7 +44,7 @@ sudo vps-panel-update      # poi, per ogni nuovo rilascio
 Su una VPS installata con una versione precedente alla 1.1, prima:
 
 ```bash
-curl -fsSLO https://github.com/IImanuII/vps-installer/releases/download/v1.4.1/install.sh
+curl -fsSLO https://github.com/IImanuII/vps-installer/releases/download/v1.5.0/install.sh
 sudo bash install.sh --tools-only
 ```
 
@@ -68,6 +68,39 @@ read -rs T && printf '%s' "$T" | sudo /opt/vps/bin/vps-cf-token set; unset T
 ```
 
 `set` controlla che il token veda la zona del pannello e quelle di tutti i siti registrati prima di salvarlo.
+
+## Avvisi e sorveglianza
+
+Dalla 1.5.0 `vps-monitor` gira come root ogni minuto (timer systemd
+`vps-monitor.timer`) e manda gli avvisi su Telegram, con il bot del pannello, a
+chi li attiva dalla pagina **Avvisi** di Plancia. Finché la sorveglianza non
+viene attivata da lì il timer resta spento.
+
+Cosa controlla:
+
+- **indirizzi**: `/health` del pannello (dritto sulla macchina) e gli indirizzi
+  scelti (anche siti su altre VPS); giù dopo 2 controlli falliti di fila (errore
+  5xx, nessuna risposta in 10 s, parola attesa assente), lento oltre 3 s per 5
+  controlli, promemoria ogni 30 minuti, avviso di rientro con la durata;
+- **servizi** Nginx, PHP-FPM, MariaDB, Redis, fail2ban: se uno è fermo lo
+  riavvia (al massimo 3 volte l'ora, poi avvisa e si ferma);
+- **risorse**: disco (85% / 95%), RAM disponibile sotto il 10% per 5 minuti,
+  carico oltre 2 volte le CPU per 10 minuti;
+- **sicurezza**: ogni accesso SSH, troppi blocchi di fail2ban;
+- **ogni 6 ore** la scadenza dei certificati e il token Cloudflare;
+- **alle 9** un riepilogo, solo se c'è qualcosa da dire (aggiornamenti, riavvio
+  richiesto, avvisi del giorno prima).
+
+Se Telegram non risponde i messaggi restano in coda e partono al giro dopo.
+
+**VPS spenta**: una macchina spenta non può avvisare da sola. Per saperlo crea un
+controllo gratuito su [Healthchecks.io](https://healthchecks.io) (periodo 1
+minuto, tolleranza 5 minuti, notifica su Telegram o email) e incolla l'indirizzo
+di ping (`https://hc-ping.com/...`) nella pagina Avvisi: `vps-monitor` lo chiama
+a ogni giro e Healthchecks.io avvisa quando i ping smettono di arrivare.
+
+Da terminale: `sudo /opt/vps/bin/vps-monitor status` (stato in JSON) e
+`sudo /opt/vps/bin/vps-monitor test` (messaggio di prova).
 
 ## Sviluppo
 

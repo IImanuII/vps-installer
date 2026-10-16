@@ -1,0 +1,10 @@
+[Unit]
+Description=Sorveglianza della VPS ogni minuto (vps-monitor)
+
+[Timer]
+OnCalendar=*:*:00
+AccuracySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=Sorveglianza della VPS (vps-monitor)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/vps/bin/vps-monitor _run
+TimeoutStartSec=55
+Nice=5
