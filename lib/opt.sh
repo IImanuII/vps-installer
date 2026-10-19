@@ -97,6 +97,11 @@ opt_system_files() {
   fi
   opt_monitor_files
   opt_panel_pool
+  # Aggiornamenti automatici: anche Nginx di nginx.org (dalla 1.5.3). Solo sulle
+  # macchine che hanno gia' la configurazione dell'installer.
+  if [[ -f "${APT_CONF_D:-/etc/apt/apt.conf.d}/52vps-unattended" ]]; then
+    install -m 644 "$VPS_TEMPLATES/apt-52vps-unattended" "${APT_CONF_D:-/etc/apt/apt.conf.d}/52vps-unattended"
+  fi
 }
 
 # opt_monitor_files — unità systemd e cartelle di vps-monitor. Il timer resta
