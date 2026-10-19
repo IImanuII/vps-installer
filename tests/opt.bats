@@ -155,3 +155,30 @@ sys_setup() {
   opt_system_files
   grep -qxF 'enable --now vps-monitor.timer' "$BATS_TEST_TMPDIR/systemctl.calls"
 }
+
+@test "opt_panel_pool aggiunge /opt/vps/bin a open_basedir, una volta, e ricarica php-fpm" {
+  jq -n '{components:{php:"8.4"}, panel:{path:"/var/www/p.test"}}' >"$VPS_OPT/manifest.json"
+  export PANEL_POOL_FILE="$BATS_TEST_TMPDIR/panel.conf"
+  printf '[panel]\nphp_admin_value[open_basedir] = /var/www/p.test/:%s/phpmyadmin/:%s/manifest.json\n' "$VPS_OPT" "$VPS_OPT" >"$PANEL_POOL_FILE"
+  make_stub php-fpm8.4 'echo test >>"$BATS_TEST_TMPDIR/fpm.calls"'
+  opt_panel_pool
+  grep -qxF "php_admin_value[open_basedir] = /var/www/p.test/:$VPS_OPT/phpmyadmin/:$VPS_OPT/manifest.json:$VPS_OPT/bin/" "$PANEL_POOL_FILE"
+  grep -qxF 'reload php8.4-fpm' "$BATS_TEST_TMPDIR/systemctl.calls"
+  opt_panel_pool
+  [ "$(grep -c '/bin/' "$PANEL_POOL_FILE")" -eq 1 ]
+  [ "$(grep -c 'reload' "$BATS_TEST_TMPDIR/systemctl.calls")" -eq 1 ]
+}
+
+@test "opt_panel_pool: php-fpm -t fallito lascia il pool com'era; senza pannello non fa nulla" {
+  jq -n '{components:{php:"8.4"}, panel:{path:"/var/www/p.test"}}' >"$VPS_OPT/manifest.json"
+  export PANEL_POOL_FILE="$BATS_TEST_TMPDIR/panel.conf"
+  printf '[panel]\nphp_admin_value[open_basedir] = /var/www/p.test/\n' >"$PANEL_POOL_FILE"
+  cp "$PANEL_POOL_FILE" "$BATS_TEST_TMPDIR/prima"
+  make_stub php-fpm8.4 'exit 1'
+  opt_panel_pool
+  cmp -s "$PANEL_POOL_FILE" "$BATS_TEST_TMPDIR/prima"
+  jq -n '{components:{php:"8.4"}}' >"$VPS_OPT/manifest.json"
+  make_stub php-fpm8.4 'exit 0'
+  opt_panel_pool
+  cmp -s "$PANEL_POOL_FILE" "$BATS_TEST_TMPDIR/prima"
+}

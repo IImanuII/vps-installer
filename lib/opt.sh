@@ -30,6 +30,34 @@ opt_tools_only() {
   log "Script di /opt/vps aggiornati alla versione $VPS_INSTALLER_VERSION."
 }
 
+# opt_panel_pool — sulle installazioni fatte prima della 1.5.2 il pool del
+# pannello non ha /opt/vps/bin in open_basedir: la dashboard non legge l'elenco
+# degli script. Si aggiunge solo quel percorso (cartella di root, script di
+# sola lettura), si verifica con php-fpm -t e si ricarica; se qualcosa non va
+# torna il file di prima.
+opt_panel_pool() {
+  local m ver f bak
+  m="$(manifest_path)"
+  ver="$(jq -r '.components.php // empty' "$m")"
+  [[ -n "$ver" && "$(jq -r '.panel != null' "$m")" == true ]] || return 0
+  f="${PANEL_POOL_FILE:-/etc/php/$ver/fpm/pool.d/panel.conf}"
+  [[ -f "$f" ]] || return 0
+  grep -q '^php_admin_value\[open_basedir\]' "$f" || return 0
+  if grep '^php_admin_value\[open_basedir\]' "$f" | grep -qF "$VPS_OPT/bin/"; then
+    return 0
+  fi
+  bak="$(mktemp)"
+  cp -p "$f" "$bak"
+  sed -i "/^php_admin_value\[open_basedir\]/ s#\$#:$VPS_OPT/bin/#" "$f"
+  if "php-fpm$ver" -t >>"$VPS_LOG" 2>&1 && systemctl reload "php$ver-fpm" >>"$VPS_LOG" 2>&1; then
+    rm -f "$bak"
+    log "Pool del pannello: $VPS_OPT/bin/ aggiunto a open_basedir"
+  else
+    mv -f "$bak" "$f"
+    log "ATTENZIONE: pool del pannello non aggiornato (php-fpm -t o reload falliti), lasciato com'era"
+  fi
+}
+
 # opt_system_files — la parte di sistema degli script: sudoers del pannello,
 # cron, cartelle dei siti e pagina di manutenzione. La chiama anche
 # --tools-only: senza, una VPS già installata riceverebbe vps-site ma il
@@ -68,6 +96,7 @@ opt_system_files() {
     redis_acl_setup || log "ATTENZIONE: Redis con utenti ACL non configurato: WordPress non sarà disponibile (dettagli in $VPS_LOG)"
   fi
   opt_monitor_files
+  opt_panel_pool
 }
 
 # opt_monitor_files — unità systemd e cartelle di vps-monitor. Il timer resta

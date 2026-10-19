@@ -58,7 +58,7 @@ setup() {
   grep -q 'return 301 https://$host$request_uri;' "$BATS_TEST_TMPDIR/vhost"
   render_template "$REPO_ROOT/templates/php-pool-panel.conf.tmpl" "$BATS_TEST_TMPDIR/pool" 644 "$(id -un):$(id -gn)" PANEL_ROOT PHP_VERSION VPS_OPT
   grep -qxF 'listen = /run/php/php8.4-fpm-panel.sock' "$BATS_TEST_TMPDIR/pool"
-  grep -q "open_basedir\] = /var/www/panel.miosito.it/:$VPS_OPT/phpmyadmin/:$VPS_OPT/manifest.json" "$BATS_TEST_TMPDIR/pool"
+  grep -q "open_basedir\] = /var/www/panel.miosito.it/:$VPS_OPT/phpmyadmin/:$VPS_OPT/manifest.json:$VPS_OPT/bin/" "$BATS_TEST_TMPDIR/pool"
 }
 
 @test "configurazione phpMyAdmin e location nginx" {
