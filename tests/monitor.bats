@@ -812,7 +812,12 @@ sent() {
   run round "$NOW"
   [ "$status" -eq 0 ]
   # primo argomento di ogni chiamata a curl = -q (letto solo se primo)
-  [ "$(awk 'NR == 1 || p == "---" { n++; if ($0 == "-q") q++ } { p = $0 } END { print n - q }' "$T/curl.args")" -eq 0 ]
+  local f n=0
+  for f in "$T"/curl.call.*; do
+    [ "$(head -n1 "$f")" = -q ]
+    n=$((n + 1))
+  done
+  [ "$n" -eq 3 ]
   [ "$(grep -cxF -- '--globoff' "$T/curl.args")" -eq 3 ]
   grep -A1 -xF -- '--max-filesize' "$T/curl.args" | grep -qxF 2097152
   [ "$(head -n1 "$T/curl.args")" = -q ]

@@ -9,6 +9,9 @@ T="$BATS_TEST_TMPDIR"
 # una sola scrittura: i controlli in parallelo non si mescolano
 args="$(printf '%s\n' "$@" ---)"
 printf '%s\n' "$args" >>"$T/curl.args"
+# e un file per chiamata: i test sull'ordine degli argomenti non dipendono da
+# come il sistema accoda le scritture parallele
+printf '%s\n' "$@" >"$T/curl.call.$BASHPID.$RANDOM"
 for a in "$@"; do
   if [[ "$a" == -K ]]; then
     cat >>"$T/curl.stdin"

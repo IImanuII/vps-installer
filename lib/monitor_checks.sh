@@ -571,7 +571,8 @@ mon_status_json() {
   if [[ -d "$MON_QUEUE" ]]; then
     q="$(find "$MON_QUEUE" -maxdepth 1 -type f -name '[0-9]*' | wc -l)"
   fi
-  jq -nc --argjson c "$cfg" --argjson s "$st" --argjson n "$(date +%s)" --argjson q "$q" '
+  # "Ultime 24 ore" con lo stesso orologio dei giri (MON_NOW solo nei test, tolto sotto sudo).
+  jq -nc --argjson c "$cfg" --argjson s "$st" --argjson n "${MON_NOW:-$(date +%s)}" --argjson q "$q" '
     def iso: if type == "number" then (floor | todate) else null end;
     def num: if type == "number" then . else null end;
     {ok: true,
