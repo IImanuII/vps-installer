@@ -55,7 +55,12 @@ fm_path_check() {
     public) area=public ;;
     logs)
       area=logs
-      if ((${#segs[@]} > 1)) && [[ "${segs[1]}" == php ]]; then area=logsphp; fi
+      if ((${#segs[@]} > 1)) && [[ "${segs[1]}" == php ]]; then
+        area=logsphp
+      else
+        # in logs/ solo voci dirette: sotto logs/<x>/ (x diverso da php) root non scende
+        ((${#segs[@]} <= 2)) || return 1
+      fi
       ;;
     wp-config.php)
       ((${#segs[@]} == 1)) || return 1

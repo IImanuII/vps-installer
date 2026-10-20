@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# vps-files — file dei siti come utente del sito: list, stat, read, write, mkdir, rename, move, copy, delete, zip, unzip, download-zip
+# Lo esegue il pannello con sudo (chiamante non fidato): root non apre mai file del
+# sito, tutto passa da `runuser` con l'utente del sito. Unica eccezione: le voci
+# dirette di logs/ (cartella di root, dove il sito non scrive), lette come root solo
+# se file regolari e non link. Contratto in docs/PANEL-HANDOFF.md, sezione 4.
+if [[ -n "${SUDO_USER:-}" ]]; then
+  VPS_OPT=/opt/vps
+  VPS_LIB=$VPS_OPT/lib
+  VPS_TEMPLATES=$VPS_OPT/templates
+  VPS_LOG=/var/log/vps-tools.log
+  unset CF_API FM_RUNUSER SITES_DIR SITES_WWW
+  [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
+  chmod 640 "$VPS_LOG"
+fi
+: "${VPS_OPT:=/opt/vps}" "${VPS_LOG:=/var/log/vps-tools.log}"
+: "${VPS_TEMPLATES:=$VPS_OPT/templates}"
+export LC_ALL=C
+for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
+  # shellcheck source=/dev/null
+  source "$_lib"
+done
+tool_init
+
+USO="uso: vps-files list|stat|read DOMINIO PERCORSO"
+FM_TEXT_MAX=2097152
+# Record di find, separati da NUL: tipo, dimensione, data (sec.nsec), permessi, nome.
+# shellcheck disable=SC2016
+FM_FIND_FMT='%y\0%s\0%T@\0%M\0%f\0'
+# Dal flusso di find all'array di voci: JSON costruito solo da jq, mai a mano.
+# shellcheck disable=SC2016
+FM_JQ_DEF='def mt: split(".") as $p | $p[0] + "." + ((($p[1] // "") + "000000000")[:9]);
+  def entries: (split("\u0000")[:-1]) as $f
+    | [range(0; ($f | length); 5) as $i
+       | {name: $f[$i + 4], type: ({"f": "file", "d": "dir", "l": "link"}[$f[$i]] // "file"),
+          size: ($f[$i + 1] | tonumber), mtime: ($f[$i + 2] | mt), perms: $f[$i + 3]}];'
+
+(($# == 3)) || json_err "$USO"
+cmd="$1"
+dom="$2"
+p="$3"
+case "$cmd" in
+  list | stat | read) ;;
+  *) json_err "$USO" ;;
+esac
+info="$(fm_site_check "$dom" 2>&1)" || json_err "$info"
+slug="${info%% *}"
+root="${info#* }"
+area="$(fm_path_check "$p")" || json_err "percorso non valido o non consentito"
+
+# Solo le voci dirette di logs/ si aprono come root; tutto il resto come utente del sito.
+mode=site
+if [[ "$area" == logs ]]; then mode=root; fi
+
+# run_in COMANDO... — nella radice del sito, come root o come utente del sito.
+run_in() {
+  if [[ "$mode" == root ]]; then
+    (
+      cd "$root" || exit 1
+      exec "$@"
+    )
+  else
+    fm_as_site "$slug" "$root" "$@"
+  fi
+}
+
+# fm_is_text PERCORSO — §3.3: al massimo 2 MB, nessun NUL nei primi 8 KB, UTF-8 valido.
+fm_is_text() {
+  local rc=0
+  # shellcheck disable=SC2016
+  run_in sh -c 'test -f "$1" -a ! -L "$1" || exit 1
+a="$(head -c 8192 <"$1" | wc -c)"
+b="$(head -c 8192 <"$1" | tr -d "\000" | wc -c)"
+test "$a" = "$b" || exit 1
+iconv -f UTF-8 -t UTF-8 <"$1" >/dev/null 2>&1' sh "$1" >/dev/null 2>&1 || rc=$?
+  return "$rc"
+}
+
+case "$cmd" in
+  list)
+    isroot=false
+    writable=false
+    target="$p"
+    if [[ "$area" == root ]]; then
+      isroot=true
+    elif [[ "$area" == public ]]; then
+      writable=true
+    elif [[ "$area" == logs && "$p" != logs ]]; then
+      json_err "non è una cartella"
+    elif [[ "$area" == wpconfig ]]; then
+      json_err "non è una cartella"
+    fi
+    if [[ "$isroot" == true ]]; then
+      # Voci virtuali: public e logs ci sono sempre, wp-config.php solo se esiste.
+      { run_in find -P public logs wp-config.php -maxdepth 0 -printf "$FM_FIND_FMT" 2>/dev/null || true; } |
+        jq -Rsc --arg path "$p" "$FM_JQ_DEF"'
+          entries as $e
+          | reduce ("public", "logs") as $n ($e;
+              if any(.[]; .name == $n) then .
+              else . + [{name: $n, type: "dir", size: 0, mtime: "0.000000000", perms: "drwxr-xr-x"}] end)
+          | {ok: true, path: $path, writable: false, entries: sort_by(.name)}'
+    else
+      rc=0
+      run_in test -d "$target" -a ! -L "$target" >/dev/null 2>&1 || rc=$?
+      ((rc == 0)) || json_err "cartella non trovata: $p"
+      { run_in find -P "$target" -mindepth 1 -maxdepth 1 -printf "$FM_FIND_FMT" 2>/dev/null || true; } |
+        jq -Rsc --arg path "$p" --argjson w "$writable" "$FM_JQ_DEF"'
+          {ok: true, path: $path, writable: $w, entries: (entries | sort_by(.name))}'
+    fi
+    ;;
+  stat)
+    entry="$({ run_in find -P "${p:-.}" -maxdepth 0 -printf "$FM_FIND_FMT" 2>/dev/null || true; } |
+      jq -Rsc "$FM_JQ_DEF"' entries | .[0] // empty')"
+    [[ -n "$entry" ]] || json_err "percorso non trovato: $p"
+    text=false
+    etype="$(jq -r .type <<<"$entry")"
+    esize="$(jq -r .size <<<"$entry")"
+    if [[ "$etype" == file ]] && ((esize <= FM_TEXT_MAX)); then
+      if fm_is_text "$p"; then text=true; fi
+    fi
+    jq -nc --argjson e "$entry" --argjson t "$text" \
+      '{ok: true, type: $e.type, size: $e.size, mtime: $e.mtime, text: $t}'
+    ;;
+  read)
+    [[ "$area" != root ]] || json_err "non è un file"
+    rc=0
+    # Solo file regolari, mai collegamenti: la destinazione non viene aperta.
+    # shellcheck disable=SC2016
+    run_in sh -c 'test -f "$1" -a ! -L "$1" || exit 66
+exec cat <"$1"' sh "$p" || rc=$?
+    if ((rc == 66)); then json_err "non è un file regolare: $p"; fi
+    ((rc == 0)) || json_err "lettura non riuscita: $p"
+    ;;
+esac
