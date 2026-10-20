@@ -46,6 +46,10 @@ fm_path_check() {
   fi
   [[ "$p" != /* && "$p" != */ ]] || return 1
   [[ "$p" != *[[:cntrl:]]* ]] || return 1
+  # byte non UTF-8: il pannello non può indirizzare quel nome in modo affidabile
+  if [[ "$p" == *[^\ -~]* ]]; then
+    printf '%s' "$p" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || return 1
+  fi
   IFS=/ read -r -a segs <<<"$p"
   for seg in "${segs[@]}"; do
     [[ -n "$seg" && "$seg" != . && "$seg" != .. ]] || return 1

@@ -420,3 +420,345 @@ no_runuser() { [ ! -s "$CALLS" ] || ! grep -q '^runuser' "$CALLS"; }
   [ "$(jq -r .text <<<"$output")" = true ]
   grep -q '^runuser -u site_blog_miosito_it' "$CALLS"
 }
+
+# ------------------------------------------------- rinforzi (revisione Task 2)
+
+@test "vps-files list/stat: fifo e socket sono type other, read li rifiuta" {
+  mk_fm_site
+  mkfifo "$R/public/coda"
+  run timeout 20 bash "$REPO_ROOT/tools/vps-files" list blog.miosito.it public
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '.entries[] | select(.name=="coda") | .type' <<<"$output" 2>/dev/null)" = other ]
+  run timeout 20 bash "$REPO_ROOT/tools/vps-files" stat blog.miosito.it public/coda
+  [ "$(jq -r .type <<<"$output" 2>/dev/null)" = other ]
+  [ "$(jq -r .text <<<"$output" 2>/dev/null)" = false ]
+  run timeout 20 bash "$REPO_ROOT/tools/vps-files" read blog.miosito.it public/coda
+  [ "$status" -eq 1 ]
+}
+
+@test "vps-files: letture come utente del sito sotto timeout (10 s testo, 120 s read)" {
+  mk_fm_site
+  printf 'ciao\n' >"$R/public/t.txt"
+  make_stub timeout 'echo "timeout $1" >>"$CALLS"; shift; exec "$@"'
+  run vf stat blog.miosito.it public/t.txt
+  [ "$(jq -r .text <<<"$output")" = true ]
+  grep -qx 'timeout 10' "$CALLS"
+  run vf read blog.miosito.it public/t.txt
+  [ "$output" = ciao ]
+  grep -qx 'timeout 120' "$CALLS"
+}
+
+@test "vps-files list: oltre 10.000 voci taglia e segnala truncated" {
+  mk_fm_site
+  mkdir "$R/public/molti"
+  (cd "$R/public/molti" && seq 1 10001 | xargs touch)
+  run vf list blog.miosito.it public/molti
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '.entries | length' <<<"$output")" -eq 10000 ]
+  [ "$(jq -r .truncated <<<"$output")" = true ]
+  rm "$R/public/molti/10001"
+  run vf list blog.miosito.it public/molti
+  [ "$(jq -r '.entries | length' <<<"$output")" -eq 10000 ]
+  [ "$(jq -r .truncated <<<"$output")" = false ]
+}
+
+@test "vps-files list: cartella non leggibile dal sito -> errore, non lista vuota" {
+  mk_fm_site
+  mkdir "$R/public/chiusa"
+  : >"$R/public/chiusa/x"
+  chmod -R a+rwX "$BATS_TEST_TMPDIR"
+  chmod a+x "$BATS_TEST_TMPDIR" /tmp 2>/dev/null || true
+  cat >"$BATS_TEST_TMPDIR/runuser-nobody" <<'STUB'
+#!/usr/bin/env bash
+shift 3
+while [[ "$1" == env || "$1" == -i || "$1" == *=* ]]; do shift; done
+exec /usr/sbin/runuser -u nobody -- "$@"
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/runuser-nobody"
+  chmod 000 "$R/public/chiusa"
+  FM_RUNUSER="$BATS_TEST_TMPDIR/runuser-nobody" run vf list blog.miosito.it public/chiusa
+  chmod 755 "$R/public/chiusa"
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"non leggibile"* ]]
+}
+
+@test "vps-files: nomi non UTF-8 elencati con raw false, ogni comando li rifiuta" {
+  mk_fm_site
+  : >"$R/public/ok"
+  : >"$R/public/$(printf 'rot\377to')"
+  run vf list blog.miosito.it public
+  [ "$(jq -r '.entries[] | select(.name=="ok") | .raw' <<<"$output")" = true ]
+  [ "$(jq -r '[.entries[] | select(.raw == false)] | length' <<<"$output")" -eq 1 ]
+  bad="public/$(printf 'rot\377to')"
+  for c in list stat read mkdir write; do
+    run vf "$c" blog.miosito.it "$bad" </dev/null
+    [ "$status" -eq 1 ] || { echo "accettato: $c"; false; }
+  done
+  run vf delete blog.miosito.it -- "$bad"
+  [ "$status" -eq 1 ]
+  run vf rename blog.miosito.it public/ok "$(printf 'x\377')"
+  [ "$status" -eq 1 ]
+  [ -e "$R/public/$(printf 'rot\377to')" ]
+}
+
+# --------------------------------------------------------------- scritture
+
+fsize() { stat -c %s "$1"; }
+
+@test "vps-files write: file nuovo, byte per byte, risposta con mtime e size" {
+  mk_fm_site
+  printf '\xef\xbb\xbfa\r\nb\0c' >"$BATS_TEST_TMPDIR/in"
+  run vf write blog.miosito.it "public/nuovo file" <"$BATS_TEST_TMPDIR/in"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .ok <<<"$output")" = true ]
+  [ "$(jq -r .size <<<"$output")" = 9 ]
+  [ "$(jq -r .mtime <<<"$output")" = "$(stat -c %.9Y "$R/public/nuovo file")" ]
+  cmp "$BATS_TEST_TMPDIR/in" "$R/public/nuovo file"
+  [ "$(stat -c %a "$R/public/nuovo file")" = 664 ]
+  [ "$(ls -A "$R/public" | wc -l)" -eq 1 ]
+  grep -q '^runuser -u site_blog_miosito_it' "$CALLS"
+}
+
+@test "vps-files write: file esistente senza --overwrite -> conflitto, file intatto" {
+  mk_fm_site
+  printf 'vecchio' >"$R/public/a.txt"
+  run vf write blog.miosito.it public/a.txt <<<"nuovo"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "esiste già" ]
+  [ "$(jq -r '.conflicts | join(",")' <<<"$output")" = public/a.txt ]
+  [ "$(cat "$R/public/a.txt")" = vecchio ]
+  printf 'nuovo' | vf write blog.miosito.it public/a.txt --overwrite >/dev/null
+  [ "$(cat "$R/public/a.txt")" = nuovo ]
+  [ "$(ls -A "$R/public" | wc -l)" -eq 1 ]
+}
+
+@test "vps-files write: --if-mtime/--if-size vecchi -> changed, file intatto" {
+  mk_fm_site
+  printf 'v1' >"$R/public/a.txt"
+  m="$(stat -c %.9Y "$R/public/a.txt")"
+  run vf write blog.miosito.it public/a.txt --overwrite --if-mtime 1000.000000000 --if-size 2 <<<"x"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .changed <<<"$output")" = true ]
+  [ "$(jq -r .error <<<"$output")" = "il file è cambiato" ]
+  run vf write blog.miosito.it public/a.txt --overwrite --if-mtime "$m" --if-size 99 <<<"x"
+  [ "$(jq -r .changed <<<"$output")" = true ]
+  [ "$(cat "$R/public/a.txt")" = v1 ]
+  run vf write blog.miosito.it public/a.txt --if-mtime "$m" --if-size 2 <<<"v2"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$R/public/a.txt")" = v2 ]
+  # file sparito: cambiato
+  rm "$R/public/a.txt"
+  run vf write blog.miosito.it public/a.txt --if-mtime "$m" --if-size 2 <<<"v3"
+  [ "$(jq -r .changed <<<"$output")" = true ]
+  [ ! -e "$R/public/a.txt" ]
+  [ "$(ls -A "$R/public" | wc -l)" -eq 0 ]
+  # opzioni incomplete o malformate
+  run vf write blog.miosito.it public/a.txt --if-mtime "$m" <<<"x"
+  [ "$status" -eq 1 ]
+  run vf write blog.miosito.it public/a.txt --if-mtime abc --if-size 1 <<<"x"
+  [ "$status" -eq 1 ]
+}
+
+@test "vps-files write: 10 MB esatti sì, 10 MB + 1 no e nulla scritto" {
+  mk_fm_site
+  head -c 10485760 /dev/zero >"$BATS_TEST_TMPDIR/dieci"
+  run vf write blog.miosito.it public/dieci <"$BATS_TEST_TMPDIR/dieci"
+  [ "$status" -eq 0 ]
+  [ "$(fsize "$R/public/dieci")" -eq 10485760 ]
+  head -c 10485761 /dev/zero >"$BATS_TEST_TMPDIR/troppo"
+  run vf write blog.miosito.it public/troppo <"$BATS_TEST_TMPDIR/troppo"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .ok <<<"$output")" = false ]
+  [ ! -e "$R/public/troppo" ]
+  run vf write blog.miosito.it public/dieci --overwrite <"$BATS_TEST_TMPDIR/troppo"
+  [ "$status" -eq 1 ]
+  [ "$(fsize "$R/public/dieci")" -eq 10485760 ]
+  [ "$(ls -A "$R/public" | wc -l)" -eq 1 ]
+}
+
+@test "vps-files scritture: aree e destinazioni non ammesse" {
+  mk_fm_site
+  mkdir "$R/public/d"
+  ln -s "$SECRET" "$R/public/lnk"
+  ln -s "$BATS_TEST_TMPDIR" "$R/public/dlnk"
+  printf 'x' >"$R/wp-config.php"
+  for p in logs/x wp-config.php public tmp/x public/nonesiste/x public/dlnk/x public/lnk public/d; do
+    run vf write blog.miosito.it "$p" --overwrite <<<"zzz"
+    [ "$status" -eq 1 ] || { echo "write accettato: $p"; false; }
+  done
+  [ "$(cat "$R/wp-config.php")" = x ]
+  [ "$(cat "$SECRET")" = SEGRETO-ALTRO-SITO ]
+  [ ! -e "$BATS_TEST_TMPDIR/x" ]
+  for p in logs/x wp-config.php public tmp/x public/nonesiste/x public/dlnk/x public/d; do
+    run vf mkdir blog.miosito.it "$p"
+    [ "$status" -eq 1 ] || { echo "mkdir accettato: $p"; false; }
+  done
+  run vf delete blog.miosito.it -- public/dlnk/x
+  [ "$status" -eq 1 ]
+  run vf rename blog.miosito.it wp-config.php altro
+  [ "$status" -eq 1 ]
+}
+
+@test "vps-files mkdir: crea la cartella, esistente -> conflitto" {
+  mk_fm_site
+  run vf mkdir blog.miosito.it "public/nuova cartella"
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"ok":true}' ]
+  [ -d "$R/public/nuova cartella" ]
+  [ "$(stat -c %a "$R/public/nuova cartella")" = 775 ]
+  run vf mkdir blog.miosito.it "public/nuova cartella"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r '.conflicts[0]' <<<"$output")" = "public/nuova cartella" ]
+  grep -q '^runuser -u site_blog_miosito_it' "$CALLS"
+}
+
+@test "vps-files rename: apostrofo, spazi, - iniziale; con / o conflitto rifiutato" {
+  mk_fm_site
+  : >"$R/public/a b"
+  : >"$R/public/altro"
+  run vf rename blog.miosito.it "public/a b" "l'altro -x è"
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"ok":true}' ]
+  [ -e "$R/public/l'altro -x è" ]
+  [ ! -e "$R/public/a b" ]
+  for n in "x/y" "../x" ".." "." "" "$(printf 'a\nb')" "$(printf 'r\377')"; do
+    run vf rename blog.miosito.it "public/altro" "$n"
+    [ "$status" -eq 1 ] || { echo "accettato: $n"; false; }
+  done
+  [ -e "$R/public/altro" ]
+  run vf rename blog.miosito.it "public/altro" "l'altro -x è"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r '.conflicts[0]' <<<"$output")" = "public/l'altro -x è" ]
+  run vf rename blog.miosito.it public/nonesiste nuovo
+  [ "$status" -eq 1 ]
+  mkdir "$R/public/d"
+  : >"$R/public/d/f"
+  run vf rename blog.miosito.it public/d/f g
+  [ -e "$R/public/d/g" ]
+  grep -q '^runuser -u site_blog_miosito_it' "$CALLS"
+}
+
+@test "vps-files move: un conflitto su due elementi -> nulla spostato" {
+  mk_fm_site
+  mkdir "$R/public/dest"
+  : >"$R/public/a"
+  : >"$R/public/b"
+  : >"$R/public/dest/b"
+  run vf move blog.miosito.it public/dest -- public/a public/b
+  [ "$status" -eq 1 ]
+  [ "$(jq -r '.conflicts | length' <<<"$output")" -eq 1 ]
+  [ "$(jq -r '.conflicts[0]' <<<"$output")" = public/dest/b ]
+  [ -e "$R/public/a" ]
+  [ -e "$R/public/b" ]
+  [ ! -e "$R/public/dest/a" ]
+  run vf move blog.miosito.it public/dest --overwrite -- public/a public/b
+  [ "$status" -eq 0 ]
+  [ -e "$R/public/dest/a" ]
+  [ -e "$R/public/dest/b" ]
+  [ ! -e "$R/public/a" ]
+  [ ! -e "$R/public/b" ]
+}
+
+@test "vps-files move/copy: destinazioni e origini incoerenti rifiutate" {
+  mk_fm_site
+  mkdir -p "$R/public/d/sub"
+  : >"$R/public/f"
+  for c in move copy; do
+    run vf "$c" blog.miosito.it public/d/sub -- public/d
+    [ "$status" -eq 1 ] || { echo "$c dentro se stessa"; false; }
+    run vf "$c" blog.miosito.it public -- public/f
+    [ "$status" -eq 1 ] || { echo "$c stessa cartella"; false; }
+    run vf "$c" blog.miosito.it public/f -- public/d
+    [ "$status" -eq 1 ]
+    run vf "$c" blog.miosito.it public/d -- public
+    [ "$status" -eq 1 ]
+    run vf "$c" blog.miosito.it logs -- public/f
+    [ "$status" -eq 1 ]
+    run vf "$c" blog.miosito.it public/d -- public/nonesiste
+    [ "$status" -eq 1 ]
+    run vf "$c" blog.miosito.it public/d -- public/f public/d/sub
+    [ "$status" -eq 1 ]
+    run vf "$c" blog.miosito.it public/d
+    [ "$status" -eq 1 ]
+    run vf "$c" blog.miosito.it public/d --
+    [ "$status" -eq 1 ]
+  done
+  [ -e "$R/public/f" ]
+  [ -d "$R/public/d/sub" ]
+}
+
+@test "vps-files copy: cartella con un link, il link resta link" {
+  mk_fm_site
+  mkdir -p "$R/public/src/sub" "$R/public/dest"
+  printf 'dentro' >"$R/public/src/sub/f"
+  ln -s "$SECRET" "$R/public/src/lnk"
+  run vf copy blog.miosito.it public/dest -- public/src
+  [ "$status" -eq 0 ]
+  [ -L "$R/public/dest/src/lnk" ]
+  [ "$(readlink "$R/public/dest/src/lnk")" = "$SECRET" ]
+  [ "$(cat "$R/public/dest/src/sub/f")" = dentro ]
+  [ -e "$R/public/src/sub/f" ]
+  run vf copy blog.miosito.it public/dest -- public/src
+  [ "$status" -eq 1 ]
+  [ "$(jq -r '.conflicts[0]' <<<"$output")" = public/dest/src ]
+  run vf copy blog.miosito.it public/dest --overwrite -- public/src
+  [ "$status" -eq 0 ]
+  [ -L "$R/public/dest/src/lnk" ]
+  grep -q '^runuser -u site_blog_miosito_it' "$CALLS"
+}
+
+@test "vps-files copy: oltre 200 MB rifiutato, nulla copiato" {
+  mk_fm_site
+  mkdir "$R/public/dest"
+  truncate -s 209715201 "$R/public/grande"
+  run vf copy blog.miosito.it public/dest -- public/grande
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .ok <<<"$output")" = false ]
+  [ ! -e "$R/public/dest/grande" ]
+  truncate -s 209715200 "$R/public/grande"
+  run vf copy blog.miosito.it public/dest -- public/grande
+  [ "$status" -eq 0 ]
+  [ -e "$R/public/dest/grande" ]
+}
+
+@test "vps-files delete: public rifiutato, due percorsi ok, link tolto senza toccare la destinazione" {
+  mk_fm_site
+  mkdir -p "$R/public/a/x"
+  : >"$R/public/b"
+  : >"$R/public/-opzione"
+  : >"$R/public/ri ga"
+  ln -s "$SECRET" "$R/public/lnk"
+  run vf delete blog.miosito.it -- public
+  [ "$status" -eq 1 ]
+  run vf delete blog.miosito.it -- public/b public
+  [ "$status" -eq 1 ]
+  [ -e "$R/public/b" ]
+  for p in logs/php wp-config.php tmp /etc ""; do
+    run vf delete blog.miosito.it -- "$p"
+    [ "$status" -eq 1 ] || { echo "accettato: $p"; false; }
+  done
+  run vf delete blog.miosito.it -- public/a public/b
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"ok":true}' ]
+  [ ! -e "$R/public/a" ]
+  [ ! -e "$R/public/b" ]
+  run vf delete blog.miosito.it -- public/-opzione "public/ri ga" public/lnk
+  [ "$status" -eq 0 ]
+  [ -z "$(ls -A "$R/public")" ]
+  [ "$(cat "$SECRET")" = SEGRETO-ALTRO-SITO ]
+  grep -q '^runuser -u site_blog_miosito_it' "$CALLS"
+  run vf delete blog.miosito.it public/x
+  [ "$status" -eq 1 ]
+  run vf delete blog.miosito.it --
+  [ "$status" -eq 1 ]
+}
+
+@test "vps-files scritture: registro con comando, sito e percorsi, mai i contenuti" {
+  mk_fm_site
+  printf 'CONTENUTO-RISERVATO' | vf write blog.miosito.it public/a.txt >/dev/null
+  vf delete blog.miosito.it -- public/a.txt >/dev/null
+  grep -q 'files write blog.miosito.it .*public/a.txt' "$VPS_LOG"
+  grep -q 'files delete blog.miosito.it .*public/a.txt' "$VPS_LOG"
+  run grep -q RISERVATO "$VPS_LOG"
+  [ "$status" -eq 1 ]
+}

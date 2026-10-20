@@ -22,31 +22,165 @@ for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
 done
 tool_init
 
-USO="uso: vps-files list|stat|read DOMINIO PERCORSO"
-FM_TEXT_MAX=2097152
+# Numero di argomenti per comando (comando e dominio compresi):
+#   list|stat|read|mkdir DOM PERCORSO                       esattamente 3
+#   write  DOM PERCORSO [--overwrite] [--if-mtime M --if-size N]   da 3 a 8, contenuto su stdin
+#   rename DOM DA NUOVONOME                                 esattamente 4
+#   move|copy DOM DESTINAZIONE [--overwrite] -- PERCORSO...  almeno 5
+#   delete DOM -- PERCORSO...                               almeno 4
+USO="uso: vps-files list|stat|read|mkdir DOM PERCORSO | write DOM PERCORSO [--overwrite] [--if-mtime SEC.NSEC --if-size N] | rename DOM DA NUOVONOME | move|copy DOM DEST [--overwrite] -- PERCORSO... | delete DOM -- PERCORSO..."
+FM_TEXT_MAX=2097152 # i limiti di scrittura (10 MB) e copia (200 MB) sono negli script sh
+FM_MAX_PATHS=500
+FM_LIST_MAX=10000
 # Record di find, separati da NUL: tipo, dimensione, data (sec.nsec), permessi, nome.
 # shellcheck disable=SC2016
 FM_FIND_FMT='%y\0%s\0%T@\0%M\0%f\0'
 # Dal flusso di find all'array di voci: JSON costruito solo da jq, mai a mano.
+# raw false = nome con byte non UTF-8 (jq li mostra come U+FFFD): non indirizzabile.
 # shellcheck disable=SC2016
 FM_JQ_DEF='def mt: split(".") as $p | $p[0] + "." + ((($p[1] // "") + "000000000")[:9]);
   def entries: (split("\u0000")[:-1]) as $f
     | [range(0; ($f | length); 5) as $i
-       | {name: $f[$i + 4], type: ({"f": "file", "d": "dir", "l": "link"}[$f[$i]] // "file"),
-          size: ($f[$i + 1] | tonumber), mtime: ($f[$i + 2] | mt), perms: $f[$i + 3]}];'
+       | {name: $f[$i + 4], type: ({"f": "file", "d": "dir", "l": "link"}[$f[$i]] // "other"),
+          size: ($f[$i + 1] | tonumber), mtime: ($f[$i + 2] | mt), perms: $f[$i + 3],
+          raw: ($f[$i + 4] | contains("�") | not)}];'
 
-(($# == 3)) || json_err "$USO"
+# Funzioni per gli script sh eseguiti come utente del sito: chkp = i genitori del
+# percorso sono cartelle vere (nessun collegamento simbolico lungo la strada); ex = esiste.
+read -r -d '' FM_SH_LIB <<'EOS' || true
+chkp() {
+  d="$1"
+  case "$d" in */*) d="${d%/*}" ;; *) return 0 ;; esac
+  set -f
+  pre=""
+  oldifs="$IFS"
+  IFS=/
+  for s in $d; do
+    pre="${pre:+$pre/}$s"
+    if [ -L "$pre" ]; then
+      IFS="$oldifs"
+      return 1
+    fi
+  done
+  IFS="$oldifs"
+  [ -d "$d" ]
+}
+ex() { [ -e "$1" ] || [ -L "$1" ]; }
+EOS
+
+# Scrittura: tmp nella stessa cartella, poi rename (o ln se il file deve essere nuovo).
+# Uscite: 66 non file regolare, 67 genitori non validi, 68 troppo grande, 69 cambiato, 70 esiste.
+read -r -d '' FM_SH_WRITE <<'EOS' || true
+t="$1"; ow="$2"; im="$3"; is="$4"
+chkp "$t" || exit 67
+if ex "$t"; then
+  [ "$ow" = 1 ] || exit 70
+  { [ -f "$t" ] && [ ! -L "$t" ]; } || exit 66
+elif [ -n "$im" ]; then
+  exit 69
+fi
+tmp="$(mktemp "${t%/*}/.vpsfiles.XXXXXX")" || exit 1
+trap 'rm -f -- "$tmp"' EXIT INT TERM
+head -c 10485761 >"$tmp"
+[ "$(wc -c <"$tmp")" -le 10485760 ] || exit 68
+if ex "$t"; then chmod --reference="$t" -- "$tmp"; else chmod 664 -- "$tmp"; fi
+if [ -n "$im" ]; then
+  cur="$(stat -c '%.9Y %s' -- "$t" 2>/dev/null)" || exit 69
+  [ "$cur" = "$im $is" ] || exit 69
+fi
+if [ "$ow" = 1 ]; then
+  mv -T -- "$tmp" "$t" || exit 1
+else
+  ln -- "$tmp" "$t" 2>/dev/null || exit 70
+fi
+stat -c '%.9Y %s' -- "$t"
+EOS
+
+read -r -d '' FM_SH_MKDIR <<'EOS' || true
+chkp "$1" || exit 67
+ex "$1" && exit 70
+mkdir -- "$1" || exit 1
+EOS
+
+read -r -d '' FM_SH_RENAME <<'EOS' || true
+chkp "$1" || exit 67
+chkp "$2" || exit 67
+ex "$1" || exit 65
+ex "$2" && exit 70
+mv -n -T -- "$1" "$2" || exit 1
+EOS
+
+# Controllo di destinazione e origini (move/copy): 65 origine mancante, 67 cartella non valida.
+read -r -d '' FM_SH_CHK <<'EOS' || true
+d="$1"; shift
+{ [ -d "$d" ] && [ ! -L "$d" ]; } || exit 67
+chkp "$d/x" || exit 67
+for s; do
+  chkp "$s" || exit 67
+  ex "$s" || exit 65
+done
+EOS
+
+# Elenco (NUL) degli argomenti che esistono già.
+read -r -d '' FM_SH_EXIST <<'EOS' || true
+for t; do
+  if ex "$t"; then printf '%s\0' "$t"; fi
+done
+exit 0
+EOS
+
+read -r -d '' FM_SH_SIZE <<'EOS' || true
+tot=0
+for s; do
+  n="$(du -sb -- "$s" 2>/dev/null | cut -f1)"
+  tot=$((tot + ${n:-0}))
+done
+[ "$tot" -le 209715200 ] || exit 68
+EOS
+
+# Coppie origine/destinazione: op ow s1 t1 s2 t2 ...
+read -r -d '' FM_SH_MVCP <<'EOS' || true
+op="$1"; ow="$2"; shift 2
+while [ "$#" -gt 0 ]; do
+  s="$1"; t="$2"; shift 2
+  if [ "$ow" = 1 ]; then rm -rf -- "$t" || exit 1; fi
+  if [ "$op" = move ]; then
+    mv -n -T -- "$s" "$t" || exit 1
+  else
+    cp -n -P -R -T --preserve=mode,timestamps -- "$s" "$t" || exit 1
+  fi
+done
+EOS
+
+read -r -d '' FM_SH_DEL <<'EOS' || true
+for s; do chkp "$s" || exit 67; done
+rm -rf -- "$@" || exit 1
+EOS
+
+# Comandi e numero di argomenti (vedi sopra) prima di qualsiasi altra cosa.
+(($# >= 2)) || json_err "$USO"
 cmd="$1"
 dom="$2"
-p="$3"
 case "$cmd" in
-  list | stat | read) ;;
+  list | stat | read | mkdir) (($# == 3)) || json_err "$USO" ;;
+  write) (($# >= 3 && $# <= 8)) || json_err "$USO" ;;
+  rename) (($# == 4)) || json_err "$USO" ;;
+  move | copy) (($# >= 5)) || json_err "$USO" ;;
+  delete) (($# >= 4)) || json_err "$USO" ;;
   *) json_err "$USO" ;;
 esac
 info="$(fm_site_check "$dom" 2>&1)" || json_err "$info"
 slug="${info%% *}"
 root="${info#* }"
-area="$(fm_path_check "$p")" || json_err "percorso non valido o non consentito"
+
+p=""
+area=""
+case "$cmd" in
+  list | stat | read | mkdir | write | rename)
+    p="$3"
+    area="$(fm_path_check "$p")" || json_err "percorso non valido o non consentito"
+    ;;
+esac
 
 # Solo le voci dirette di logs/ si aprono come root; tutto il resto come utente del sito.
 mode=site
@@ -64,17 +198,64 @@ run_in() {
   fi
 }
 
+# site_sh SECONDI SCRIPT ARGOMENTI... — script sh come utente del sito, con timeout;
+# FM_SH_LIB è anteposta. stdin passa.
+site_sh() {
+  local t="$1" script="$2"
+  shift 2
+  fm_as_site "$slug" "$root" timeout "$t" sh -c "$FM_SH_LIB"$'\n'"$script" sh "$@"
+}
+
 # fm_is_text PERCORSO — §3.3: al massimo 2 MB, nessun NUL nei primi 8 KB, UTF-8 valido.
+# Legge al massimo 2 MB + 1 e sotto timeout: un fifo scambiato al volo non blocca.
 fm_is_text() {
   local rc=0
   # shellcheck disable=SC2016
-  run_in sh -c 'test -f "$1" -a ! -L "$1" || exit 1
+  run_in timeout 10 sh -c 'test -f "$1" -a ! -L "$1" || exit 1
 a="$(head -c 8192 <"$1" | wc -c)"
 b="$(head -c 8192 <"$1" | tr -d "\000" | wc -c)"
 test "$a" = "$b" || exit 1
-iconv -f UTF-8 -t UTF-8 <"$1" >/dev/null 2>&1' sh "$1" >/dev/null 2>&1 || rc=$?
+n="$(head -c 2097153 <"$1" | wc -c)"
+test "$n" -le 2097152 || exit 1
+head -c 2097153 <"$1" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1' sh "$1" >/dev/null 2>&1 || rc=$?
   return "$rc"
 }
+
+# fm_log COMANDO PERCORSO... — registro: comando, sito, al massimo 20 percorsi e il totale.
+fm_log() {
+  local c="$1" n=$(($# - 1)) list
+  shift
+  list="$(printf '%q ' "${@:1:20}")"
+  log "files $c $dom $list""totale=$n"
+}
+
+# fm_conflict PERCORSO... — risposta di conflitto, uscita 1.
+fm_conflict() {
+  jq -nc '{ok: false, error: "esiste già", conflicts: $ARGS.positional}' --args "$@"
+  exit 1
+}
+
+# fm_fail CODICE — messaggio per le uscite comuni degli script sh.
+fm_fail() {
+  case "$1" in
+    65) json_err "origine non trovata" ;;
+    66) json_err "non è un file regolare" ;;
+    67) json_err "cartella non valida o percorso che passa da un collegamento" ;;
+    68) json_err "troppo grande" ;;
+    124) json_err "operazione scaduta" ;;
+    *) json_err "operazione non riuscita" ;;
+  esac
+}
+
+# under A B — A è B stesso o sta dentro B.
+under() { [[ "$1" == "$2" || "$1" == "$2"/* ]]; }
+
+# Parte comune di mkdir/write/rename: solo sotto public/, mai public stesso.
+case "$cmd" in
+  mkdir | write | rename)
+    fm_writable "$p" || json_err "percorso in sola lettura o non consentito: $p"
+    ;;
+esac
 
 case "$cmd" in
   list)
@@ -97,15 +278,22 @@ case "$cmd" in
           entries as $e
           | reduce ("public", "logs") as $n ($e;
               if any(.[]; .name == $n) then .
-              else . + [{name: $n, type: "dir", size: 0, mtime: "0.000000000", perms: "drwxr-xr-x"}] end)
-          | {ok: true, path: $path, writable: false, entries: sort_by(.name)}'
+              else . + [{name: $n, type: "dir", size: 0, mtime: "0.000000000", perms: "drwxr-xr-x", raw: true}] end)
+          | {ok: true, path: $path, writable: false, truncated: false, entries: sort_by(.name)}'
     else
       rc=0
       run_in test -d "$target" -a ! -L "$target" >/dev/null 2>&1 || rc=$?
       ((rc == 0)) || json_err "cartella non trovata: $p"
-      { run_in find -P "$target" -mindepth 1 -maxdepth 1 -printf "$FM_FIND_FMT" 2>/dev/null || true; } |
-        jq -Rsc --arg path "$p" --argjson w "$writable" "$FM_JQ_DEF"'
-          {ok: true, path: $path, writable: $w, entries: (entries | sort_by(.name))}'
+      rc=0
+      run_in test -r "$target" -a -x "$target" >/dev/null 2>&1 || rc=$?
+      ((rc == 0)) || json_err "cartella non leggibile: $p"
+      # Al massimo FM_LIST_MAX + 1 voci (5 campi NUL ciascuna): oltre si taglia.
+      { run_in find -P "$target" -mindepth 1 -maxdepth 1 -printf "$FM_FIND_FMT" 2>/dev/null |
+        head -z -n $(((FM_LIST_MAX + 1) * 5)) || true; } |
+        jq -Rsc --arg path "$p" --argjson w "$writable" --argjson max "$FM_LIST_MAX" "$FM_JQ_DEF"'
+          entries as $e
+          | {ok: true, path: $path, writable: $w, truncated: ($e | length > $max),
+             entries: ($e[:$max] | sort_by(.name))}'
     fi
     ;;
   stat)
@@ -126,9 +314,150 @@ case "$cmd" in
     rc=0
     # Solo file regolari, mai collegamenti: la destinazione non viene aperta.
     # shellcheck disable=SC2016
-    run_in sh -c 'test -f "$1" -a ! -L "$1" || exit 66
+    run_in timeout 120 sh -c 'test -f "$1" -a ! -L "$1" || exit 66
 exec cat <"$1"' sh "$p" || rc=$?
     if ((rc == 66)); then json_err "non è un file regolare: $p"; fi
+    if ((rc == 124)); then json_err "lettura scaduta: $p"; fi
     ((rc == 0)) || json_err "lettura non riuscita: $p"
+    ;;
+  write)
+    shift 3
+    ow=0
+    im=""
+    is=""
+    while (($#)); do
+      case "$1" in
+        --overwrite)
+          ow=1
+          shift
+          ;;
+        --if-mtime)
+          (($# >= 2)) || json_err "$USO"
+          im="$2"
+          shift 2
+          ;;
+        --if-size)
+          (($# >= 2)) || json_err "$USO"
+          is="$2"
+          shift 2
+          ;;
+        *) json_err "$USO" ;;
+      esac
+    done
+    if [[ -n "$im$is" ]]; then
+      [[ "$im" =~ ^[0-9]+\.[0-9]{9}$ && "$is" =~ ^[0-9]+$ ]] || json_err "--if-mtime e --if-size vanno usati insieme, con valori validi"
+      ow=1 # sostituire una versione precisa del file
+    fi
+    fm_log write "$p"
+    rc=0
+    out="$(site_sh 120 "$FM_SH_WRITE" "$p" "$ow" "$im" "$is")" || rc=$?
+    case "$rc" in
+      0) ;;
+      70) fm_conflict "$p" ;;
+      69)
+        printf '{"ok":false,"error":"il file è cambiato","changed":true}\n'
+        exit 1
+        ;;
+      68) json_err "file troppo grande (massimo 10 MB)" ;;
+      *) fm_fail "$rc" ;;
+    esac
+    read -r wm ws <<<"$out"
+    jq -nc --arg m "$wm" --argjson s "${ws:-0}" '{ok: true, mtime: $m, size: $s}'
+    ;;
+  mkdir)
+    fm_log mkdir "$p"
+    rc=0
+    site_sh 30 "$FM_SH_MKDIR" "$p" || rc=$?
+    case "$rc" in
+      0) ;;
+      70) fm_conflict "$p" ;;
+      *) fm_fail "$rc" ;;
+    esac
+    json_ok
+    ;;
+  rename)
+    new="$4"
+    [[ -n "$new" && "$new" != */* ]] || json_err "nuovo nome non valido"
+    np="${p%/*}/$new"
+    fm_writable "$np" || json_err "nuovo nome non valido o non consentito"
+    fm_log rename "$p" "$np"
+    rc=0
+    site_sh 30 "$FM_SH_RENAME" "$p" "$np" || rc=$?
+    case "$rc" in
+      0) ;;
+      70) fm_conflict "$np" ;;
+      *) fm_fail "$rc" ;;
+    esac
+    json_ok
+    ;;
+  move | copy)
+    dest="$3"
+    shift 3
+    ow=0
+    while (($#)) && [[ "$1" != -- ]]; do
+      if [[ "$1" == --overwrite ]]; then ow=1; else json_err "$USO"; fi
+      shift
+    done
+    [[ "${1-}" == -- ]] || json_err "$USO"
+    shift
+    (($# >= 1 && $# <= FM_MAX_PATHS)) || json_err "$USO"
+    darea="$(fm_path_check "$dest")" || json_err "destinazione non valida"
+    [[ "$darea" == public ]] || json_err "la destinazione deve stare in public"
+    srcs=("$@")
+    targets=()
+    for s in "${srcs[@]}"; do
+      fm_writable "$s" || json_err "percorso in sola lettura o non consentito: $s"
+      t="$dest/${s##*/}"
+      fm_path_check "$t" >/dev/null || json_err "nome di destinazione non valido: $t"
+      targets+=("$t")
+    done
+    n=${#srcs[@]}
+    for ((i = 0; i < n; i++)); do
+      s="${srcs[i]}"
+      t="${targets[i]}"
+      [[ "$s" != "$t" ]] || json_err "origine e destinazione coincidono: $s"
+      if under "$dest" "$s"; then json_err "la destinazione sta dentro l'origine: $s"; fi
+      for ((j = 0; j < n; j++)); do
+        if ((j != i)); then
+          if under "$s" "${srcs[j]}"; then json_err "elementi duplicati o uno dentro l'altro"; fi
+          [[ "${targets[j]}" != "$t" ]] || json_err "due elementi con lo stesso nome"
+          if ((ow)) && under "${srcs[j]}" "$t"; then json_err "un'origine sta dentro una destinazione da sovrascrivere"; fi
+        fi
+      done
+    done
+    fm_log "$cmd" "$dest" "${srcs[@]}"
+    rc=0
+    site_sh 60 "$FM_SH_CHK" "$dest" "${srcs[@]}" || rc=$?
+    ((rc == 0)) || fm_fail "$rc"
+    if ((ow == 0)); then
+      conf=()
+      mapfile -d '' conf < <(site_sh 60 "$FM_SH_EXIST" "${targets[@]}")
+      ((${#conf[@]} == 0)) || fm_conflict "${conf[@]}"
+    fi
+    if [[ "$cmd" == copy ]]; then
+      rc=0
+      site_sh 120 "$FM_SH_SIZE" "${srcs[@]}" || rc=$?
+      if ((rc == 68)); then json_err "la copia supera i 200 MB"; fi
+      ((rc == 0)) || fm_fail "$rc"
+    fi
+    pairs=()
+    for ((i = 0; i < n; i++)); do pairs+=("${srcs[i]}" "${targets[i]}"); done
+    rc=0
+    site_sh 120 "$FM_SH_MVCP" "$cmd" "$ow" "${pairs[@]}" || rc=$?
+    ((rc == 0)) || fm_fail "$rc"
+    json_ok
+    ;;
+  delete)
+    [[ "$3" == -- ]] || json_err "$USO"
+    shift 3
+    (($# >= 1 && $# <= FM_MAX_PATHS)) || json_err "$USO"
+    for s in "$@"; do
+      fm_writable "$s" || json_err "percorso in sola lettura o non consentito: $s"
+    done
+    fm_log delete "$@"
+    rc=0
+    site_sh 120 "$FM_SH_DEL" "$@" || rc=$?
+    ((rc == 0)) || fm_fail "$rc"
+    json_ok
     ;;
 esac
