@@ -73,6 +73,8 @@ chkp() {
   [ -d "$d" ]
 }
 ex() { [ -e "$1" ] || [ -L "$1" ]; }
+# temporanei di operazioni interrotte (kill -9, riavvio): quelli di tmp/ oltre un'ora si tolgono
+sweep() { find tmp -maxdepth 1 -name '.vpsfiles-*' -mmin +60 -exec rm -rf -- {} + 2>/dev/null; return 0; }
 EOS
 
 # Scrittura: tmp nella stessa cartella, poi rename (o ln se il file deve essere nuovo).
@@ -150,6 +152,7 @@ EOS
 read -r -d '' FM_SH_MVCP <<'EOS' || true
 op="$1"; ow="$2"; shift 2
 c=""
+sweep
 # a scadenza o in errore la copia parziale non resta
 trap 'if [ -n "$c" ]; then rm -rf -- "$c"; fi' EXIT
 trap 'exit 124' INT TERM
@@ -184,16 +187,24 @@ EOS
 # (sulle dimensioni dichiarate; l'estrazione le ricontrolla sui byte veri). Stampa i nomi, uno
 # per riga. Uscite: 65 manca, 66 non è un file regolare, 67 cartella non valida, 72 zip
 # illeggibile o righe incoerenti col totale, 73 troppe voci, 74 voce > 10 MB, 75 totale > 200 MB,
-# 76 collegamenti o file speciali, 77 nomi non ammessi.
+# 76 collegamenti o file speciali, 77 nomi non ammessi, 78 nomi non UTF-8 o con controlli,
+# 79 voci cifrate.
 read -r -d '' FM_SH_ZLIST <<'EOS' || true
 a="$1"
 chkp "$a" || exit 67
 ex "$a" || exit 65
 { [ -f "$a" ] && [ ! -L "$a" ]; } || exit 66
-list="$(zipinfo -s "$a" 2>/dev/null)" || exit 72
+sweep
+w=""
+trap 'if [ -n "$w" ]; then rm -rf -- "$w"; fi' EXIT
+trap 'exit 124' INT TERM
+w="$(mktemp -d tmp/.vpsfiles-l.XXXXXX)" || exit 1
+# nome fisso: zipinfo e unzip trattano [ ] * ? del nome dell'archivio come caratteri jolly
+ln -- "$a" "$w/a.zip" 2>/dev/null || cp -- "$a" "$w/a.zip" || exit 1
+list="$(LC_ALL=C.UTF-8 zipinfo -s "$w/a.zip" 2>/dev/null)" || exit 72
 printf '%s\n' "$list" | awk '
   function fail(c) { if (!err) err = c }
-  /^[-dlcbps?][-rwxsStTa]+ +[0-9.]+ +[a-zA-Z0-9]+ +[0-9]+ / {
+  /^[-dlcbps?][^ ]+ +[0-9.]+ +[a-zA-Z0-9]+ +[0-9]+ / {
     n++
     t = substr($1, 1, 1)
     sz = $4
@@ -201,6 +212,7 @@ printf '%s\n' "$list" | awk '
     for (i = 0; i < 7; i++) sub(/^[^ ]+ +/, "", nm)
     sub(/^[^ ]+ /, "", nm)
     if (t != "-" && t != "d") fail(76)
+    if ($5 ~ /^[TB]/) fail(79)
     if (sz + 0 > 10485760) fail(74)
     tot += sz
     if (n > 10000) fail(73)
@@ -237,9 +249,11 @@ cleanup() {
   if [ -n "$pid" ]; then kill -9 "$pid" 2>/dev/null; fi
   if [ -n "$w" ]; then rm -rf -- "$w"; fi
 }
+sweep
 trap cleanup EXIT
 trap 'exit 124' INT TERM
 w="$(mktemp -d tmp/.vpsfiles-x.XXXXXX)" || exit 1
+ln -- "$a" "$w/a.zip" 2>/dev/null || cp -- "$a" "$w/a.zip" || exit 1
 w="$PWD/$w"
 s="$w/s"
 mkdir "$s" || exit 1
@@ -247,7 +261,7 @@ mkdir "$s" || exit 1
 fsum() { find "$1" -type f -printf '%s\n' 2>/dev/null | awk '{t += $1} END {print t + 0}'; }
 (
   ulimit -f 20480
-  exec unzip -q -o -d "$s" "$a" >/dev/null 2>&1
+  exec env LC_ALL=C.UTF-8 unzip -q -o -P '' -d "$s" "$w/a.zip" >/dev/null 2>&1
 ) &
 pid=$!
 (
@@ -267,13 +281,15 @@ pid=""
 kill "$wp" 2>/dev/null
 wp=""
 [ ! -e "$w/b" ] || exit 75
-if [ "$rc" -ge 128 ]; then exit 74; fi
+# solo SIGXFSZ (153) è il tetto per file; altri segnali sono un errore generico
+if [ "$rc" = 153 ]; then exit 74; fi
+if [ "$rc" -ge 128 ]; then exit 1; fi
 [ "$rc" = 0 ] || exit 72
 chmod -R u+rwX -- "$s" 2>/dev/null
 if [ -n "$(find "$s" -mindepth 1 ! -type f ! -type d | head -n 1)" ]; then exit 76; fi
 # zipinfo mostra i caratteri di controllo come "?": i nomi veri si controllano qui
-if [ -n "$(find "$s" -mindepth 1 -name '*[[:cntrl:]]*' | head -n 1)" ]; then exit 77; fi
-find "$s" -mindepth 1 -print0 | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || exit 77
+if [ -n "$(find "$s" -mindepth 1 -name '*[[:cntrl:]]*' | head -n 1)" ]; then exit 78; fi
+find "$s" -mindepth 1 -print0 | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || exit 78
 [ "$(find "$s" -mindepth 1 | wc -l)" -le 10000 ] || exit 73
 if [ -n "$(find "$s" -type f -size +10485760c | head -n 1)" ]; then exit 74; fi
 [ "$(fsum "$s")" -le 209715200 ] || exit 75
@@ -323,6 +339,7 @@ for s; do
   chkp "$s" || exit 67
   ex "$s" || exit 65
 done
+sweep
 tot=0
 for s; do
   n="$(du -sbl -- "$s" 2>/dev/null | cut -f1)"
@@ -343,7 +360,7 @@ for s; do
   shift
 done
 cd public || exit 1
-zip -r -y -q -nw "$w/o.zip" -- "$@" >/dev/null 2>&1 || exit 1
+LC_ALL=C.UTF-8 zip -r -y -q -nw "$w/o.zip" -- "$@" >/dev/null 2>&1 || exit 1
 mv -n -T -- "$w/o.zip" "$final" || exit 1
 [ ! -e "$w/o.zip" ] || exit 70
 EOS
@@ -355,6 +372,7 @@ p="$1"
 chkp "$p" || exit 67
 ex "$p" || exit 65
 { [ -d "$p" ] && [ ! -L "$p" ]; } || exit 66
+sweep
 n="$(du -sbl -- "$p" 2>/dev/null | cut -f1)"
 [ "${n:-0}" -le 209715200 ] || exit 68
 w=""
@@ -367,7 +385,7 @@ case "$p" in
   *) par="."; base="$p" ;;
 esac
 cd "$par" || exit 1
-{ zip -r -y -q -nw - -- "$base" 2>/dev/null; echo "$?" >"$w/rc"; } |
+{ LC_ALL=C.UTF-8 zip -r -y -q -nw - -- "$base" 2>/dev/null; echo "$?" >"$w/rc"; } |
   { head -c 209715200; if [ "$(head -c 1 | wc -c)" != 0 ]; then : >"$w/big"; fi; }
 [ ! -e "$w/big" ] || exit 68
 [ "$(cat "$w/rc" 2>/dev/null)" = 0 ] || exit 1
@@ -726,20 +744,29 @@ exec cat <"$1"' sh "$p" || rc=$?
         75) json_err "l'archivio supera i 200 MB estratti" ;;
         76) json_err "l'archivio contiene collegamenti o file speciali" ;;
         77) json_err "l'archivio contiene percorsi non ammessi (assoluti o con ..)" ;;
+        78) json_err "nomi non validi (non UTF-8 o con caratteri di controllo)" ;;
+        79) json_err "l'archivio contiene voci cifrate (con password): non supportate" ;;
         *) fm_fail "$1" ;;
       esac
     }
     # fase 1: elenco e controlli sull'archivio; base64 per vedere l'uscita dello script
+    # un solo budget di 120 s per le due fasi: alla seconda resta quanto avanzato
+    t0=$SECONDS
     rc=0
     nb="$(site_sh 60 "$FM_SH_ZLIST" "$arch" | base64 -w0)" || rc=$?
     ((rc == 0)) || unz_fail "$rc"
     while IFS= read -r nm; do
       # il nome, unito alla destinazione, deve passare le regole di tutti i percorsi
-      fm_path_check "$dest/${nm%/}" >/dev/null || json_err "nome non ammesso nell'archivio: $nm"
+      if ! fm_path_check "$dest/${nm%/}" >/dev/null; then
+        if ! printf '%s' "$nm" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then json_err "nomi non validi (non UTF-8)"; fi
+        json_err "nome non ammesso nell'archivio: $nm"
+      fi
     done < <(base64 -d <<<"$nb")
     # fase 2: estrazione protetta
+    left=$((120 - (SECONDS - t0)))
+    ((left >= 5)) || json_err "operazione scaduta"
     rc=0
-    ob="$(site_sh 120 "$FM_SH_UNZIP" "$arch" "$dest" "$ow" | base64 -w0)" || rc=$?
+    ob="$(site_sh "$left" "$FM_SH_UNZIP" "$arch" "$dest" "$ow" | base64 -w0)" || rc=$?
     if ((rc == 70)); then
       conf=()
       mapfile -d '' conf < <(base64 -d <<<"$ob")

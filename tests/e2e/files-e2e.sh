@@ -10,24 +10,16 @@ set -Eeuo pipefail
 src="$(cd "$(dirname "$0")/../.." && pwd)"
 ((EUID == 0)) || { echo "Serve root: sudo bash $0" >&2; exit 2; }
 
-made_zip=
-for p in nginx acl openssl jq gettext-base zip unzip; do
-  if ! dpkg -s "$p" >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$p" >/dev/null
-    case "$p" in zip | unzip) made_zip="$made_zip $p" ;; esac
-  fi
-done
-
 work="$(mktemp -d /tmp/files-e2e.XXXXXX)"
 chmod 755 "$work"
 # Il sito con --www è il dominio principale della zona: dalla v1.2.1 il www si
 # aggiunge solo lì (Cloudflare non ha un certificato per www.blog.zona).
 D1=e2etest.it
-D2=vetrina.e2etest.it
 ADMIN=e2eadmin
 created=()
 made_maint=
 made_admin=
+made_zip=
 
 fail() {
   echo "E2E FALLITO: $*" >&2
@@ -40,15 +32,15 @@ cleanup() {
   set +e
   # Prima togliamo i pool e ricarichiamo PHP-FPM: finché i suoi processi
   # girano come utente del sito, userdel si rifiuta.
-  for d in "$D1" "$D2"; do
+  for d in $D1; do
     rm -f "/etc/nginx/conf.d/$d.conf" "/etc/php/8.4/fpm/pool.d/site_${d//./_}.conf"
   done
   /usr/bin/systemctl reload php8.4-fpm >/dev/null 2>&1
-  for d in "$D1" "$D2"; do
+  for d in $D1; do
     pkill -u "site_${d//./_}" 2>/dev/null
   done
   sleep 1
-  for d in "$D1" "$D2"; do
+  for d in $D1; do
     userdel "site_${d//./_}" 2>/dev/null; groupdel "site_${d//./_}" 2>/dev/null
     mariadb -e "DROP DATABASE IF EXISTS \`site_${d//./_}\`; DROP USER IF EXISTS 'site_${d//./_}'@'localhost';" 2>/dev/null
     rm -rf "/etc/letsencrypt/live/$d"
@@ -63,6 +55,14 @@ cleanup() {
   rm -rf "$work"
 }
 trap cleanup EXIT
+
+# Pacchetti: la pulizia è già armata, quindi un errore a metà non lascia nulla.
+for p in nginx acl openssl jq gettext-base zip unzip; do
+  if ! dpkg -s "$p" >/dev/null 2>&1; then
+    case "$p" in zip | unzip) made_zip="$made_zip $p" ;; esac
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$p" >/dev/null
+  fi
+done
 
 # Pezzi di Nginx che sulla VPS mette l'installer.
 mkdir -p /etc/nginx/snippets
@@ -219,6 +219,15 @@ vf_ok unzip "$D1" public/dir.zip public/estratto --overwrite
 vf download-zip "$D1" public/dir >"$work/d.zip" || fail "download-zip"
 unzip -tq "$work/d.zip" >/dev/null || fail "download-zip non valido"
 zipinfo -1 "$work/d.zip" | grep -qx 'dir/a.txt' || fail "download-zip: manca dir/a.txt"
+
+# nomi non ASCII: andata e ritorno
+vf_ok mkdir "$D1" public/u
+printf 'x' | vf_ok write "$D1" "public/u/caffè perché.txt"
+vf_ok zip "$D1" public/u.zip -- public/u
+vf_ok mkdir "$D1" public/uu
+vf_ok unzip "$D1" public/u.zip public/uu
+[[ -e "$r/public/uu/u/caffè perché.txt" ]] || fail "nome non ASCII rovinato: $(ls -A "$r/public/uu/u")"
+vf_ok delete "$D1" -- public/u public/uu public/u.zip
 
 echo "== archivi malevoli (zip-slip, link, voce da 11 MB)"
 mal() { # NOME voci... : crea l'archivio come file del sito

@@ -888,9 +888,11 @@ nothing_written() {
   printf 'ciao' >"$z"
   run vf unzip blog.miosito.it public/m.zip public/dest
   [ "$status" -eq 1 ]; nothing_written
-  # nome con a capo: unzip lo trasforma in "^J"; comunque nessun file con caratteri di controllo
+  # nome con a capo: unzip toglie il controllo dal nome; comunque nessun file con caratteri di controllo
   mkz "$z" $'a\nb|100644|3'
   run vf unzip blog.miosito.it public/m.zip public/dest
+  [ "$status" -eq 0 ]
+  [ -e "$R/public/dest/ab" ] || { ls -A "$R/public/dest"; false; }
   [ -z "$(find "$R/public/dest" -name '*[[:cntrl:]]*')" ]
   [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
   [ ! -e "$R/evil" ] && [ ! -e "$R/public/evil" ]
@@ -1108,4 +1110,95 @@ nothing_written() {
   [ "$status" -eq 1 ]
   [[ "$output" == *"10 MB"* ]]
   nothing_written
+}
+
+# 1 se una voce dell'archivio ha il bit 11 (UTF-8) nelle intestazioni centrali
+zflag() {
+  perl -e 'open F, "<:raw", $ARGV[0] or die; local $/; $_ = <F>; my ($i, $r) = (0, 0); while (($i = index($_, "PK\x01\x02", $i)) >= 0) { $r = 1 if unpack("v", substr($_, $i + 8, 2)) & 0x800; $i += 4 } print $r' "$1"
+}
+
+@test "vps-files zip/unzip: nomi non ASCII, andata e ritorno e flag UTF-8" {
+  need_zip
+  mk_fm_site
+  mkdir -p "$R/public/u" "$R/public/dest"
+  printf 'x' >"$R/public/u/caffè perché.txt"
+  run vf zip blog.miosito.it public/u.zip -- public/u
+  [ "$status" -eq 0 ]
+  [ "$(zflag "$R/public/u.zip")" = 1 ] || { zipinfo -v "$R/public/u.zip" | head -30; false; }
+  run vf unzip blog.miosito.it public/u.zip public/dest
+  [ "$status" -eq 0 ]
+  [ -e "$R/public/dest/u/caffè perché.txt" ] || { ls -A "$R/public/dest/u"; false; }
+  bash "$REPO_ROOT/tools/vps-files" download-zip blog.miosito.it public/u >"$BATS_TEST_TMPDIR/d.zip" 2>/dev/null
+  [ "$(zflag "$BATS_TEST_TMPDIR/d.zip")" = 1 ] || { zipinfo -v "$BATS_TEST_TMPDIR/d.zip" | head -30; false; }
+  # archivio di un altro strumento, con il flag UTF-8
+  rm -rf "$R/public/dest/"*
+  mkz "$R/public/x.zip" "è/|40755|0|0|u" "è/perché ☃.txt|100644|3|=ciao|u"
+  run vf unzip blog.miosito.it public/x.zip public/dest
+  [ "$status" -eq 0 ]
+  [ "$(cat "$R/public/dest/è/perché ☃.txt")" = ciao ]
+}
+
+@test "vps-files unzip: voce di Windows con attributo nascosto (FAT) accettata" {
+  need_zip
+  mk_fm_site
+  mkdir "$R/public/dest"
+  mkz "$R/public/w.zip" "cartella/|40755|0|0|fat" "cartella/nascosto.txt|100644|3|=win|fat" "Thumbs.db|100644|2|=ab|fat"
+  zipinfo -s "$R/public/w.zip" | grep -q -- '-rw-ah-' || zipinfo -s "$R/public/w.zip" >&3
+  run vf unzip blog.miosito.it public/w.zip public/dest
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [ "$(cat "$R/public/dest/cartella/nascosto.txt")" = win ]
+  [ -e "$R/public/dest/Thumbs.db" ]
+}
+
+@test "vps-files unzip: voci cifrate rifiutate con messaggio chiaro" {
+  need_zip
+  mk_fm_site
+  mkdir "$R/public/dest"
+  mkz "$R/public/e.zip" "ok|100644|3|=abc" "segreto|100644|3|=abc|enc"
+  run vf unzip blog.miosito.it public/e.zip public/dest
+  [ "$status" -eq 1 ]
+  [[ "$output" == *cifrat* ]]
+  nothing_written
+}
+
+@test "vps-files unzip: nome dell'archivio con caratteri jolly" {
+  need_zip
+  mk_fm_site
+  mkdir "$R/public/dest"
+  mkz "$R/public/y[1]*.zip" "a.txt|100644|0|=ok"
+  mkz "$R/public/y1.zip" "altro.txt|100644|0|=no"
+  run vf unzip blog.miosito.it "public/y[1]*.zip" public/dest
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [ "$(cat "$R/public/dest/a.txt")" = ok ]
+  [ ! -e "$R/public/dest/altro.txt" ]
+  [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
+}
+
+@test "vps-files unzip: nomi non UTF-8 (CP437) -> messaggio dedicato, nulla scritto" {
+  need_zip
+  mk_fm_site
+  mkdir "$R/public/dest"
+  mkz "$R/public/c.zip" $'caff\x8a.txt|100644|3'
+  run vf unzip blog.miosito.it public/c.zip public/dest
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"UTF-8"* ]] || { echo "$output"; false; }
+  nothing_written
+}
+
+@test "vps-files unzip: temporanei vecchi di tmp/ spazzati, budget di 120 s in totale" {
+  need_zip
+  mk_fm_site
+  mkdir "$R/public/dest" "$R/tmp/.vpsfiles-x.vecchio" "$R/tmp/.vpsfiles-x.nuovo" "$R/tmp/altro"
+  touch -d '2 hours ago' "$R/tmp/.vpsfiles-x.vecchio"
+  mkz "$R/public/t.zip" "a|100644|0|=a"
+  make_stub timeout 'echo "timeout $1" >>"$CALLS"; shift; exec "$@"'
+  run vf unzip blog.miosito.it public/t.zip public/dest
+  [ "$status" -eq 0 ]
+  [ ! -e "$R/tmp/.vpsfiles-x.vecchio" ]
+  [ -e "$R/tmp/.vpsfiles-x.nuovo" ] && [ -e "$R/tmp/altro" ]
+  local t1 t2
+  t1="$(grep '^timeout ' "$CALLS" | sed -n 1p | cut -d' ' -f2)"
+  t2="$(grep '^timeout ' "$CALLS" | sed -n 2p | cut -d' ' -f2)"
+  [ "$t1" -le 120 ] && [ "$t2" -le 120 ] && [ "$t2" -ge 100 ]
+  [ "$((t1 + 0))" -le 60 ]
 }

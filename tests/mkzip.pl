@@ -4,6 +4,9 @@
 # Uso: mkzip.pl USCITA "nome|modo-ottale|dim-dichiarata[|reali]"...
 # Il quarto campo può essere: un numero (byte reali, "x"), "=testo" (contenuto letterale)
 # o "zNUMERO" (NUMERO byte di zeri compressi con deflate: una bomba che dichiara poco).
+# Quinto campo (opzioni, separate da virgola): enc = voce cifrata, fat = creata da DOS/Windows
+# (attributi 0x22: nascosto + archivio, nessun modo unix), u = nome con il flag UTF-8 (bit 11).
+# Con il quinto campo il quarto non può contenere "|".
 # Il nome che finisce con / è una cartella; il modo 12xxxx è un link verso /etc/shadow.
 use strict;
 use warnings;
@@ -12,7 +15,8 @@ use Compress::Raw::Zlib qw(crc32 Z_OK Z_STREAM_END Z_FINISH);
 my $out = shift @ARGV;
 my ($body, $cd, $n) = ('', '', 0);
 for my $a (@ARGV) {
-    my ($name, $mode, $us, $len) = split /\|/, $a, 4;
+    my ($name, $mode, $us, $len, $opt) = split /\|/, $a, 5;
+    my %o = map { $_ => 1 } split /,/, ($opt // '');
     $len = $us unless defined $len;
     my ($data, $method, $crc) = ('', 0, 0);
     if ($len =~ /^=/) {
@@ -36,10 +40,13 @@ for my $a (@ARGV) {
     $data = '/etc/shadow' if $mode =~ /^12/;
     $crc = crc32($data) unless $method;
     my $cs  = length $data;
+    my $flags = ($o{enc} ? 1 : 0) | ($o{u} ? 0x800 : 0);
+    my $made  = $o{fat} ? 20 : (3 << 8) | 20;
+    my $eattr = $o{fat} ? ($name =~ m{/$} ? 0x10 : 0x22) : oct($mode) << 16;
     my $off = length $body;
-    $body .= pack('VvvvvvVVVvv', 0x04034b50, 20, 0, $method, 0, 0x21, $crc, $cs, $us, length $name, 0) . $name . $data;
-    $cd .= pack('VvvvvvvVVVvvvvvVV', 0x02014b50, (3 << 8) | 20, 20, 0, $method, 0, 0x21, $crc, $cs, $us,
-        length $name, 0, 0, 0, 0, oct($mode) << 16, $off) . $name;
+    $body .= pack('VvvvvvVVVvv', 0x04034b50, 20, $flags, $method, 0, 0x21, $crc, $cs, $us, length $name, 0) . $name . $data;
+    $cd .= pack('VvvvvvvVVVvvvvvVV', 0x02014b50, $made, 20, $flags, $method, 0, 0x21, $crc, $cs, $us,
+        length $name, 0, 0, 0, 0, $eattr, $off) . $name;
     $n++;
 }
 my $eocd = pack('VvvvvVVv', 0x06054b50, 0, 0, $n, $n, length $cd, length $body, 0);
