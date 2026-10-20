@@ -95,6 +95,23 @@ sys_setup() {
   grep -q 'install .* acl' "$BATS_TEST_TMPDIR/apt.calls"
 }
 
+@test "opt_system_files installa zip e unzip se mancano, anche con --tools-only" {
+  sys_setup
+  make_stub dpkg 'exit 1'
+  make_stub apt-get 'echo "apt-get $*" >>"$BATS_TEST_TMPDIR/apt.calls"'
+  opt_system_files
+  grep -q 'install .* zip' "$BATS_TEST_TMPDIR/apt.calls"
+  grep -q 'install .* unzip' "$BATS_TEST_TMPDIR/apt.calls"
+}
+
+@test "opt_system_files non reinstalla zip e unzip se ci sono" {
+  sys_setup
+  make_stub dpkg 'exit 0'
+  make_stub apt-get 'echo "apt-get $*" >>"$BATS_TEST_TMPDIR/apt.calls"'
+  opt_system_files
+  [ ! -e "$BATS_TEST_TMPDIR/apt.calls" ] || ! grep -q 'zip' "$BATS_TEST_TMPDIR/apt.calls"
+}
+
 @test "opt_tools_only aggiorna anche sudoers e cron" {
   sys_setup
   declare -f opt_tools_only | grep -q opt_system_files

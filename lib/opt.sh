@@ -91,6 +91,12 @@ opt_system_files() {
   if ! dpkg -s acl >/dev/null 2>&1; then
     apt_install acl || die "Pacchetto acl non installato"
   fi
+  # zip e unzip: li usa il file manager (vps-files zip, unzip, download-zip)
+  for pkg in zip unzip; do
+    if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+      apt_install "$pkg" || die "Pacchetto $pkg non installato"
+    fi
+  done
   wpcli_install || log "ATTENZIONE: WP-CLI non installato: WordPress non sarà disponibile finché non riesce"
   if [[ "$(jq -r '.components.redis == true' "$m")" == true ]]; then
     redis_acl_setup || log "ATTENZIONE: Redis con utenti ACL non configurato: WordPress non sarà disponibile (dettagli in $VPS_LOG)"

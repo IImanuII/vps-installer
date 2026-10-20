@@ -28,7 +28,10 @@ tool_init
 #   rename DOM DA NUOVONOME                                 esattamente 4
 #   move|copy DOM DESTINAZIONE [--overwrite] -- PERCORSO...  almeno 5
 #   delete DOM -- PERCORSO...                               almeno 4
-USO="uso: vps-files list|stat|read|mkdir DOM PERCORSO | write DOM PERCORSO [--overwrite] [--if-mtime SEC.NSEC --if-size N] | rename DOM DA NUOVONOME | move|copy DOM DEST [--overwrite] -- PERCORSO... | delete DOM -- PERCORSO..."
+#   zip DOM DEST.zip -- PERCORSO...                         almeno 5
+#   unzip DOM ARCHIVIO DESTINAZIONE [--overwrite]           4 o 5
+#   download-zip DOM PERCORSO                               esattamente 3, zip su stdout
+USO="uso: vps-files list|stat|read|mkdir|download-zip DOM PERCORSO | write DOM PERCORSO [--overwrite] [--if-mtime SEC.NSEC --if-size N] | rename DOM DA NUOVONOME | move|copy DOM DEST [--overwrite] -- PERCORSO... | delete DOM -- PERCORSO... | zip DOM DEST.zip -- PERCORSO... | unzip DOM ARCHIVIO DESTINAZIONE [--overwrite]"
 FM_TEXT_MAX=2097152 # i limiti di scrittura (10 MB) e copia (200 MB) sono negli script sh
 FM_MAX_PATHS=500
 FM_LIST_MAX=10000
@@ -49,6 +52,7 @@ FM_JQ_DEF='def mt: split(".") as $p | $p[0] + "." + ((($p[1] // "") + "000000000
 # percorso sono cartelle vere (nessun collegamento simbolico lungo la strada); ex = esiste.
 read -r -d '' FM_SH_LIB <<'EOS' || true
 chkp() {
+  local d pre oldifs r s
   d="$1"
   case "$d" in */*) d="${d%/*}" ;; *) return 0 ;; esac
   set -f
@@ -145,6 +149,10 @@ EOS
 # Coppie origine/destinazione: op ow s1 t1 s2 t2 ...
 read -r -d '' FM_SH_MVCP <<'EOS' || true
 op="$1"; ow="$2"; shift 2
+c=""
+# a scadenza o in errore la copia parziale non resta
+trap 'if [ -n "$c" ]; then rm -rf -- "$c"; fi' EXIT
+trap 'exit 124' INT TERM
 while [ "$#" -gt 0 ]; do
   s="$1"; t="$2"; shift 2
   if [ "$op" = move ]; then
@@ -159,6 +167,7 @@ while [ "$#" -gt 0 ]; do
       exit 1
     fi
     rm -rf -- "$t" && mv -T -- "$c" "$t" || { rm -rf -- "$c"; exit 1; }
+    c=""
   else
     cp -n -P -R -T --preserve=mode,timestamps -- "$s" "$t" || exit 1
   fi
@@ -170,12 +179,208 @@ for s; do chkp "$s" || exit 67; done
 rm -rf -- "$@" || exit 1
 EOS
 
+# Elenco di uno zip (unzip, fase 1): ARCHIVIO. Non si fida di nulla: rifiuta tutto ciò che
+# non è file o cartella, nomi assoluti/con ..//\, troppe voci, voci o totale troppo grandi
+# (sulle dimensioni dichiarate; l'estrazione le ricontrolla sui byte veri). Stampa i nomi, uno
+# per riga. Uscite: 65 manca, 66 non è un file regolare, 67 cartella non valida, 72 zip
+# illeggibile o righe incoerenti col totale, 73 troppe voci, 74 voce > 10 MB, 75 totale > 200 MB,
+# 76 collegamenti o file speciali, 77 nomi non ammessi.
+read -r -d '' FM_SH_ZLIST <<'EOS' || true
+a="$1"
+chkp "$a" || exit 67
+ex "$a" || exit 65
+{ [ -f "$a" ] && [ ! -L "$a" ]; } || exit 66
+list="$(zipinfo -s "$a" 2>/dev/null)" || exit 72
+printf '%s\n' "$list" | awk '
+  function fail(c) { if (!err) err = c }
+  /^[-dlcbps?][-rwxsStTa]+ +[0-9.]+ +[a-zA-Z0-9]+ +[0-9]+ / {
+    n++
+    t = substr($1, 1, 1)
+    sz = $4
+    nm = $0
+    for (i = 0; i < 7; i++) sub(/^[^ ]+ +/, "", nm)
+    sub(/^[^ ]+ /, "", nm)
+    if (t != "-" && t != "d") fail(76)
+    if (sz + 0 > 10485760) fail(74)
+    tot += sz
+    if (n > 10000) fail(73)
+    if (nm == "" || substr(nm, 1, 1) == "/" || index(nm, "\\") || ("/" nm "/") ~ /\/\.\.\//) fail(77)
+    print nm
+    next
+  }
+  /^[0-9]+ files?, / { total = $1 + 0; seen = 1 }
+  END {
+    if (!err && tot > 209715200) err = 75
+    if (!err && (!seen || n == 0 || n != total)) err = 72
+    exit err
+  }'
+exit $?
+EOS
+
+# Estrazione (unzip, fase 2): ARCHIVIO DESTINAZIONE OVERWRITE. Estrae in una cartella di
+# lavoro in tmp/ con un tetto per file (ulimit -f) e uno sul totale (sorvegliante), ricontrolla
+# l'albero (niente link né file speciali, voci, dimensioni), e solo dopo copia nella destinazione.
+# Uscite oltre a quelle dell'elenco: 70 conflitti (nomi su stdout, separati da NUL), 71 tipo
+# incompatibile (file/cartella/collegamento) con --overwrite, 124 scaduto.
+read -r -d '' FM_SH_UNZIP <<'EOS' || true
+a="$1"; d="$2"; ow="$3"
+exec 2>/dev/null
+chkp "$a" || exit 67
+{ [ -f "$a" ] && [ ! -L "$a" ]; } || exit 66
+{ [ -d "$d" ] && [ ! -L "$d" ]; } || exit 67
+chkp "$d/x" || exit 67
+pid=""
+wp=""
+w=""
+cleanup() {
+  if [ -n "$wp" ]; then kill "$wp" 2>/dev/null; fi
+  if [ -n "$pid" ]; then kill -9 "$pid" 2>/dev/null; fi
+  if [ -n "$w" ]; then rm -rf -- "$w"; fi
+}
+trap cleanup EXIT
+trap 'exit 124' INT TERM
+w="$(mktemp -d tmp/.vpsfiles-x.XXXXXX)" || exit 1
+w="$PWD/$w"
+s="$w/s"
+mkdir "$s" || exit 1
+# somma dei byte dei file regolari (le cartelle non contano)
+fsum() { find "$1" -type f -printf '%s\n' 2>/dev/null | awk '{t += $1} END {print t + 0}'; }
+(
+  ulimit -f 20480
+  exec unzip -q -o -d "$s" "$a" >/dev/null 2>&1
+) &
+pid=$!
+(
+  while sleep 0.05; do
+    n="$(fsum "$s")"
+    if [ "$n" -gt 209715200 ]; then
+      : >"$w/b"
+      kill -9 "$pid" 2>/dev/null
+      exit 0
+    fi
+  done
+) &
+wp=$!
+rc=0
+wait "$pid" || rc=$?
+pid=""
+kill "$wp" 2>/dev/null
+wp=""
+[ ! -e "$w/b" ] || exit 75
+if [ "$rc" -ge 128 ]; then exit 74; fi
+[ "$rc" = 0 ] || exit 72
+chmod -R u+rwX -- "$s" 2>/dev/null
+if [ -n "$(find "$s" -mindepth 1 ! -type f ! -type d | head -n 1)" ]; then exit 76; fi
+# zipinfo mostra i caratteri di controllo come "?": i nomi veri si controllano qui
+if [ -n "$(find "$s" -mindepth 1 -name '*[[:cntrl:]]*' | head -n 1)" ]; then exit 77; fi
+find "$s" -mindepth 1 -print0 | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || exit 77
+[ "$(find "$s" -mindepth 1 | wc -l)" -le 10000 ] || exit 73
+if [ -n "$(find "$s" -type f -size +10485760c | head -n 1)" ]; then exit 74; fi
+[ "$(fsum "$s")" -le 209715200 ] || exit 75
+# permessi sani: gruppo del sito scrive, altri solo leggono, niente setuid/setgid sui file
+find "$s" -type d -exec chmod u+rwx,g+rwx,o+rx,o-w,u-s {} +
+find "$s" -type f -exec chmod u+rw,g+rw,o+r,o-w,a-s {} +
+# cosa esiste già in destinazione: C = stesso nome, M = tipo diverso (file/cartella/collegamento)
+export D="$PWD/$d" C="$w/c" M="$w/m"
+: >"$C"
+: >"$M"
+(
+  cd "$s" || exit 1
+  find . -mindepth 1 -exec sh -c '
+    for f; do
+      r="${f#./}"
+      t="$D/$r"
+      if [ -d "$f" ] && [ ! -L "$f" ]; then
+        if { [ -e "$t" ] || [ -L "$t" ]; } && { [ -L "$t" ] || [ ! -d "$t" ]; }; then printf "%s\0" "$r" >>"$M"; fi
+      elif [ -d "$t" ]; then
+        printf "%s\0" "$r" >>"$M"
+      elif [ -e "$t" ] || [ -L "$t" ]; then
+        printf "%s\0" "$r" >>"$C"
+      fi
+    done' sh {} +
+) || exit 1
+if [ "$ow" = 1 ]; then
+  [ ! -s "$M" ] || exit 71
+elif [ -s "$M" ] || [ -s "$C" ]; then
+  cat "$M" "$C"
+  exit 70
+fi
+if [ "$ow" = 1 ]; then
+  cp -R -P --remove-destination --preserve=mode,timestamps -- "$s"/. "$d"/ || exit 1
+else
+  cp -R -P -n --preserve=mode,timestamps -- "$s"/. "$d"/ || exit 1
+fi
+EOS
+
+# zip: DESTINAZIONE.zip PERCORSO... (relativi alla radice, tutti sotto public). Nell'archivio
+# i nomi sono relativi a public/ ("public" stesso = tutto il contenuto). Uscite: 65 origine
+# mancante, 67 cartella non valida, 68 oltre 200 MB, 70 la destinazione esiste.
+read -r -d '' FM_SH_ZIP <<'EOS' || true
+dest="$1"; shift
+chkp "$dest" || exit 67
+ex "$dest" && exit 70
+for s; do
+  chkp "$s" || exit 67
+  ex "$s" || exit 65
+done
+tot=0
+for s; do
+  n="$(du -sbl -- "$s" 2>/dev/null | cut -f1)"
+  tot=$((tot + ${n:-0}))
+done
+[ "$tot" -le 209715200 ] || exit 68
+w=""
+trap 'if [ -n "$w" ]; then rm -rf -- "$w"; fi' EXIT
+trap 'exit 124' INT TERM
+w="$(mktemp -d tmp/.vpsfiles-z.XXXXXX)" || exit 1
+w="$PWD/$w"
+final="$PWD/$dest"
+for s; do
+  case "$s" in
+    public) set -- "$@" . ;;
+    *) set -- "$@" "${s#public/}" ;;
+  esac
+  shift
+done
+cd public || exit 1
+zip -r -y -q -nw "$w/o.zip" -- "$@" >/dev/null 2>&1 || exit 1
+mv -n -T -- "$w/o.zip" "$final" || exit 1
+[ ! -e "$w/o.zip" ] || exit 70
+EOS
+
+# download-zip: PERCORSO. Zip su stdout, con il nome della cartella in testa; tetto 200 MB
+# prima (sui file) e durante (sul flusso). Uscite: 65, 67, 68, 1.
+read -r -d '' FM_SH_DLZIP <<'EOS' || true
+p="$1"
+chkp "$p" || exit 67
+ex "$p" || exit 65
+{ [ -d "$p" ] && [ ! -L "$p" ]; } || exit 66
+n="$(du -sbl -- "$p" 2>/dev/null | cut -f1)"
+[ "${n:-0}" -le 209715200 ] || exit 68
+w=""
+trap 'if [ -n "$w" ]; then rm -rf -- "$w"; fi' EXIT
+trap 'exit 124' INT TERM
+w="$(mktemp -d tmp/.vpsfiles-d.XXXXXX)" || exit 1
+w="$PWD/$w"
+case "$p" in
+  */*) par="${p%/*}"; base="${p##*/}" ;;
+  *) par="."; base="$p" ;;
+esac
+cd "$par" || exit 1
+{ zip -r -y -q -nw - -- "$base" 2>/dev/null; echo "$?" >"$w/rc"; } |
+  { head -c 209715200; if [ "$(head -c 1 | wc -c)" != 0 ]; then : >"$w/big"; fi; }
+[ ! -e "$w/big" ] || exit 68
+[ "$(cat "$w/rc" 2>/dev/null)" = 0 ] || exit 1
+EOS
+
 # Comandi e numero di argomenti (vedi sopra) prima di qualsiasi altra cosa.
 (($# >= 2)) || json_err "$USO"
 cmd="$1"
 dom="$2"
 case "$cmd" in
-  list | stat | read | mkdir) (($# == 3)) || json_err "$USO" ;;
+  list | stat | read | mkdir | download-zip) (($# == 3)) || json_err "$USO" ;;
+  zip) (($# >= 5)) || json_err "$USO" ;;
+  unzip) (($# >= 4 && $# <= 5)) || json_err "$USO" ;;
   write) (($# >= 3 && $# <= 8)) || json_err "$USO" ;;
   rename) (($# == 4)) || json_err "$USO" ;;
   move | copy) (($# >= 5)) || json_err "$USO" ;;
@@ -189,7 +394,7 @@ root="${info#* }"
 p=""
 area=""
 case "$cmd" in
-  list | stat | read | mkdir | write | rename)
+  list | stat | read | mkdir | write | rename | download-zip)
     p="$3"
     area="$(fm_path_check "$p")" || json_err "percorso non valido o non consentito"
     ;;
@@ -476,5 +681,83 @@ exec cat <"$1"' sh "$p" || rc=$?
     site_sh 120 "$FM_SH_DEL" "$@" || rc=$?
     ((rc == 0)) || fm_fail "$rc"
     json_ok
+    ;;
+  zip)
+    dest="$3"
+    [[ "$4" == -- ]] || json_err "$USO"
+    shift 4
+    (($# >= 1 && $# <= FM_MAX_PATHS)) || json_err "$USO"
+    fm_writable "$dest" || json_err "destinazione non valida o non consentita: $dest"
+    [[ "$dest" == *.zip && "${dest##*/}" != .zip ]] || json_err "la destinazione deve finire con .zip"
+    for s in "$@"; do
+      [[ "$(fm_path_check "$s")" == public ]] || json_err "percorso non consentito: $s"
+    done
+    fm_log zip "$dest" "$@"
+    rc=0
+    site_sh 120 "$FM_SH_ZIP" "$dest" "$@" || rc=$?
+    case "$rc" in
+      0) ;;
+      70) fm_conflict "$dest" ;;
+      68) json_err "la selezione supera i 200 MB" ;;
+      *) fm_fail "$rc" ;;
+    esac
+    json_ok
+    ;;
+  unzip)
+    arch="$3"
+    dest="$4"
+    ow=0
+    if (($# == 5)); then
+      [[ "$5" == --overwrite ]] || json_err "$USO"
+      ow=1
+    fi
+    fm_writable "$arch" || json_err "archivio non valido o non consentito: $arch"
+    [[ "$(fm_path_check "$dest")" == public ]] || json_err "la destinazione deve stare in public"
+    fm_log unzip "$arch" "$dest"
+    # unz_fail CODICE — messaggio per le uscite di elenco ed estrazione.
+    unz_fail() {
+      case "$1" in
+        65) json_err "archivio non trovato: $arch" ;;
+        66) json_err "l'archivio non è un file regolare: $arch" ;;
+        71) json_err "un file ha lo stesso nome di una cartella (o di un collegamento): impossibile sovrascrivere" ;;
+        72) json_err "archivio non valido" ;;
+        73) json_err "l'archivio ha più di 10.000 voci" ;;
+        74) json_err "l'archivio contiene un file oltre 10 MB" ;;
+        75) json_err "l'archivio supera i 200 MB estratti" ;;
+        76) json_err "l'archivio contiene collegamenti o file speciali" ;;
+        77) json_err "l'archivio contiene percorsi non ammessi (assoluti o con ..)" ;;
+        *) fm_fail "$1" ;;
+      esac
+    }
+    # fase 1: elenco e controlli sull'archivio; base64 per vedere l'uscita dello script
+    rc=0
+    nb="$(site_sh 60 "$FM_SH_ZLIST" "$arch" | base64 -w0)" || rc=$?
+    ((rc == 0)) || unz_fail "$rc"
+    while IFS= read -r nm; do
+      # il nome, unito alla destinazione, deve passare le regole di tutti i percorsi
+      fm_path_check "$dest/${nm%/}" >/dev/null || json_err "nome non ammesso nell'archivio: $nm"
+    done < <(base64 -d <<<"$nb")
+    # fase 2: estrazione protetta
+    rc=0
+    ob="$(site_sh 120 "$FM_SH_UNZIP" "$arch" "$dest" "$ow" | base64 -w0)" || rc=$?
+    if ((rc == 70)); then
+      conf=()
+      mapfile -d '' conf < <(base64 -d <<<"$ob")
+      conf=("${conf[@]/#/$dest/}")
+      fm_conflict "${conf[@]}"
+    fi
+    ((rc == 0)) || unz_fail "$rc"
+    json_ok
+    ;;
+  download-zip)
+    [[ "$area" == public ]] || json_err "percorso non consentito: $p"
+    rc=0
+    site_sh 120 "$FM_SH_DLZIP" "$p" || rc=$?
+    case "$rc" in
+      0) ;;
+      66) json_err "non è una cartella: $p" ;;
+      68) json_err "il download supera i 200 MB" ;;
+      *) fm_fail "$rc" ;;
+    esac
     ;;
 esac

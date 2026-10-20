@@ -44,7 +44,7 @@ sudo vps-panel-update      # poi, per ogni nuovo rilascio
 Su una VPS installata con una versione precedente alla 1.1, prima:
 
 ```bash
-curl -fsSLO https://github.com/IImanuII/vps-installer/releases/download/v1.5.3/install.sh
+curl -fsSLO https://github.com/IImanuII/vps-installer/releases/download/v1.6.0/install.sh
 sudo bash install.sh --tools-only
 ```
 
@@ -114,3 +114,14 @@ Da terminale: `sudo /opt/vps/bin/vps-monitor status` (stato in JSON) e
 - End-to-end di WordPress (WSL, root, serve internet): `sudo bash tests/e2e/wp-e2e.sh`
   (Redis con ACL e WP-CLI veri; `redis.conf` torna com'era alla fine).
 - Spec v1.1: [docs/specs/2026-10-11-vps-installer-v1.1-design.md](docs/specs/2026-10-11-vps-installer-v1.1-design.md)
+
+## File manager
+
+Dalla 1.6.0 `vps-files` (che il pannello esegue con sudo) legge e scrive i file dei
+siti sempre come l'utente del sito (`runuser`), mai come root: elenco, lettura,
+salvataggio con controllo di modifica, creazione di cartelle, rinomina, copia,
+spostamento, eliminazione, zip, estrazione di zip e download di cartelle come zip.
+Si lavora solo in `public/` (in sola lettura anche `logs/` e `wp-config.php`), i
+collegamenti simbolici non si seguono mai e gli zip malevoli (percorsi con `..` o
+assoluti, collegamenti, bombe) sono rifiutati. L'installer aggiunge i pacchetti `zip`
+e `unzip`. Contratto in `docs/PANEL-HANDOFF.md`.

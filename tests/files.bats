@@ -828,3 +828,284 @@ STUB
   grep -q '^runuser -u site_blog_miosito_it' "$CALLS"
   grep -q 'files move verso public/dest blog.miosito.it public/a totale=1' "$VPS_LOG"
 }
+
+# ---------------------------------------------------------------- zip, unzip, download-zip
+
+# mkz USCITA "nome|modo|dim[|reali]"... — zip fatto a mano (anche malevolo), vedi tests/mkzip.pl
+mkz() { perl "$REPO_ROOT/tests/mkzip.pl" "$@"; }
+
+need_zip() {
+  command -v zip >/dev/null && command -v unzip >/dev/null && command -v zipinfo >/dev/null || skip "servono zip e unzip"
+}
+
+# nulla è stato scritto: né in public/dest né temporanei in tmp/
+nothing_written() {
+  [ "$(ls -A "$R/public/dest" | wc -l)" -eq 0 ] || { ls -A "$R/public/dest"; false; }
+  [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ] || { ls -A "$R/tmp"; false; }
+}
+
+@test "vps-files unzip: archivi malevoli rifiutati prima di estrarre, nulla scritto" {
+  need_zip
+  mk_fm_site
+  mkdir "$R/public/dest"
+  local z="$R/public/m.zip" i args=()
+  # nome|modo|dimensione dichiarata[|byte reali]
+  mkz "$z" "../evil|100644|3"
+  run vf unzip blog.miosito.it public/m.zip public/dest
+  [ "$status" -eq 1 ]; [ "$(jq -r .ok <<<"$output")" = false ]; nothing_written
+  mkz "$z" "a/../../evil|100644|3"
+  run vf unzip blog.miosito.it public/m.zip public/dest
+  [ "$status" -eq 1 ]; nothing_written
+  mkz "$z" "/etc/x|100644|3"
+  run vf unzip blog.miosito.it public/m.zip public/dest
+  [ "$status" -eq 1 ]; nothing_written
+  mkz "$z" 'a\b|100644|3'
+  run vf unzip blog.miosito.it public/m.zip public/dest
+  [ "$status" -eq 1 ]; nothing_written
+  mkz "$z" "ok|100644|3" "link|120777|11"
+  run vf unzip blog.miosito.it public/m.zip public/dest
+  [ "$status" -eq 1 ]; [[ "$output" == *collegament* ]]; nothing_written
+  mkz "$z" "fifo|10644|0"
+  run vf unzip blog.miosito.it public/m.zip public/dest
+  [ "$status" -eq 1 ]; nothing_written
+  # voce dichiarata 11 MB
+  mkz "$z" "grande|100644|11534336|0"
+  run vf unzip blog.miosito.it public/m.zip public/dest
+  [ "$status" -eq 1 ]; [[ "$output" == *"10 MB"* ]]; nothing_written
+  # 21 voci da 10 MB dichiarati = 210 MB
+  args=()
+  for i in $(seq 1 21); do args+=("f$i|100644|10485760|0"); done
+  mkz "$z" "${args[@]}"
+  run vf unzip blog.miosito.it public/m.zip public/dest
+  [ "$status" -eq 1 ]; [[ "$output" == *"200 MB"* ]]; nothing_written
+  # 10.001 voci
+  args=()
+  for i in $(seq 1 10001); do args+=("f$i|100644|0"); done
+  mkz "$z" "${args[@]}"
+  run vf unzip blog.miosito.it public/m.zip public/dest
+  [ "$status" -eq 1 ]; [[ "$output" == *"10.000"* ]]; nothing_written
+  # non è uno zip
+  printf 'ciao' >"$z"
+  run vf unzip blog.miosito.it public/m.zip public/dest
+  [ "$status" -eq 1 ]; nothing_written
+  # nome con a capo: unzip lo trasforma in "^J"; comunque nessun file con caratteri di controllo
+  mkz "$z" $'a\nb|100644|3'
+  run vf unzip blog.miosito.it public/m.zip public/dest
+  [ -z "$(find "$R/public/dest" -name '*[[:cntrl:]]*')" ]
+  [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
+  [ ! -e "$R/evil" ] && [ ! -e "$R/public/evil" ]
+}
+
+@test "vps-files unzip: intestazione che mente (11 MB reali, 100 dichiarati) -> nessun file oltre 10 MB" {
+  need_zip
+  mk_fm_site
+  mkdir "$R/public/dest"
+  mkz "$R/public/m.zip" "bomba|100644|100|11534336"
+  run vf unzip blog.miosito.it public/m.zip public/dest
+  [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
+  [ "$(find "$R/public/dest" -type f -size +10485760c | wc -l)" -eq 0 ]
+}
+
+@test "vps-files unzip: valido, qui e in cartella; permessi sani, nessun temporaneo" {
+  need_zip
+  mk_fm_site
+  mkdir "$R/public/dest"
+  mkz "$R/public/t.zip" "tema/|40755|0" "tema/style.css|100644|0|=body{}" "tema/js/|40700|0" "tema/js/a b.js|100755|0|=alert(1)" "-x|104777|0|=u"
+  run vf unzip blog.miosito.it public/t.zip public
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"ok":true}' ]
+  [ "$(cat "$R/public/tema/style.css")" = "body{}" ]
+  [ "$(cat "$R/public/tema/js/a b.js")" = "alert(1)" ]
+  [ -d "$R/public/tema/js" ]
+  [ "$(stat -c %a "$R/public/-x")" -lt 1000 ]
+  [ "$(stat -c %a "$R/public/tema/js")" = 775 ]
+  [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
+  rm -rf "$R/public/tema" "$R/public/-x"
+  run vf unzip blog.miosito.it public/t.zip public/dest
+  [ "$status" -eq 0 ]
+  [ "$(cat "$R/public/dest/tema/style.css")" = "body{}" ]
+  grep -q '^runuser -u site_blog_miosito_it' "$CALLS"
+  grep -q 'files unzip blog.miosito.it public/t.zip public/dest' "$VPS_LOG"
+}
+
+@test "vps-files unzip: conflitto -> elenco e nulla toccato; --overwrite sovrascrive" {
+  need_zip
+  mk_fm_site
+  mkdir -p "$R/public/dest/tema"
+  printf 'vecchio' >"$R/public/dest/tema/style.css"
+  printf 'mio' >"$R/public/dest/tema/mio.txt"
+  mkz "$R/public/t.zip" "tema/|40755|0" "tema/style.css|100644|0|=nuovo" "tema/nuovo.txt|100644|0|=n"
+  run vf unzip blog.miosito.it public/t.zip public/dest
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .ok <<<"$output")" = false ]
+  [ "$(jq -r '.conflicts | join(",")' <<<"$output")" = "public/dest/tema/style.css" ]
+  [ "$(cat "$R/public/dest/tema/style.css")" = vecchio ]
+  [ ! -e "$R/public/dest/tema/nuovo.txt" ]
+  [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
+  run vf unzip blog.miosito.it public/t.zip public/dest --overwrite
+  [ "$status" -eq 0 ]
+  [ "$(cat "$R/public/dest/tema/style.css")" = nuovo ]
+  [ "$(cat "$R/public/dest/tema/nuovo.txt")" = n ]
+  [ "$(cat "$R/public/dest/tema/mio.txt")" = mio ]
+}
+
+@test "vps-files unzip: file dove c'è una cartella o cartella dove c'è un collegamento -> conflitto, con --overwrite errore" {
+  need_zip
+  mk_fm_site
+  mkdir -p "$R/public/dest/d"
+  ln -s "$BATS_TEST_TMPDIR" "$R/public/dest/lnk"
+  mkz "$R/public/t.zip" "d|100644|0|=f" "lnk/|40755|0" "lnk/x|100644|0|=x"
+  run vf unzip blog.miosito.it public/t.zip public/dest
+  [ "$status" -eq 1 ]
+  [ "$(jq -r '.conflicts | length' <<<"$output")" -ge 2 ]
+  run vf unzip blog.miosito.it public/t.zip public/dest --overwrite
+  [ "$status" -eq 1 ]
+  [ -d "$R/public/dest/d" ]
+  [ -L "$R/public/dest/lnk" ]
+  [ ! -e "$BATS_TEST_TMPDIR/x" ]
+  [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
+}
+
+@test "vps-files unzip: archivio e destinazione non ammessi" {
+  need_zip
+  mk_fm_site
+  mkdir "$R/public/dest"
+  mkz "$R/public/t.zip" "a|100644|0|=a"
+  ln -s "$R/public/t.zip" "$R/public/lnk.zip"
+  ln -s "$BATS_TEST_TMPDIR" "$R/public/dlnk"
+  printf 'x' >"$R/public/file"
+  for a in "public/nonesiste.zip public/dest" "public/lnk.zip public/dest" "logs/x public/dest" "public/dest public/dest" \
+    "public/t.zip public/nonesiste" "public/t.zip public/dlnk" "public/t.zip public/file" "public/t.zip logs" "public/t.zip tmp" "public/t.zip ../x"; do
+    # shellcheck disable=SC2086
+    run vf unzip blog.miosito.it $a
+    [ "$status" -eq 1 ] || { echo "accettato: $a"; false; }
+  done
+  [ "$(ls -A "$R/public/dest" | wc -l)" -eq 0 ]
+  [ ! -e "$BATS_TEST_TMPDIR/a" ]
+  run vf unzip blog.miosito.it public/t.zip public/dest --zzz
+  [ "$status" -eq 1 ]
+}
+
+@test "vps-files zip: cartella e file, riaperto con unzip; collegamenti memorizzati come tali" {
+  need_zip
+  mk_fm_site
+  mkdir -p "$R/public/sito/sub" "$R/public/altro"
+  printf 'uno' >"$R/public/sito/a b.txt"
+  printf 'due' >"$R/public/sito/sub/-x"
+  printf 'tre' >"$R/public/altro/[y]*.txt"
+  ln -s "$SECRET" "$R/public/sito/lnk"
+  run vf zip blog.miosito.it public/out.zip -- public/sito public/altro/'[y]*.txt'
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"ok":true}' ]
+  unzip -tq "$R/public/out.zip"
+  run zipinfo -1 "$R/public/out.zip"
+  [[ "$output" == *"sito/a b.txt"* ]]
+  [[ "$output" == *"sito/sub/-x"* ]]
+  [[ "$output" == *"[y]*.txt"* ]]
+  run zipinfo -s "$R/public/out.zip"
+  [[ "$output" == *"lrwx"*"sito/lnk"* ]]
+  [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
+  grep -q '^runuser -u site_blog_miosito_it' "$CALLS"
+  grep -q 'files zip blog.miosito.it public/out.zip public/sito' "$VPS_LOG"
+  ! grep -aq SEGRETO-ALTRO-SITO "$R/public/out.zip"
+  # esiste già -> conflitto, file intatto
+  cp "$R/public/out.zip" "$BATS_TEST_TMPDIR/prima.zip"
+  run vf zip blog.miosito.it public/out.zip -- public/sito
+  [ "$status" -eq 1 ]
+  [ "$(jq -r '.conflicts[0]' <<<"$output")" = public/out.zip ]
+  cmp "$R/public/out.zip" "$BATS_TEST_TMPDIR/prima.zip"
+}
+
+@test "vps-files zip: percorsi e destinazioni non ammessi, oltre 200 MB rifiutato, nulla creato" {
+  need_zip
+  mk_fm_site
+  mkdir -p "$R/public/sito"
+  ln -s "$BATS_TEST_TMPDIR" "$R/public/dlnk"
+  for a in "logs/o.zip -- public/sito" "public/o.txt -- public/sito" "public/o.zip -- logs" "public/o.zip -- wp-config.php" "public/o.zip -- public/nonesiste" \
+    "public/dlnk/o.zip -- public/sito" "public/nonesiste/o.zip -- public/sito" "public -- public/sito" "public/o.zip -- public/dlnk/x" "public/o.zip -- ../x" "public/o.zip public/sito"; do
+    # shellcheck disable=SC2086
+    run vf zip blog.miosito.it $a
+    [ "$status" -eq 1 ] || { echo "accettato: $a"; false; }
+  done
+  [ ! -e "$R/public/o.zip" ] && [ ! -e "$BATS_TEST_TMPDIR/o.zip" ]
+  truncate -s 209715201 "$R/public/sito/grosso"
+  run vf zip blog.miosito.it public/o.zip -- public/sito
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"200 MB"* ]]
+  [ ! -e "$R/public/o.zip" ]
+  [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
+}
+
+@test "vps-files download-zip: zip valido su stdout, collegamenti non letti, tetto 200 MB" {
+  need_zip
+  mk_fm_site
+  mkdir -p "$R/public/sito/sub"
+  printf 'uno' >"$R/public/sito/a.txt"
+  printf 'due' >"$R/public/sito/sub/-b"
+  ln -s "$SECRET" "$R/public/sito/lnk"
+  bash "$REPO_ROOT/tools/vps-files" download-zip blog.miosito.it public/sito >"$BATS_TEST_TMPDIR/dl.zip" 2>/dev/null
+  unzip -tq "$BATS_TEST_TMPDIR/dl.zip"
+  run zipinfo -s "$BATS_TEST_TMPDIR/dl.zip"
+  [[ "$output" == *"sito/a.txt"* ]]
+  [[ "$output" == *"sito/sub/-b"* ]]
+  [[ "$output" == *"lrwx"*"sito/lnk"* ]]
+  ! grep -aq SEGRETO-ALTRO-SITO "$BATS_TEST_TMPDIR/dl.zip"
+  grep -q '^runuser -u site_blog_miosito_it' "$CALLS"
+  [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
+  bash "$REPO_ROOT/tools/vps-files" download-zip blog.miosito.it public >"$BATS_TEST_TMPDIR/dl2.zip" 2>/dev/null
+  unzip -tq "$BATS_TEST_TMPDIR/dl2.zip"
+  for p in logs wp-config.php public/nonesiste ../x public/sito/lnk; do
+    run vf download-zip blog.miosito.it "$p"
+    [ "$status" -eq 1 ] || { echo "accettato: $p"; false; }
+    [ "$(jq -r .ok <<<"$output")" = false ]
+  done
+  truncate -s 209715201 "$R/public/sito/grosso"
+  run vf download-zip blog.miosito.it public/sito
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"200 MB"* ]]
+  [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
+}
+
+@test "vps-files download-zip: flusso oltre 200 MB (cresciuto dopo il controllo) -> errore e nessun temporaneo" {
+  mk_fm_site
+  mkdir -p "$R/public/sito"
+  # zip finto che produce 200 MB + 1: il tetto sul flusso scatta comunque
+  make_stub zip 'head -c 209715201 /dev/zero'
+  run vf download-zip blog.miosito.it public/sito
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'"ok":false'* ]]
+  [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
+}
+
+@test "vps-files copy: scadenza durante --overwrite -> nessuna copia parziale rimasta" {
+  mk_fm_site
+  mkdir -p "$R/public/dest/src" "$R/public/src"
+  printf 'vecchio' >"$R/public/dest/src/f"
+  printf 'nuovo' >"$R/public/src/f"
+  make_stub timeout 'shift; exec /usr/bin/timeout 1 "$@"'
+  make_stub cp 'c="${!#}"; mkdir -p "$c"; : >"$c/parziale"; sleep 5'
+  run vf copy blog.miosito.it public/dest --overwrite -- public/src
+  [ "$status" -eq 1 ]
+  [ "$(cat "$R/public/dest/src/f")" = vecchio ]
+  [ "$(ls -A "$R/public/dest" | wc -l)" -eq 1 ]
+}
+
+@test "vps-files unzip: bomba deflate che dichiara poco -> fermata durante l'estrazione, nulla rimasto" {
+  need_zip
+  mk_fm_site
+  mkdir "$R/public/dest"
+  local args=() i
+  # 30 voci da 10 MB di zeri (299 KB compressi) che dichiarano 100 byte: 300 MB veri
+  for i in $(seq 1 30); do args+=("b$i|100644|100|z10000000"); done
+  mkz "$R/public/m.zip" "${args[@]}"
+  run vf unzip blog.miosito.it public/m.zip public/dest
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"200 MB"* ]]
+  nothing_written
+  # una voce sola da 11 MB veri, dichiarata 100
+  mkz "$R/public/m.zip" "b|100644|100|z11000000"
+  run vf unzip blog.miosito.it public/m.zip public/dest
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"10 MB"* ]]
+  nothing_written
+}

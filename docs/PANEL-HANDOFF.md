@@ -227,6 +227,34 @@ la sorveglianza della VPS con avvisi Telegram. Il giro (`_run`) lo lancia solo
 
 Un giro: indirizzi in parallelo (`/health` con `--resolve <dominio>:443:127.0.0.1`, atteso 200 e `OK`; gli altri ok se codice < 500, redirect non seguiti, e la parola attesa nel primo MiB), servizi del manifest con riavvio (al massimo 3 l'ora, poi "riavvii sospesi"), disco/RAM/carico, accessi SSH (`journalctl -u ssh`), Ban di fail2ban, ogni 6 ore certificati e `vps-cf-token test`, alle 9 (Europe/Rome) il riepilogo solo se c'è contenuto; poi stato salvato, ping a Healthchecks.io, invio della coda (dal più vecchio, al massimo 10 invii e 44 s). Messaggi in testo semplice: `<emoji> <hostname>: <testo>` (🔴 giù, 🟡 attenzione, 🟢 rientro, 🔐 SSH, 📋 riepilogo).
 
+Fornito dall'installer v1.6, **eseguito dal pannello** con sudo (è in `/etc/sudoers.d/vps-panel`): `vps-files`, il file manager dei siti. Il chiamante non è fidato e i file sono del sito: root non apre mai nulla sotto `public/` o `logs/php/`, ogni accesso passa da `runuser -u site_<slug>` con `env -i`, `PATH` fisso e `umask 002` (file 664, cartelle 775), sotto `timeout`. Le sole letture di root sono le voci dirette di `logs/` (file regolari, non link). Il sito deve essere nel registro di `vps-site` con stato `active` o `disabled`.
+
+| Comando (argomenti) | Risposta |
+|---|---|
+| `list DOM PERCORSO` (`""` = radice) | `{"ok":true,"path","writable":bool,"truncated":bool,"entries":[{"name","type":"file\|dir\|link\|other","size","mtime":"<sec>.<9 cifre>","perms","raw":bool}]}`; al massimo 10.000 voci; `raw:false` = nome non UTF-8, non indirizzabile |
+| `stat DOM PERCORSO` | `{"ok":true,"type","size","mtime","text":bool}` (`text`: file regolare ≤ 2 MB, senza NUL nei primi 8 KB, UTF-8 valido) |
+| `read DOM PERCORSO` | **byte grezzi** del file su stdout (solo file regolari) |
+| `write DOM PERCORSO [--overwrite] [--if-mtime SEC.NSEC --if-size N]` (contenuto su stdin, ≤ 10 MB) | `{"ok":true,"mtime","size"}`; file nuovo senza `--overwrite`; con `--if-*` (insieme, implicano `--overwrite`) `{"ok":false,"error":"il file è cambiato","changed":true}` se data (ns) o dimensione sono diverse |
+| `mkdir DOM PERCORSO` | `{"ok":true}` |
+| `rename DOM DA NUOVONOME` | `{"ok":true}` |
+| `move\|copy DOM DESTINAZIONE [--overwrite] -- PERCORSO...` | `{"ok":true}`; la copia è limitata a 200 MB |
+| `delete DOM -- PERCORSO...` | `{"ok":true}` |
+| `zip DOM DESTINAZIONE.zip -- PERCORSO...` | `{"ok":true}`; i nomi nell'archivio sono relativi a `public/`; collegamenti memorizzati come tali; sorgenti ≤ 200 MB |
+| `unzip DOM ARCHIVIO DESTINAZIONE [--overwrite]` | `{"ok":true}` |
+| `download-zip DOM PERCORSO` (cartella) | **zip su stdout**; il nome della cartella è in testa a ogni voce; tetto 200 MB |
+
+Regole comuni:
+- Percorsi relativi alla radice del sito; ammessi `public/…` (lettura e scrittura), `logs/<file>`, `logs/php/…` e `wp-config.php` (sola lettura); rifiutati assoluti, segmenti vuoti, `.` o `..`, slash finale, caratteri di controllo, byte non UTF-8, nome > 255 byte, percorso > 4096 byte, `tmp/` e il resto. La radice (`""`) vale solo per `list` e `stat`. Scrivono (write, mkdir, rename, move, copy, delete, zip, unzip) solo sotto `public/`, mai `public` stesso; destinazione di move/copy/unzip anche `public`.
+- Argomenti: le opzioni (`--overwrite`, `--if-*`) vanno prima di `--`; dopo `--` tutto sono percorsi (anche con `-` iniziale), al massimo 500 per chiamata. Forma sbagliata = messaggio d'uso, uscita 1.
+- Errori: `{"ok":false,"error":"…"}` su stdout, uscita 1.
+- Conflitti: senza `--overwrite`, `write`, `mkdir`, `rename`, `move`, `copy`, `zip` e `unzip` non toccano nulla se anche un solo nome esiste e rispondono `{"ok":false,"error":"esiste già","conflicts":["public/x",…]}` (percorsi dalla radice del sito). Il pannello chiede e ripete con `--overwrite`. Con `unzip --overwrite`, un file al posto di una cartella (o un collegamento al posto di una cartella) non si sovrascrive: errore.
+- Link simbolici: mai seguiti. `read`/`write` li rifiutano, `copy`/`move` li copiano come link, `zip` li memorizza come link, `unzip` rifiuta gli archivi che ne contengono, `delete` toglie il link e non la destinazione; un genitore che è un link è rifiutato.
+- Limiti `unzip`: voce ≤ 10 MB, ≤ 10.000 voci, totale ≤ 200 MB, nessun nome assoluto, con `..` o `\`, nessun link o file speciale. Si controlla l'elenco (`zipinfo`) e poi **anche l'estrazione vera** (cartella di lavoro in `tmp/`, tetto per file con `ulimit -f`, sorveglianza sul totale, albero ricontrollato) prima di copiare in destinazione: un'intestazione che mente non basta. Errori: `archivio non valido`, `l'archivio ha più di 10.000 voci`, `l'archivio contiene un file oltre 10 MB`, `l'archivio supera i 200 MB estratti`, `l'archivio contiene collegamenti o file speciali`, `l'archivio contiene percorsi non ammessi (assoluti o con ..)`.
+- Tempi: 120 s per write, zip, unzip, move, copy, delete, read e download-zip (il ponte del pannello deve avere almeno lo stesso timeout); scaduto = `operazione scaduta`, i temporanei vengono tolti.
+- **Stream**: `read` e `download-zip` scrivono byte grezzi su stdout. Se l'uscita è ≠ 0 il chiamante **deve scartare** quanto ricevuto: dopo dati parziali può seguire un JSON di errore (`{"ok":false,…}`); un'uscita 0 è l'unica garanzia di un flusso completo.
+- Registro: `/var/log/vps-tools.log`, una riga per operazione che modifica (`files <comando> <dominio> <al massimo 20 percorsi> totale=N`), mai i contenuti. Per il registro del pannello: `files.upload|write|mkdir|rename|move|copy|delete|zip|unzip`, dettagli con al massimo 20 percorsi più `totale`.
+- Pacchetti `zip` e `unzip`: installati da `install.sh` e da `--tools-only` se mancano.
+
 Previsti per il pannello (da scrivere con il pannello, stesse regole):
 
 | Script | Cosa farà |
