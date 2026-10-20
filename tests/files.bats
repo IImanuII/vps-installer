@@ -762,3 +762,69 @@ fsize() { stat -c %s "$1"; }
   run grep -q RISERVATO "$VPS_LOG"
   [ "$status" -eq 1 ]
 }
+
+# ------------------------------------------------------- correzioni (giro 1)
+
+@test "vps-files copy: i collegamenti fisici contano uno per uno nel tetto di 200 MB" {
+  mk_fm_site
+  mkdir -p "$R/public/src" "$R/public/dest"
+  truncate -s 70M "$R/public/src/a"
+  for i in 1 2 3; do ln "$R/public/src/a" "$R/public/src/h$i"; done
+  run vf copy blog.miosito.it public/dest -- public/src
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .ok <<<"$output")" = false ]
+  [ ! -e "$R/public/dest/src" ]
+}
+
+@test "vps-files move/copy: controllo dei conflitti fallito -> errore, nulla fatto" {
+  mk_fm_site
+  mkdir "$R/public/dest"
+  : >"$R/public/a"
+  cat >"$BATS_TEST_TMPDIR/runuser-rotto" <<'STUB'
+#!/usr/bin/env bash
+shift 3
+while [[ "$1" == env || "$1" == -i || "$1" == *=* ]]; do shift; done
+case "$*" in *"for t; do"*) exit 5 ;; esac
+exec "$@"
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/runuser-rotto"
+  for c in move copy; do
+    FM_RUNUSER="$BATS_TEST_TMPDIR/runuser-rotto" run vf "$c" blog.miosito.it public/dest -- public/a
+    [ "$status" -eq 1 ]
+    [ "$(jq -r .ok <<<"$output")" = false ]
+    [ ! -e "$R/public/dest/a" ]
+  done
+  [ -e "$R/public/a" ]
+}
+
+@test "vps-files copy --overwrite: se la copia fallisce il vecchio resta, nessun temporaneo" {
+  mk_fm_site
+  mkdir -p "$R/public/dest/src" "$R/public/src"
+  printf 'vecchio' >"$R/public/dest/src/f"
+  printf 'nuovo' >"$R/public/src/f"
+  make_stub cp 'exit 1'
+  run vf copy blog.miosito.it public/dest --overwrite -- public/src
+  [ "$status" -eq 1 ]
+  [ "$(cat "$R/public/dest/src/f")" = vecchio ]
+  [ "$(ls -A "$R/public/dest" | wc -l)" -eq 1 ]
+}
+
+@test "vps-files write: scadenza del timeout -> errore e nessun temporaneo" {
+  mk_fm_site
+  make_stub timeout 'shift; exec /usr/bin/timeout 1 "$@"'
+  run bash -c "sleep 4 | bash '$REPO_ROOT/tools/vps-files' write blog.miosito.it public/lento 2>/dev/null"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .ok <<<"$output")" = false ]
+  [ ! -e "$R/public/lento" ]
+  [ "$(ls -A "$R/public" | wc -l)" -eq 0 ]
+}
+
+@test "vps-files move: registro senza la destinazione nel totale, chiamata a runuser" {
+  mk_fm_site
+  mkdir "$R/public/dest"
+  : >"$R/public/a"
+  run vf move blog.miosito.it public/dest -- public/a
+  [ "$status" -eq 0 ]
+  grep -q '^runuser -u site_blog_miosito_it' "$CALLS"
+  grep -q 'files move verso public/dest blog.miosito.it public/a totale=1' "$VPS_LOG"
+}

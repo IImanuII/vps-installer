@@ -55,14 +55,17 @@ chkp() {
   pre=""
   oldifs="$IFS"
   IFS=/
+  r=0
   for s in $d; do
     pre="${pre:+$pre/}$s"
     if [ -L "$pre" ]; then
-      IFS="$oldifs"
-      return 1
+      r=1
+      break
     fi
   done
   IFS="$oldifs"
+  set +f
+  [ "$r" = 0 ] || return 1
   [ -d "$d" ]
 }
 ex() { [ -e "$1" ] || [ -L "$1" ]; }
@@ -80,7 +83,8 @@ elif [ -n "$im" ]; then
   exit 69
 fi
 tmp="$(mktemp "${t%/*}/.vpsfiles.XXXXXX")" || exit 1
-trap 'rm -f -- "$tmp"' EXIT INT TERM
+trap 'rm -f -- "$tmp"' EXIT
+trap 'exit 124' INT TERM
 head -c 10485761 >"$tmp"
 [ "$(wc -c <"$tmp")" -le 10485760 ] || exit 68
 if ex "$t"; then chmod --reference="$t" -- "$tmp"; else chmod 664 -- "$tmp"; fi
@@ -132,7 +136,7 @@ EOS
 read -r -d '' FM_SH_SIZE <<'EOS' || true
 tot=0
 for s; do
-  n="$(du -sb -- "$s" 2>/dev/null | cut -f1)"
+  n="$(du -sbl -- "$s" 2>/dev/null | cut -f1)"
   tot=$((tot + ${n:-0}))
 done
 [ "$tot" -le 209715200 ] || exit 68
@@ -143,9 +147,18 @@ read -r -d '' FM_SH_MVCP <<'EOS' || true
 op="$1"; ow="$2"; shift 2
 while [ "$#" -gt 0 ]; do
   s="$1"; t="$2"; shift 2
-  if [ "$ow" = 1 ]; then rm -rf -- "$t" || exit 1; fi
   if [ "$op" = move ]; then
+    if [ "$ow" = 1 ]; then rm -rf -- "$t" || exit 1; fi
     mv -n -T -- "$s" "$t" || exit 1
+  elif [ "$ow" = 1 ]; then
+    # copia in un nome temporaneo, poi lo si mette al posto: se la copia fallisce il vecchio resta
+    c="${t%/*}/.vpsfiles-cp.$$"
+    rm -rf -- "$c"
+    if ! cp -P -R -T --preserve=mode,timestamps -- "$s" "$c"; then
+      rm -rf -- "$c"
+      exit 1
+    fi
+    rm -rf -- "$t" && mv -T -- "$c" "$t" || { rm -rf -- "$c"; exit 1; }
   else
     cp -n -P -R -T --preserve=mode,timestamps -- "$s" "$t" || exit 1
   fi
@@ -425,13 +438,17 @@ exec cat <"$1"' sh "$p" || rc=$?
         fi
       done
     done
-    fm_log "$cmd" "$dest" "${srcs[@]}"
+    fm_log "$cmd verso $(printf "%q" "$dest")" "${srcs[@]}"
     rc=0
     site_sh 60 "$FM_SH_CHK" "$dest" "${srcs[@]}" || rc=$?
     ((rc == 0)) || fm_fail "$rc"
     if ((ow == 0)); then
       conf=()
-      mapfile -d '' conf < <(site_sh 60 "$FM_SH_EXIST" "${targets[@]}")
+      # base64: la variabile non può contenere NUL, e così si vede anche l'uscita dello script
+      rc=0
+      exb="$(site_sh 60 "$FM_SH_EXIST" "${targets[@]}" | base64 -w0)" || rc=$?
+      ((rc == 0)) || fm_fail "$rc"
+      mapfile -d '' conf < <(base64 -d <<<"$exb")
       ((${#conf[@]} == 0)) || fm_conflict "${conf[@]}"
     fi
     if [[ "$cmd" == copy ]]; then
