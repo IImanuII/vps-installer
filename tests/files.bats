@@ -829,6 +829,21 @@ STUB
   grep -q 'files move verso public/dest blog.miosito.it public/a totale=1' "$VPS_LOG"
 }
 
+@test "vps-files copy: un solo budget di 120 s per tutta l'operazione" {
+  mk_fm_site
+  mkdir "$R/public/dest"
+  : >"$R/public/a"
+  make_stub timeout 'echo "timeout $1" >>"$CALLS"; sleep 2; shift; exec "$@"'
+  run vf copy blog.miosito.it public/dest -- public/a
+  [ "$status" -eq 0 ]
+  mapfile -t tt < <(grep '^timeout ' "$CALLS" | cut -d' ' -f2)
+  [ "${#tt[@]}" -eq 4 ]
+  [ "${tt[0]}" -eq 120 ]
+  # ogni passo riceve quanto avanza: mai il vecchio 60/60/120/120 a catena
+  [ "${tt[1]}" -le 118 ] && [ "${tt[2]}" -le 116 ] && [ "${tt[3]}" -le 114 ]
+  [ "${tt[3]}" -ge 100 ]
+}
+
 # ---------------------------------------------------------------- zip, unzip, download-zip
 
 # mkz USCITA "nome|modo|dim[|reali]"... — zip fatto a mano (anche malevolo), vedi tests/mkzip.pl

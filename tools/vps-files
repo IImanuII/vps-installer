@@ -662,28 +662,37 @@ exec cat <"$1"' sh "$p" || rc=$?
       done
     done
     fm_log "$cmd verso $(printf "%q" "$dest")" "${srcs[@]}"
+    # un solo budget di 120 s per tutta l'operazione: a ogni passo resta quanto avanzato
+    t0=$SECONDS
+    left=120
     rc=0
-    site_sh 60 "$FM_SH_CHK" "$dest" "${srcs[@]}" || rc=$?
+    site_sh "$left" "$FM_SH_CHK" "$dest" "${srcs[@]}" || rc=$?
     ((rc == 0)) || fm_fail "$rc"
     if ((ow == 0)); then
       conf=()
       # base64: la variabile non può contenere NUL, e così si vede anche l'uscita dello script
+      left=$((120 - (SECONDS - t0)))
+      ((left >= 5)) || json_err "operazione scaduta"
       rc=0
-      exb="$(site_sh 60 "$FM_SH_EXIST" "${targets[@]}" | base64 -w0)" || rc=$?
+      exb="$(site_sh "$left" "$FM_SH_EXIST" "${targets[@]}" | base64 -w0)" || rc=$?
       ((rc == 0)) || fm_fail "$rc"
       mapfile -d '' conf < <(base64 -d <<<"$exb")
       ((${#conf[@]} == 0)) || fm_conflict "${conf[@]}"
     fi
     if [[ "$cmd" == copy ]]; then
+      left=$((120 - (SECONDS - t0)))
+      ((left >= 5)) || json_err "operazione scaduta"
       rc=0
-      site_sh 120 "$FM_SH_SIZE" "${srcs[@]}" || rc=$?
+      site_sh "$left" "$FM_SH_SIZE" "${srcs[@]}" || rc=$?
       if ((rc == 68)); then json_err "la copia supera i 200 MB"; fi
       ((rc == 0)) || fm_fail "$rc"
     fi
     pairs=()
     for ((i = 0; i < n; i++)); do pairs+=("${srcs[i]}" "${targets[i]}"); done
+    left=$((120 - (SECONDS - t0)))
+    ((left >= 5)) || json_err "operazione scaduta"
     rc=0
-    site_sh 120 "$FM_SH_MVCP" "$cmd" "$ow" "${pairs[@]}" || rc=$?
+    site_sh "$left" "$FM_SH_MVCP" "$cmd" "$ow" "${pairs[@]}" || rc=$?
     ((rc == 0)) || fm_fail "$rc"
     json_ok
     ;;

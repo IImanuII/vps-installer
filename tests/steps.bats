@@ -55,6 +55,7 @@ setup() {
   grep -q 'root /var/www/panel.miosito.it/public;' "$BATS_TEST_TMPDIR/vhost"
   grep -q 'include /etc/nginx/snippets/panel.d/\*.conf;' "$BATS_TEST_TMPDIR/vhost"
   grep -q 'limit_req zone=req_limit_per_ip' "$BATS_TEST_TMPDIR/vhost"
+  grep -q 'fastcgi_read_timeout 150s;' "$BATS_TEST_TMPDIR/vhost"
   grep -q 'return 301 https://$host$request_uri;' "$BATS_TEST_TMPDIR/vhost"
   render_template "$REPO_ROOT/templates/php-pool-panel.conf.tmpl" "$BATS_TEST_TMPDIR/pool" 644 "$(id -un):$(id -gn)" PANEL_ROOT PHP_VERSION VPS_OPT
   grep -qxF 'listen = /run/php/php8.4-fpm-panel.sock' "$BATS_TEST_TMPDIR/pool"

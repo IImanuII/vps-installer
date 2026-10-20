@@ -44,5 +44,7 @@ server {
         include fastcgi_params;
         fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
         fastcgi_pass unix:/run/php/php${PHP_VERSION}-fpm-panel.sock;
+        # le operazioni sui file durano fino a 120 s: il default di nginx (60 s) le taglierebbe
+        fastcgi_read_timeout 150s;
     }
 }
