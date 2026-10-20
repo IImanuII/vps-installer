@@ -124,4 +124,5 @@ spostamento, eliminazione, zip, estrazione di zip e download di cartelle come zi
 Si lavora solo in `public/` (in sola lettura anche `logs/` e `wp-config.php`), i
 collegamenti simbolici non si seguono mai e gli zip malevoli (percorsi con `..` o
 assoluti, collegamenti, bombe) sono rifiutati. L'installer aggiunge i pacchetti `zip`
-e `unzip`. Contratto in `docs/PANEL-HANDOFF.md`.
+e `unzip`, e con `--tools-only` aggiunge `fastcgi_read_timeout 150s` al vhost del
+pannello (le operazioni durano fino a 120 s). Contratto in `docs/PANEL-HANDOFF.md`.

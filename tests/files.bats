@@ -1217,3 +1217,45 @@ zflag() {
   [ "$t1" -le 120 ] && [ "$t2" -le 120 ] && [ "$t2" -ge 100 ]
   [ "$((t1 + 0))" -le 60 ]
 }
+
+# ------------------------------------------------------- correzioni (giro finale)
+
+@test "vps-files write: temporanei .vpsfiles.* vecchi della cartella di destinazione spazzati, non ricorsivo" {
+  mk_fm_site
+  mkdir -p "$R/public/d/sub"
+  : >"$R/public/d/.vpsfiles.VECCHIO"
+  : >"$R/public/d/.vpsfiles.NUOVO"
+  : >"$R/public/d/.vpsfiles-cp.VECCHIO"
+  : >"$R/public/d/sub/.vpsfiles.VECCHIO"
+  : >"$R/public/d/utente.txt"
+  touch -d '2 hours ago' "$R/public/d/.vpsfiles.VECCHIO" "$R/public/d/.vpsfiles-cp.VECCHIO" "$R/public/d/sub/.vpsfiles.VECCHIO" "$R/public/d/utente.txt"
+  printf 'x' | vf write blog.miosito.it public/d/a.txt >/dev/null
+  [ ! -e "$R/public/d/.vpsfiles.VECCHIO" ]
+  [ ! -e "$R/public/d/.vpsfiles-cp.VECCHIO" ]
+  [ -e "$R/public/d/.vpsfiles.NUOVO" ]
+  [ -e "$R/public/d/sub/.vpsfiles.VECCHIO" ]
+  [ -e "$R/public/d/utente.txt" ]
+}
+
+@test "vps-files copy: spazza i temporanei vecchi della cartella di destinazione" {
+  mk_fm_site
+  mkdir -p "$R/public/dest"
+  : >"$R/public/a"
+  : >"$R/public/dest/.vpsfiles-cp.99999"
+  : >"$R/public/dest/.vpsfiles.VECCHIO"
+  touch -d '2 hours ago' "$R/public/dest/.vpsfiles-cp.99999" "$R/public/dest/.vpsfiles.VECCHIO"
+  run vf copy blog.miosito.it public/dest --overwrite -- public/a
+  [ "$status" -eq 0 ]
+  [ -e "$R/public/dest/a" ]
+  [ ! -e "$R/public/dest/.vpsfiles-cp.99999" ]
+  [ ! -e "$R/public/dest/.vpsfiles.VECCHIO" ]
+}
+
+@test "vps-files: il registro riporta anche l'esito, ok o il messaggio di errore" {
+  mk_fm_site
+  printf 'x' | vf write blog.miosito.it public/a.txt >/dev/null
+  grep -q 'files write blog.miosito.it public/a.txt totale=1 esito=ok$' "$VPS_LOG"
+  run vf mkdir blog.miosito.it public/a.txt
+  [ "$status" -eq 1 ]
+  grep -q 'files mkdir blog.miosito.it public/a.txt totale=1 esito=errore .*esiste' "$VPS_LOG"
+}

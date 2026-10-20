@@ -75,6 +75,8 @@ chkp() {
 ex() { [ -e "$1" ] || [ -L "$1" ]; }
 # temporanei di operazioni interrotte (kill -9, riavvio): quelli di tmp/ oltre un'ora si tolgono
 sweep() { find tmp -maxdepth 1 -name '.vpsfiles-*' -mmin +60 -exec rm -rf -- {} + 2>/dev/null; return 0; }
+# idem per i temporanei di scrittura e copia, che stanno nella cartella di destinazione (solo quella)
+sweepd() { find "$1" -maxdepth 1 \( -name '.vpsfiles.*' -o -name '.vpsfiles-cp.*' \) -mmin +60 -exec rm -rf -- {} + 2>/dev/null; return 0; }
 EOS
 
 # Scrittura: tmp nella stessa cartella, poi rename (o ln se il file deve essere nuovo).
@@ -88,6 +90,7 @@ if ex "$t"; then
 elif [ -n "$im" ]; then
   exit 69
 fi
+sweepd "${t%/*}"
 tmp="$(mktemp "${t%/*}/.vpsfiles.XXXXXX")" || exit 1
 trap 'rm -f -- "$tmp"' EXIT
 trap 'exit 124' INT TERM
@@ -163,6 +166,7 @@ while [ "$#" -gt 0 ]; do
     mv -n -T -- "$s" "$t" || exit 1
   elif [ "$ow" = 1 ]; then
     # copia in un nome temporaneo, poi lo si mette al posto: se la copia fallisce il vecchio resta
+    sweepd "${t%/*}"
     c="${t%/*}/.vpsfiles-cp.$$"
     rm -rf -- "$c"
     if ! cp -P -R -T --preserve=mode,timestamps -- "$s" "$c"; then
@@ -457,16 +461,35 @@ head -c 2097153 <"$1" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1' sh "$1" >/dev/n
   return "$rc"
 }
 
-# fm_log COMANDO PERCORSO... — registro: comando, sito, al massimo 20 percorsi e il totale.
+# json_err con il messaggio memorizzato, per il registro (esito).
+json_err() {
+  FM_ERR="$1"
+  jq -nc --arg e "$1" '{ok: false, error: $e}'
+  exit 1
+}
+
+# fm_log COMANDO PERCORSO... — registro: comando, sito, al massimo 20 percorsi e il totale;
+# l'esito (ok o il messaggio di errore) si aggiunge alla fine, in uscita.
 fm_log() {
   local c="$1" n=$(($# - 1)) list
   shift
   list="$(printf '%q ' "${@:1:20}")"
-  log "files $c $dom $list""totale=$n"
+  FM_LOGLINE="files $c $dom $list""totale=$n"
+  trap 'fm_log_end $?' EXIT
+}
+
+fm_log_end() {
+  [[ $BASHPID == "$$" ]] || return 0
+  if (($1 == 0)); then
+    log "$FM_LOGLINE esito=ok"
+  else
+    log "$FM_LOGLINE esito=errore $(printf '%q' "${FM_ERR:-uscita $1}")"
+  fi
 }
 
 # fm_conflict PERCORSO... — risposta di conflitto, uscita 1.
 fm_conflict() {
+  FM_ERR="esiste già"
   jq -nc '{ok: false, error: "esiste già", conflicts: $ARGS.positional}' --args "$@"
   exit 1
 }

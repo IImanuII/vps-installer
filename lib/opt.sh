@@ -58,6 +58,33 @@ opt_panel_pool() {
   fi
 }
 
+# opt_panel_vhost — le installazioni precedenti alla 1.6.0 hanno il vhost del
+# pannello senza fastcgi_read_timeout: le operazioni sui file (fino a 120 s)
+# verrebbero tagliate dal default di nginx (60 s). Si aggiunge la riga
+# `fastcgi_read_timeout 150s;` subito dopo il fastcgi_pass del pool del pannello,
+# si verifica con nginx -t e si ricarica; se qualcosa non va torna il file di
+# prima e --tools-only prosegue.
+opt_panel_vhost() {
+  local m dom f bak
+  m="$(manifest_path)"
+  dom="$(jq -r '.panel.domain // empty' "$m")"
+  [[ -n "$dom" ]] || return 0
+  f="${PANEL_VHOST_FILE:-${NGINX_CONF_D:-/etc/nginx/conf.d}/$dom.conf}"
+  [[ -f "$f" ]] || return 0
+  grep -q 'fastcgi_read_timeout' "$f" && return 0
+  grep -q '^[[:space:]]*fastcgi_pass .*-fpm-panel\.sock;' "$f" || return 0
+  bak="$(mktemp)"
+  cp -p "$f" "$bak"
+  sed -i 's/^\([[:space:]]*\)\(fastcgi_pass .*-fpm-panel\.sock;\)/&\n\1fastcgi_read_timeout 150s;/' "$f"
+  if nginx -t >>"$VPS_LOG" 2>&1 && systemctl reload nginx >>"$VPS_LOG" 2>&1; then
+    rm -f "$bak"
+    log "Vhost del pannello: aggiunto fastcgi_read_timeout 150s"
+  else
+    mv -f "$bak" "$f"
+    log "ATTENZIONE: vhost del pannello non aggiornato (nginx -t o reload falliti), lasciato com'era"
+  fi
+}
+
 # opt_system_files — la parte di sistema degli script: sudoers del pannello,
 # cron, cartelle dei siti e pagina di manutenzione. La chiama anche
 # --tools-only: senza, una VPS già installata riceverebbe vps-site ma il
@@ -103,6 +130,7 @@ opt_system_files() {
   fi
   opt_monitor_files
   opt_panel_pool
+  opt_panel_vhost
   # Aggiornamenti automatici: anche Nginx di nginx.org (dalla 1.5.3). Solo sulle
   # macchine che hanno gia' la configurazione dell'installer.
   if [[ -f "${APT_CONF_D:-/etc/apt/apt.conf.d}/52vps-unattended" ]]; then

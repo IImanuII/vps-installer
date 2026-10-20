@@ -211,3 +211,50 @@ sys_setup() {
   opt_system_files
   grep -qF 'origin=nginx' "$APT_CONF_D/52vps-unattended"
 }
+
+@test "opt_panel_vhost aggiunge fastcgi_read_timeout dopo fastcgi_pass, una volta, e ricarica nginx" {
+  jq -n '{panel:{domain:"p.test"}}' >"$VPS_OPT/manifest.json"
+  export PANEL_VHOST_FILE="$BATS_TEST_TMPDIR/p.test.conf"
+  printf 'server {\n    location ~ \.php$ {\n        include fastcgi_params;\n        fastcgi_pass unix:/run/php/php8.4-fpm-panel.sock;\n    }\n}\n' >"$PANEL_VHOST_FILE"
+  make_stub nginx 'echo "nginx $*" >>"$BATS_TEST_TMPDIR/ng.calls"'
+  opt_panel_vhost
+  [ "$(sed -n 5p "$PANEL_VHOST_FILE")" = "        fastcgi_read_timeout 150s;" ]
+  [ "$(sed -n 4p "$PANEL_VHOST_FILE")" = "        fastcgi_pass unix:/run/php/php8.4-fpm-panel.sock;" ]
+  grep -qxF 'nginx -t' "$BATS_TEST_TMPDIR/ng.calls"
+  grep -qxF 'reload nginx' "$BATS_TEST_TMPDIR/systemctl.calls"
+  opt_panel_vhost
+  [ "$(grep -c fastcgi_read_timeout "$PANEL_VHOST_FILE")" -eq 1 ]
+  [ "$(grep -c 'reload nginx' "$BATS_TEST_TMPDIR/systemctl.calls")" -eq 1 ]
+}
+
+@test "opt_panel_vhost: timeout già presente = nessuna modifica né reload; senza pannello non fa nulla" {
+  jq -n '{panel:{domain:"p.test"}}' >"$VPS_OPT/manifest.json"
+  export PANEL_VHOST_FILE="$BATS_TEST_TMPDIR/p.test.conf"
+  printf 'fastcgi_pass unix:/run/php/php8.4-fpm-panel.sock;\nfastcgi_read_timeout 300s;\n' >"$PANEL_VHOST_FILE"
+  cp "$PANEL_VHOST_FILE" "$BATS_TEST_TMPDIR/prima"
+  make_stub nginx 'exit 0'
+  opt_panel_vhost
+  cmp -s "$PANEL_VHOST_FILE" "$BATS_TEST_TMPDIR/prima"
+  [ ! -e "$BATS_TEST_TMPDIR/systemctl.calls" ]
+  printf 'fastcgi_pass unix:/run/php/php8.4-fpm-panel.sock;\n' >"$PANEL_VHOST_FILE"
+  cp "$PANEL_VHOST_FILE" "$BATS_TEST_TMPDIR/prima"
+  jq -n '{components:{php:"8.4"}}' >"$VPS_OPT/manifest.json"
+  opt_panel_vhost
+  cmp -s "$PANEL_VHOST_FILE" "$BATS_TEST_TMPDIR/prima"
+}
+
+@test "opt_panel_vhost: nginx -t fallito ripristina il vhost e non interrompe" {
+  jq -n '{panel:{domain:"p.test"}}' >"$VPS_OPT/manifest.json"
+  export PANEL_VHOST_FILE="$BATS_TEST_TMPDIR/p.test.conf"
+  printf '    fastcgi_pass unix:/run/php/php8.4-fpm-panel.sock;\n' >"$PANEL_VHOST_FILE"
+  cp "$PANEL_VHOST_FILE" "$BATS_TEST_TMPDIR/prima"
+  make_stub nginx 'exit 1'
+  run opt_panel_vhost
+  [ "$status" -eq 0 ]
+  cmp -s "$PANEL_VHOST_FILE" "$BATS_TEST_TMPDIR/prima"
+  [ ! -e "$BATS_TEST_TMPDIR/systemctl.calls" ]
+}
+
+@test "opt_system_files chiama opt_panel_vhost" {
+  declare -f opt_system_files | grep -q opt_panel_vhost
+}
