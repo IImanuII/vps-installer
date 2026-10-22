@@ -370,7 +370,7 @@ mv -n -T -- "$w/o.zip" "$final" || exit 1
 EOS
 
 # download-zip: PERCORSO. Zip su stdout, con il nome della cartella in testa; tetto 200 MB
-# prima (sui file) e durante (sul flusso). Uscite: 65, 67, 68, 1.
+# prima (sui file) e dopo (sull'archivio, scritto in tmp/). Uscite: 65, 67, 68, 1.
 read -r -d '' FM_SH_DLZIP <<'EOS' || true
 p="$1"
 chkp "$p" || exit 67
@@ -389,10 +389,18 @@ case "$p" in
   *) par="."; base="$p" ;;
 esac
 cd "$par" || exit 1
-{ LC_ALL=C.UTF-8 zip -r -y -q -nw - -- "$base" 2>/dev/null; echo "$?" >"$w/rc"; } |
-  { head -c 209715200; if [ "$(head -c 1 | wc -c)" != 0 ]; then : >"$w/big"; fi; }
-[ ! -e "$w/big" ] || exit 68
-[ "$(cat "$w/rc" 2>/dev/null)" = 0 ] || exit 1
+# zip su file in tmp/ e non su stdout: lo zip di Ubuntu rifiuta le pipe ("zip -0 not
+# supported for I/O on pipes"). ulimit -f (blocchi da 512 byte) appena sopra il tetto:
+# se i file crescono dopo il controllo, l'archivio supera il tetto e si esce con 68.
+z="$w/z.zip"
+(
+  ulimit -f 409601
+  exec env LC_ALL=C.UTF-8 zip -r -y -q -nw "$z" -- "$base" >/dev/null 2>&1
+)
+rc=$?
+[ "$(du -sb -- "$w" 2>/dev/null | cut -f1)" -le 209715200 ] || exit 68
+[ "$rc" = 0 ] && [ -f "$z" ] || exit 1
+cat -- "$z" || exit 1
 EOS
 
 # Comandi e numero di argomenti (vedi sopra) prima di qualsiasi altra cosa.

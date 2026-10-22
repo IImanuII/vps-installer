@@ -463,6 +463,8 @@ no_runuser() { [ ! -s "$CALLS" ] || ! grep -q '^runuser' "$CALLS"; }
 }
 
 @test "vps-files list: cartella non leggibile dal sito -> errore, non lista vuota" {
+  # runuser vero verso nobody: serve root (in CI i test girano come utente normale)
+  [[ $EUID -eq 0 ]] || skip "serve root"
   mk_fm_site
   mkdir "$R/public/chiusa"
   : >"$R/public/chiusa/x"
@@ -1083,11 +1085,11 @@ nothing_written() {
   [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
 }
 
-@test "vps-files download-zip: flusso oltre 200 MB (cresciuto dopo il controllo) -> errore e nessun temporaneo" {
+@test "vps-files download-zip: archivio oltre 200 MB (cresciuto dopo il controllo) -> errore e nessun temporaneo" {
   mk_fm_site
   mkdir -p "$R/public/sito"
-  # zip finto che produce 200 MB + 1: il tetto sul flusso scatta comunque
-  make_stub zip 'head -c 209715201 /dev/zero'
+  # zip finto che scrive un archivio di 200 MB + 1: il tetto sull'archivio scatta comunque
+  make_stub zip 'head -c 209715201 /dev/zero >"$5"'
   run vf download-zip blog.miosito.it public/sito
   [ "$status" -eq 1 ]
   [[ "$output" == *'"ok":false'* ]]
