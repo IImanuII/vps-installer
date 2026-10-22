@@ -13,6 +13,8 @@
 
 # Messaggio dell'ultimo errore di bk_archive / bk_verify (leggibile dal chiamante).
 export BK_ERR=""
+# Descrittore del lock di sito tenuto da questo processo (vuoto se nessuno).
+export BK_SITE_LOCK_FD=""
 
 # --- lock per sito ---------------------------------------------------------
 
@@ -21,68 +23,87 @@ bk_lock_file() {
   printf '%s/vps-site.%s.lock' "$BK_LOCK_DIR" "$1"
 }
 
-# bk_site_lock SLUG — prende il lock del sito senza attendere e lo tiene sul
-# descrittore 6 finché il chiamante (o bk_site_unlock) non lo chiude. 1 se occupato.
-# Si apre prima sul 7: così un tentativo fallito non fa perdere un lock già tenuto
-# sul 6, e due chiamate sullo stesso sito nello stesso processo si vedono tra loro.
+# Lo slug finisce in un nome di file: solo la forma che vps-site genera.
+_bk_slug_ok() {
+  [[ "${1-}" =~ ^site_[a-z0-9_]{1,27}$ ]]
+}
+
+# bk_site_lock SLUG — prende il lock del sito senza attendere e lo tiene su un
+# descrittore allocato da bash (BK_SITE_LOCK_FD): i numeri fissi 6-9 sono già usati
+# da redis_acl.sh, sites.sh, vps-site e vps-monitor. 1 se occupato o non apribile.
+# Il nuovo lock si prova prima di lasciare il vecchio: un tentativo fallito non fa
+# perdere quello già tenuto, e due lock sullo stesso sito nello stesso processo si
+# vedono tra loro.
 bk_site_lock() {
-  local f old
-  f="$(bk_lock_file "${1-}")"
+  local f old fd
+  _bk_slug_ok "${1-}" || return 2
+  f="$(bk_lock_file "$1")"
   old="$(umask)"
   umask 077
   # shellcheck disable=SC2261
-  { exec 7>>"$f"; } 2>/dev/null || {
+  { exec {fd}>>"$f"; } 2>/dev/null || {
     umask "$old"
     return 1
   }
   umask "$old"
   chmod 600 "$f" 2>/dev/null || true
-  if ! flock -n 7; then
-    exec 7>&-
+  if ! flock -n "$fd"; then
+    exec {fd}>&-
     return 1
   fi
-  exec 6>&7 7>&-
+  if [[ -n "$BK_SITE_LOCK_FD" ]]; then
+    exec {BK_SITE_LOCK_FD}>&-
+  fi
+  BK_SITE_LOCK_FD="$fd"
 }
 
-# bk_site_unlock — rilascia il lock tenuto sul descrittore 6.
+# bk_site_unlock — rilascia il lock tenuto da questo processo.
 bk_site_unlock() {
-  exec 6>&-
+  if [[ -n "$BK_SITE_LOCK_FD" ]]; then
+    exec {BK_SITE_LOCK_FD}>&-
+    BK_SITE_LOCK_FD=""
+  fi
 }
 
-# bk_site_locked SLUG — 0 se un altro processo tiene il lock del sito. Lo prova su
-# un descrittore a parte e lo rilascia subito; non crea il file.
+# bk_site_locked SLUG — 0 se un altro processo tiene il lock del sito, 1 se è libero
+# (o il file non esiste: non lo crea), 2 se lo slug non è valido. Un file che c'è ma
+# non si riesce ad aprire conta come occupato: nel dubbio non si tocca il sito.
 bk_site_locked() {
-  local f
-  f="$(bk_lock_file "${1-}")"
-  [[ -e "$f" ]] || return 1
-  (
-    # shellcheck disable=SC2261
-    { exec 8<"$f"; } 2>/dev/null || exit 1
-    if flock -n 8; then exit 1; fi
-    exit 0
-  )
+  local f fd rc=1
+  _bk_slug_ok "${1-}" || return 2
+  f="$(bk_lock_file "$1")"
+  [[ -e "$f" || -L "$f" ]] || return 1
+  # shellcheck disable=SC2261
+  { exec {fd}<"$f"; } 2>/dev/null || return 0
+  flock -n "$fd" || rc=0
+  exec {fd}>&-
+  return "$rc"
 }
 
 # --- spazio e conservazione ------------------------------------------------
 
 # bk_space_ok DIR BYTES — 0 se lo spazio libero su DIR supera BYTES*2 + 512 MB
-# (archivio finale + temporanei, più un margine per il resto del disco).
+# (archivio finale + temporanei, più un margine per il resto del disco). BYTES
+# oltre 2^50 (un petabyte) è un errore, non un calcolo che trabocca.
 bk_space_ok() {
   local dir="${1-}" bytes="${2-}" free
-  [[ "$bytes" =~ ^[0-9]+$ ]] || return 1
+  [[ "$bytes" =~ ^[0-9]{1,16}$ ]] || return 1
+  bytes=$((10#$bytes))
+  ((bytes <= 1125899906842624)) || return 1
   free="$(df -PB1 "$dir" 2>/dev/null | awk 'NR == 2 {print $4}')"
-  [[ "$free" =~ ^[0-9]+$ ]] || return 1
-  ((free > bytes * 2 + 536870912))
+  [[ "$free" =~ ^[0-9]{1,18}$ ]] || return 1
+  ((10#$free > bytes * 2 + 536870912))
 }
 
 # bk_keep_plan NOMI... — nomi del tipo qualcosa-AAAAMMGG-HHMM.ext: stampa quelli da
-# eliminare, cioè tutti tranne gli ultimi 3 per data. Un nome senza data non si
-# tocca mai (non si cancella ciò che non si riconosce).
+# eliminare, cioè tutti tranne gli ultimi 3 per data (la data è l'ultima occorrenza
+# nel nome). Un nome senza data non si tocca mai (non si cancella ciò che non si
+# riconosce).
 bk_keep_plan() {
   local n key
   local -a rows=()
   for n in "$@"; do
-    if [[ "$n" =~ -([0-9]{8}-[0-9]{4})\.[^/]*$ ]]; then
+    if [[ "$n" =~ ^.*-([0-9]{8}-[0-9]{4}([0-9]{2})?)\.[^/]*$ ]]; then
       key="${BASH_REMATCH[1]}"
       rows+=("$key $n")
     fi
@@ -105,16 +126,27 @@ bk_tmp_dir() {
   mktemp -d "$BK_BACKUPS/tmp/bk.XXXXXX"
 }
 
+# _bk_log_file FILE ETICHETTA — mette nel registro il contenuto di FILE (testo di un
+# comando che gira con dati del sito) su una riga sola, senza caratteri di controllo:
+# un sito non deve poter scrivere righe finte nel registro.
+_bk_log_file() {
+  [[ -s "$1" ]] || return 0
+  printf '[%s] bk_archive: %s: %s\n' "$(date '+%F %T')" "$2" \
+    "$(head -c 500 "$1" | LC_ALL=C tr -c '[:print:]' '?')" >>"$VPS_LOG" 2>/dev/null || true
+}
+
 # bk_archive DOMINIO OUT — scrive l'archivio del sito in OUT. Tutto si costruisce in
 # una cartella temporanea e si sposta in OUT solo a lavoro finito: se qualcosa
-# fallisce non resta nulla (né temporaneo né OUT) e BK_ERR dice perché. Uscita 0/1.
+# fallisce non resta nulla di ciò che questa chiamata ha creato (un OUT già esistente
+# non si tocca) e BK_ERR dice perché. Uscita 0/1.
 bk_archive() {
-  local d="${1-}" out="${2-}" w rc=0
+  local d="${1-}" out="${2-}" w rc=0 existed=0
   BK_ERR=""
   if [[ -z "$out" ]]; then
     BK_ERR="percorso di destinazione mancante"
     return 1
   fi
+  [[ -e "$out" || -L "$out" ]] && existed=1
   w="$(bk_tmp_dir)" || {
     BK_ERR="cartella temporanea non disponibile"
     return 1
@@ -125,15 +157,16 @@ bk_archive() {
   fi
   rm -rf "$w"
   if ((rc)); then
-    rm -f "$out"
+    rm -f "$out.part"
+    ((existed)) || rm -f "$out"
     return 1
   fi
 }
 
-# _bk_archive_in DOMINIO OUT LAVORO — corpo di bk_archive (in una subshell: BK_ERR
-# non risale, quindi lo passa dal file LAVORO/err).
+# _bk_archive_in DOMINIO OUT LAVORO — corpo di bk_archive (in una subshell: BK_ERR non
+# risale, quindi passa dal file LAVORO/err).
 _bk_archive_in() {
-  local d="$1" out="$2" w="$3" info slug root rc=0 type login hasdb www
+  local d="$1" out="$2" w="$3" info slug root rc=0 type login hasdb www first
   info="$(fm_site_check "$d" 2>&1)" || {
     printf '%s\n' "$info" >"$w/err"
     return 1
@@ -150,13 +183,22 @@ _bk_archive_in() {
   # restano link. Uscita 1 di tar = un file è cambiato mentre lo leggeva: va bene.
   if [[ -d "$root/public" ]]; then
     fm_as_site "$slug" "$root" env LC_ALL=C.UTF-8 tar --warning=no-file-changed -cf - public \
-      >"$w/files.tar" 2>>"$VPS_LOG" || rc=$?
+      >"$w/files.tar" 2>"$w/tar.err" || rc=$?
+    _bk_log_file "$w/tar.err" "tar di $d"
     if ((rc > 1)); then
       echo "lettura dei file del sito non riuscita (tar $rc)" >"$w/err"
       return 1
     fi
+    # Un cambio di utente fallito (runuser, cd) esce con 1 come "file cambiato" ma non
+    # lascia nulla: senza questo controllo l'archivio avrebbe solo wp-config.php.
+    tar -tf "$w/files.tar" >"$w/first.lst" 2>/dev/null || true
+    first="$(head -n1 "$w/first.lst")"
+    if [[ ! -s "$w/files.tar" || ( "$first" != public && "$first" != public/ ) ]]; then
+      echo "lettura di public/ come utente del sito non riuscita (archivio vuoto)" >"$w/err"
+      return 1
+    fi
   else
-    # tar vuoto valido: la fine-archivio sono due blocchi da 512 byte di zeri
+    # tar vuoto valido: la fine-archivio sono blocchi da 512 byte di zeri
     head -c 10240 /dev/zero >"$w/files.tar"
   fi
 
@@ -167,7 +209,8 @@ _bk_archive_in() {
     return 1
   fi
   if [[ -f "$root/wp-config.php" ]]; then
-    LC_ALL=C.UTF-8 tar --append --file="$w/files.tar" -C "$root" wp-config.php 2>>"$VPS_LOG" || {
+    LC_ALL=C.UTF-8 tar --append --file="$w/files.tar" -C "$root" wp-config.php 2>"$w/tar2.err" || {
+      _bk_log_file "$w/tar2.err" "wp-config.php di $d"
       echo "wp-config.php non aggiunto all'archivio" >"$w/err"
       return 1
     }
@@ -180,7 +223,8 @@ _bk_archive_in() {
   local dbsha=""
   if [[ "$hasdb" == true ]]; then
     # dump su file, poi gzip: se il dump fallisce lo si sa dal suo codice di uscita
-    mariadb-dump --single-transaction "$slug" >"$w/db.sql" 2>>"$VPS_LOG" || {
+    mariadb-dump --single-transaction --routines --events "$slug" >"$w/db.sql" 2>"$w/dump.err" || {
+      _bk_log_file "$w/dump.err" "dump di $d"
       echo "dump del database non riuscito" >"$w/err"
       return 1
     }
@@ -209,7 +253,8 @@ _bk_archive_in() {
     echo "archivio finale non scritto" >"$w/err"
     return 1
   }
-  mv -f "$w/out.tar.gz" "$out" || {
+  # prima accanto a OUT, poi rename: OUT non è mai a metà, nemmeno su un altro disco
+  { mv -f "$w/out.tar.gz" "$out.part" && mv -f "$out.part" "$out"; } || {
     echo "archivio non spostato in $out" >"$w/err"
     return 1
   }
@@ -217,75 +262,119 @@ _bk_archive_in() {
 
 # --- verifica ---------------------------------------------------------------
 
-# bk_verify_names LISTA — LISTA è l'output di `tar -P --numeric-owner -tvzf` (-P: senza, tar toglie la "/" iniziale e il nome assoluto non si vede) di
-# files.tar.gz. Stampa il primo problema trovato (e restituisce 1): nome assoluto,
-# segmento "..", dispositivi, link assoluto o che esce dalla cartella del sito
-# (normalizzato a partire dalla cartella del link), hardlink fuori dall'archivio.
-# Il nome di un link e la sua destinazione sono separati da " -> ": se un nome ne
-# contiene uno la divisione è ambigua, quindi si provano entrambe le divisioni.
+# bk_verify_names LISTA RADICE — LISTA è l'output di
+#   tar -P --numeric-owner --quoting-style=c -tvzf files.tar.gz
+# (-P: senza, tar toglie la "/" iniziale e il nome assoluto non si vede). Con lo stile
+# "c" nome e destinazione di un link sono ciascuno tra virgolette e con gli escape: non
+# si divide mai il testo a occhio, quindi un " -> " dentro un nome o uno spazio
+# nel nome non spostano nulla. Ogni riga deve avere esattamente la forma
+#   TIPO+PERMESSI PROPRIETARIO PESO AAAA-MM-GG HH:MM "nome" [-> "dest" | link to "dest"]
+# altrimenti si rifiuta tutto (fail closed). Tipi ammessi: - d l h.
+# RADICE è la cartella del sito (es. /var/www/dominio): un link assoluto è ammesso solo
+# se punta lì dentro. Stampa il primo problema e restituisce 1.
 bk_verify_names() {
-  LC_ALL=C awk '
-    function bad_name(n,   a, i, c) {
-      if (n ~ /^\//) return 1
-      c = split(n, a, "/")
-      for (i = 1; i <= c; i++) if (a[i] == "..") return 1
-      return 0
+  LC_ALL=C awk -v root="$2" '
+    function unq(s, start,   i, c, o, v, k, ch) {
+      # s[start] è la prima lettera dopo la virgoletta; legge fino alla chiusura
+      o = ""; i = start; QEND = 0
+      while (i <= length(s)) {
+        c = substr(s, i, 1)
+        if (c == "\"") { QEND = i; return o }
+        if (c == "\\") {
+          i++; c = substr(s, i, 1)
+          if (c == "\\" || c == "\"") o = o c
+          else if (c ~ /[0-7]/) {
+            v = 0; k = 0
+            while (k < 3 && substr(s, i, 1) ~ /[0-7]/) { v = v * 8 + substr(s, i, 1); i++; k++ }
+            i--
+            o = o (v == 0 ? "?" : sprintf("%c", v))
+          } else o = o "?"
+        } else o = o c
+        i++
+      }
+      return o
     }
-    # profondità della cartella che contiene il nome
-    function depth_of(n,   a, i, c, dpt) {
-      c = split(n, a, "/"); dpt = 0
-      for (i = 1; i < c; i++) if (a[i] != "" && a[i] != ".") dpt++
-      return dpt
+    function norm(n,   a, c, i, r) {
+      c = split(n, a, "/"); r = ""
+      for (i = 1; i <= c; i++) { if (a[i] == "" || a[i] == ".") continue; r = (r == "" ? a[i] : r "/" a[i]) }
+      return r
     }
-    # 1 se il percorso relativo T, partendo da profondità DPT, esce dalla radice
-    function escapes(t, dpt,   a, i, c) {
-      if (t ~ /^\//) return 1
+    # percorso T partendo dalla cartella START (già normalizzata); "" se resta dentro
+    function walk(start, t,   a, c, i, d, st, j, cur) {
+      d = 0
+      if (start != "") d = split(start, st, "/")
       c = split(t, a, "/")
       for (i = 1; i <= c; i++) {
         if (a[i] == "" || a[i] == ".") continue
-        if (a[i] == "..") { dpt--; if (dpt < 0) return 1 }
-        else dpt++
+        if (d > 0) {
+          cur = st[1]; for (j = 2; j <= d; j++) cur = cur "/" st[j]
+          if (cur in sym) return "attraversa un altro collegamento"
+        }
+        if (a[i] == "..") { if (d == 0) return "esce dalla cartella del sito"; d-- }
+        else { d++; st[d] = a[i] }
       }
-      return 0
+      return ""
+    }
+    function fail(m) { print m; bad = 1; exit 1 }
+    BEGIN {
+      perm = ""; for (i = 0; i < 9; i++) perm = perm "[rwxsStT-]"
+      re = "^.(" perm ") [0-9]+/[0-9]+ +[0-9]+ [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9] \""
+      n = 0
     }
     {
       line = $0
+      if (!match(line, re)) fail("riga non riconosciuta: " line)
       t = substr(line, 1, 1)
-      if (!match(line, /^[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ /)) { print "voce non leggibile: " line; exit 1 }
-      rest = substr(line, RLENGTH + 1)
-      if (t == "c" || t == "b" || t == "p") { print "voce speciale: " rest; exit 1 }
-      if (t == "l") {
-        sep = " -> "
-        first = index(rest, sep)
-        if (first == 0) { print "collegamento senza destinazione: " rest; exit 1 }
-        # ultima occorrenza
-        last = 0; s = rest
-        while ((p = index(s, sep)) > 0) { last += p + length(sep) - 1; s = substr(rest, last + 1) }
-        last = last - length(sep) + 1
-        n1 = substr(rest, 1, first - 1); t1 = substr(rest, first + length(sep))
-        n2 = substr(rest, 1, last - 1);  t2 = substr(rest, last + length(sep))
-        if (bad_name(n1) || bad_name(n2)) { print "nome non valido: " rest; exit 1 }
-        if (escapes(t1, depth_of(n1)) || escapes(t2, depth_of(n2))) { print "collegamento fuori dal sito: " rest; exit 1 }
-      } else if (t == "h") {
-        sep = " link to "
-        first = index(rest, sep)
-        if (first == 0) { print "hardlink senza destinazione: " rest; exit 1 }
-        last = 0; s = rest
-        while ((p = index(s, sep)) > 0) { last += p + length(sep) - 1; s = substr(rest, last + 1) }
-        last = last - length(sep) + 1
-        n1 = substr(rest, 1, first - 1); t1 = substr(rest, first + length(sep))
-        n2 = substr(rest, 1, last - 1);  t2 = substr(rest, last + length(sep))
-        if (bad_name(n1) || bad_name(n2) || escapes(t1, 0) || escapes(t2, 0)) { print "hardlink non valido: " rest; exit 1 }
-      } else {
-        if (bad_name(rest)) { print "nome non valido: " rest; exit 1 }
+      if (t != "-" && t != "d" && t != "l" && t != "h") fail("tipo di voce non ammesso: " line)
+      nm = unq(line, RLENGTH + 1)
+      if (!QEND) fail("riga non chiusa: " line)
+      rest = substr(line, QEND + 1)
+      tg = ""
+      if (t == "l" || t == "h") {
+        pre = (t == "l") ? " -> \"" : " link to \""
+        if (substr(rest, 1, length(pre)) != pre) fail("destinazione mancante: " line)
+        tg = unq(rest, length(pre) + 1)
+        if (!QEND || QEND != length(rest)) fail("destinazione non valida: " line)
+      } else if (rest != "") fail("riga con testo in più: " line)
+      n++; ty[n] = t; na[n] = nm; ta[n] = tg
+      if (t == "l") sym[norm(nm)] = 1
+    }
+    END {
+      if (bad) exit 1
+      for (k = 1; k <= n; k++) {
+        nm = na[k]; t = ty[k]; tg = ta[k]
+        if (nm ~ /^\//) fail("nome assoluto: " nm)
+        c = split(nm, a, "/")
+        for (i = 1; i <= c; i++) if (a[i] == "..") fail("nome con \"..\": " nm)
+        nn = norm(nm); pre = ""; c = split(nn, a, "/")
+        for (i = 1; i < c; i++) {
+          pre = (pre == "" ? a[i] : pre "/" a[i])
+          if (pre in sym) fail("voce sotto un collegamento: " nm)
+        }
+        if (t == "l" || t == "h") {
+          if (tg == "") fail("destinazione vuota: " nm)
+          if (tg ~ /^\//) {
+            if (t == "h" || root == "") fail("destinazione assoluta: " nm " -> " tg)
+            if (tg == root) rel = ""
+            else if (index(tg, root "/") == 1) rel = substr(tg, length(root) + 2)
+            else fail("collegamento fuori dal sito: " nm " -> " tg)
+            m = walk("", rel)
+          } else if (t == "h") m = walk("", tg)
+          else {
+            dir = nn; if (dir ~ /\//) sub(/\/[^\/]*$/, "", dir); else dir = ""
+            m = walk(dir, tg)
+          }
+          if (m != "") fail("collegamento " m ": " nm " -> " tg)
+        }
       }
     }' "$1"
 }
 
 # bk_verify ARCHIVIO — 0 se l'archivio è integro e sicuro da estrarre: contiene solo
-# manifest.json, files.tar.gz e (opzionale) db.sql.gz come file regolari, i sha256 del
-# manifest tornano, e files.tar.gz non ha nomi assoluti, "..", né link che escono
-# dalla cartella del sito. Non estrae nulla nel sito. 1 con BK_ERR altrimenti.
+# manifest.json, files.tar.gz e (opzionale) db.sql.gz come file regolari senza doppioni,
+# i sha256 del manifest tornano, e files.tar.gz non ha nomi assoluti, "..", né link che
+# escono dalla cartella del sito (vedi bk_verify_names). Non estrae nulla nel sito.
+# 1 con BK_ERR altrimenti.
 bk_verify() {
   local a="${1-}" w rc=0
   BK_ERR=""
@@ -306,28 +395,38 @@ bk_verify() {
 }
 
 _bk_verify_in() {
-  local a="$1" w="$2" line t name have_db=0 want got
-  # 1. l'archivio esterno ha solo le tre voci previste, tutte file regolari
-  LC_ALL=C.UTF-8 tar -P --numeric-owner -tvzf "$a" >"$w/outer.lst" 2>/dev/null || {
+  local a="$1" w="$2" line t name have_db=0 want got dom
+  local -A seen=()
+  local re='^(.)[rwxsStT-]{9} [0-9]+/[0-9]+ +[0-9]+ [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} "([^"\\]*)"$'
+  # 1. l'archivio esterno ha solo le tre voci previste, una volta, file regolari
+  LC_ALL=C.UTF-8 tar -P --numeric-owner --quoting-style=c -tvzf "$a" >"$w/outer.lst" 2>/dev/null || {
     echo "archivio illeggibile" >"$w/err"
     return 1
   }
   while IFS= read -r line; do
-    t="${line:0:1}"
-    # nome dopo i cinque campi (permessi, proprietario, peso, data, ora)
-    name="$(printf '%s' "$line" | LC_ALL=C sed -E 's/^[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ //')"
+    if [[ ! "$line" =~ $re ]]; then
+      echo "voce non riconosciuta nell'archivio" >"$w/err"
+      return 1
+    fi
+    t="${BASH_REMATCH[1]}"
+    name="${BASH_REMATCH[2]}"
     if [[ "$t" != - ]]; then
       echo "voce non ammessa nell'archivio: $name" >"$w/err"
       return 1
     fi
     case "$name" in
-      manifest.json | files.tar.gz) ;;
-      db.sql.gz) have_db=1 ;;
+      manifest.json | files.tar.gz | db.sql.gz) ;;
       *)
         echo "voce non ammessa nell'archivio: $name" >"$w/err"
         return 1
         ;;
     esac
+    if [[ -n "${seen[$name]-}" ]]; then
+      echo "voce duplicata nell'archivio: $name" >"$w/err"
+      return 1
+    fi
+    seen[$name]=1
+    [[ "$name" == db.sql.gz ]] && have_db=1
   done <"$w/outer.lst"
   tar -xzf "$a" -C "$w" --no-same-owner --no-same-permissions manifest.json files.tar.gz 2>/dev/null || {
     echo "archivio incompleto: mancano manifest.json o files.tar.gz" >"$w/err"
@@ -339,21 +438,26 @@ _bk_verify_in() {
       return 1
     }
   fi
-  # 2. checksum
+  # 2. manifest e checksum
   jq -e . "$w/manifest.json" >/dev/null 2>&1 || {
     echo "manifest non valido" >"$w/err"
     return 1
   }
+  dom="$(jq -r '.domain // ""' "$w/manifest.json")"
+  if ! valid_domain "$dom"; then
+    echo "dominio del manifest non valido" >"$w/err"
+    return 1
+  fi
   want="$(jq -r '.sha256.files // ""' "$w/manifest.json")"
   got="$(sha256sum "$w/files.tar.gz" | cut -d' ' -f1)"
-  if [[ -z "$want" || "$want" != "$got" ]]; then
+  if [[ ! "$want" =~ ^[0-9a-f]{64}$ || "$want" != "$got" ]]; then
     echo "checksum di files.tar.gz non corrisponde" >"$w/err"
     return 1
   fi
   want="$(jq -r '.sha256.db // ""' "$w/manifest.json")"
   if ((have_db)); then
     got="$(sha256sum "$w/db.sql.gz" | cut -d' ' -f1)"
-    if [[ -z "$want" || "$want" != "$got" ]]; then
+    if [[ ! "$want" =~ ^[0-9a-f]{64}$ || "$want" != "$got" ]]; then
       echo "checksum di db.sql.gz non corrisponde" >"$w/err"
       return 1
     fi
@@ -362,10 +466,10 @@ _bk_verify_in() {
     return 1
   fi
   # 3. nomi e link di files.tar.gz
-  LC_ALL=C.UTF-8 tar -P --numeric-owner -tvzf "$w/files.tar.gz" >"$w/files.lst" 2>/dev/null || {
+  LC_ALL=C.UTF-8 tar -P --numeric-owner --quoting-style=c -tvzf "$w/files.tar.gz" >"$w/files.lst" 2>/dev/null || {
     echo "files.tar.gz illeggibile" >"$w/err"
     return 1
   }
-  bk_verify_names "$w/files.lst" >"$w/err" || return 1
+  bk_verify_names "$w/files.lst" "$(site_root "$dom")" >"$w/err" || return 1
   rm -f "$w/err"
 }

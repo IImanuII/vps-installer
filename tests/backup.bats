@@ -319,3 +319,185 @@ arc_from_files() {
   run bk_site_locked site_blog
   [ "$status" -eq 1 ]
 }
+
+# --- fix round 1 -------------------------------------------------------------
+
+# fl_arc DIR — impacchetta DIR/src (cartella con public/...) come files.tar.gz con manifest del dominio x.it.
+fl_arc() {
+  local w="$1"
+  tar -czf "$w/files.tar.gz" -C "$w/src" public
+  arc_from_files "$w" "$w/a.tar.gz"
+}
+
+@test "lock: usa un descrittore allocato (non 6-9) e non ne perde" {
+  local before after
+  before="$(ls /proc/$$/fd | wc -l)"
+  bk_site_lock site_blog
+  [ -n "$BK_SITE_LOCK_FD" ]
+  [ "$BK_SITE_LOCK_FD" -ge 10 ]
+  [ ! -e /proc/$$/fd/6 ]
+  run bk_site_locked site_blog
+  [ "$status" -eq 0 ]
+  bk_site_locked site_altro || true
+  after="$(ls /proc/$$/fd | wc -l)"
+  [ "$after" -eq $((before + 1)) ]
+  bk_site_unlock
+  after="$(ls /proc/$$/fd | wc -l)"
+  [ "$after" -eq "$before" ]
+}
+
+@test "lock: slug non valido rifiutato; file non apribile = occupato" {
+  run bk_site_lock '../x'
+  [ "$status" -ne 0 ]
+  run bk_site_lock ''
+  [ "$status" -ne 0 ]
+  run bk_site_locked 'a/b'
+  [ "$status" -ne 0 ]
+  ln -s "$BK_LOCK_DIR/vps-site.site_loop.lock" "$BK_LOCK_DIR/vps-site.site_loop.lock"
+  run bk_site_locked site_loop
+  [ "$status" -eq 0 ]
+}
+
+@test "bk_archive: utente del sito non raggiungibile (runuser 1) fallisce con messaggio" {
+  mk_site blog.miosito.it no
+  make_stub runuser-ko 'exit 1'
+  FM_RUNUSER=runuser-ko bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz" && false
+  [[ "$BK_ERR" == *public* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/out.tar.gz" ]
+  [ -z "$(ls -A "$BK_BACKUPS/tmp")" ]
+}
+
+@test "bk_archive: un OUT preesistente non si cancella se il giro fallisce" {
+  mk_site blog.miosito.it yes
+  echo vecchia >"$BATS_TEST_TMPDIR/out.tar.gz"
+  STUB_RC_mariadb_dump=2 bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz" && false
+  [ "$(cat "$BATS_TEST_TMPDIR/out.tar.gz")" = vecchia ]
+  [ ! -e "$BATS_TEST_TMPDIR/out.tar.gz.part" ]
+}
+
+@test "bk_archive: mariadb-dump con --routines --events" {
+  mk_site blog.miosito.it yes
+  make_stub mariadb-dump 'echo "mariadb-dump $*" >>"$CALLS"; echo "-- dump"'
+  bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz"
+  grep -q "mariadb-dump --single-transaction --routines --events site_blog_miosito_it" "$CALLS"
+}
+
+@test "bk_archive: stderr del tar del sito sanificato nel registro" {
+  mk_site blog.miosito.it no
+  # shellcheck disable=SC2016
+  make_stub runuser-ev 'printf "ev\033[31m\nFAKE-LINE\n" >&2; shift 3
+if [[ "$1" == env ]]; then shift; while [[ "$1" == -i || "$1" == *=* ]]; do shift; done; fi
+exec "$@"'
+  FM_RUNUSER=runuser-ev bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz"
+  ! grep -q $'\033' "$VPS_LOG"
+  ! grep -q '^FAKE-LINE' "$VPS_LOG"
+  grep -q 'ev' "$VPS_LOG"
+}
+
+@test "bk_archive: link a /etc/shadow resta un link e nessun file contiene il contenuto" {
+  mk_site blog.miosito.it no
+  printf 'SENTINELLA-SEGRETA\n' >"$BATS_TEST_TMPDIR/segreto"
+  ln -s "$BATS_TEST_TMPDIR/segreto" "$SITES_WWW/blog.miosito.it/public/l"
+  bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz"
+  local w="$BATS_TEST_TMPDIR/x"
+  mkdir -p "$w/files"
+  tar -xzf "$BATS_TEST_TMPDIR/out.tar.gz" -C "$w"
+  run tar -tvzf "$w/files.tar.gz"
+  [[ "$output" =~ (^|$'\n')l[rwx-]{9}.*public/l\ -\>\ "$BATS_TEST_TMPDIR"/segreto ]]
+  tar -xzf "$w/files.tar.gz" -C "$w/files" --no-same-owner
+  [ -L "$w/files/public/l" ]
+  ! grep -rq SENTINELLA-SEGRETA "$w/files" "$w/manifest.json"
+}
+
+@test "bk_verify: bypass della divisione centrale di ' -> ' (nome e destinazione)" {
+  local w="$BATS_TEST_TMPDIR/w"
+  mkdir -p "$w/src/public"
+  ln -s "$SITES_WWW/x.it/public/d -> e/../../../../../../etc/shadow" "$w/src/public/a -> b"
+  fl_arc "$w"
+  bk_verify "$w/a.tar.gz" && false
+  true
+}
+
+@test "bk_verify: link assoluto solo dentro la radice del sito (dominio del manifest)" {
+  local w="$BATS_TEST_TMPDIR/w"
+  mkdir -p "$w/src/public/d"
+  ln -s "$SITES_WWW/x.it/public/d" "$w/src/public/ok"
+  ln -s "$SITES_WWW/x.it/wp-config.php" "$w/src/public/ok2"
+  fl_arc "$w"
+  run bk_verify "$w/a.tar.gz"
+  [ "$status" -eq 0 ]
+  local t
+  for t in "$SITES_WWW/altro.it/public" "$SITES_WWW/x.it/../altro.it/public" "$SITES_WWW/x.it.evil/public" /etc/shadow "$SITES_WWW/x.it/public/../../altro.it"; do
+    rm -rf "$w/src"
+    mkdir -p "$w/src/public"
+    ln -s "$t" "$w/src/public/l"
+    fl_arc "$w"
+    bk_verify "$w/a.tar.gz" && { echo "accettato: $t"; false; }
+  done
+  true
+}
+
+@test "bk_verify: link a catena (up -> .. e up2 -> up/..) rifiutati" {
+  local w="$BATS_TEST_TMPDIR/w"
+  mkdir -p "$w/src/public"
+  ln -s .. "$w/src/public/up"
+  ln -s up/.. "$w/src/public/up2"
+  fl_arc "$w"
+  bk_verify "$w/a.tar.gz" && false
+  # un nome sotto un link dell'archivio
+  rm -rf "$w/src"
+  mkdir -p "$w/src/public"
+  ln -s . "$w/src/public/self"
+  echo x >"$w/src/zz"
+  tar -czf "$w/files.tar.gz" -C "$w/src" public zz --transform='s,^zz$,public/self/zz,'
+  arc_from_files "$w" "$w/a.tar.gz"
+  bk_verify "$w/a.tar.gz" && false
+  true
+}
+
+@test "bk_verify: solo file, cartelle, link e hardlink (fifo rifiutato)" {
+  local w="$BATS_TEST_TMPDIR/w"
+  mkdir -p "$w/src/public"
+  mkfifo "$w/src/public/ff"
+  fl_arc "$w"
+  bk_verify "$w/a.tar.gz" && false
+  true
+}
+
+@test "bk_verify: nome del manifest che non è un dominio, sha256 non esadecimale" {
+  local w="$BATS_TEST_TMPDIR/w"
+  mkdir -p "$w/src/public"
+  echo x >"$w/src/public/f"
+  tar -czf "$w/files.tar.gz" -C "$w/src" public
+  jq -n '{domain:"x.it", sha256:{files:"ZZ", db:null}}' >"$w/manifest.json"
+  tar -czf "$w/a.tar.gz" -C "$w" manifest.json files.tar.gz
+  bk_verify "$w/a.tar.gz" && false
+  arc_from_files "$w" "$w/b.tar.gz"
+  jq '.domain = "../x"' "$w/manifest.json" >"$w/m2" && mv "$w/m2" "$w/manifest.json"
+  tar -czf "$w/c.tar.gz" -C "$w" manifest.json files.tar.gz
+  bk_verify "$w/c.tar.gz" && false
+  run bk_verify "$w/b.tar.gz"
+  [ "$status" -eq 0 ]
+}
+
+@test "bk_verify: nomi duplicati nell'archivio esterno" {
+  local w="$BATS_TEST_TMPDIR/w"
+  mkdir -p "$w/src/public"
+  echo x >"$w/src/public/f"
+  fl_arc "$w"
+  tar -czf "$w/dup.tar.gz" --hard-dereference -C "$w" manifest.json files.tar.gz manifest.json
+  bk_verify "$w/dup.tar.gz" && false
+  [[ "$BK_ERR" == *duplicat* ]]
+}
+
+@test "bk_keep_plan: la data è l'ultima occorrenza nel nome" {
+  run bk_keep_plan x-20990101-0000-20261001-0400.tgz x-20261002-0400.tgz x-20261003-0400.tgz x-20261004-0400.tgz
+  [ "$output" = x-20990101-0000-20261001-0400.tgz ]
+}
+
+@test "bk_space_ok: BYTES enorme o oltre 2^50 rifiutato senza overflow" {
+  run bk_space_ok "$BATS_TEST_TMPDIR" 1125899906842625
+  [ "$status" -eq 1 ]
+  run bk_space_ok "$BATS_TEST_TMPDIR" 99999999999999999999999
+  [ "$status" -eq 1 ]
+}
