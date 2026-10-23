@@ -568,7 +568,7 @@ bk_status_json() {
 # lasciati. Va chiamata senza $(...): le variabili andrebbero perse nella subshell.
 bk_connect() {
   local -a righe cmd
-  local tok id sec folder tmp prev="" out rc=0 conf at rt
+  local tok id sec folder tmp prev="" out rc=0 conf dir at rt
   mapfile -t righe < <(printf '%s' "$1")
   tok="${righe[0]:-}"
   id="${righe[1]:-}"
@@ -596,21 +596,38 @@ bk_connect() {
     | with_entries(select(.value != null))' <<<"$tok")"
   folder="$(jq -r .folder <<<"$(bk_config_json)")"
 
-  install -d -m 700 "$(dirname "$BK_RCLONE_CONF")"
   conf="$BK_RCLONE_CONF"
+  dir="$(dirname "$conf")"
+  # Questa funzione gira sotto `|| json_err`: errexit e trap ERR sono spenti, quindi
+  # ogni operazione sui file è controllata a mano e il file attuale non si tocca
+  # finché la copia di sicurezza e il nuovo file non sono pronti.
+  install -d -m 700 "$dir" || { BK_ERR="cartella dei segreti non disponibile"; return 1; }
+  # Avanzi di un collegamento interrotto (processo ucciso a metà).
+  rm -f "$dir"/.rclone-prev.* "$dir"/.rclone-new.*
   if [[ -f "$conf" ]]; then
-    prev="$(umask 077; mktemp "$(dirname "$conf")/.rclone-prev.XXXXXX")"
-    cp -p "$conf" "$prev"
+    prev="$(umask 077; mktemp "$dir/.rclone-prev.XXXXXX")" || prev=""
+    if [[ -z "$prev" ]] || ! cp -p "$conf" "$prev" || ! cmp -s "$conf" "$prev"; then
+      [[ -z "$prev" ]] || rm -f "$prev"
+      BK_ERR="copia di sicurezza del collegamento attuale non riuscita: nulla è cambiato"
+      return 1
+    fi
   fi
-  tmp="$(umask 077; mktemp "$(dirname "$conf")/.rclone-new.XXXXXX")"
-  {
+  tmp="$(umask 077; mktemp "$dir/.rclone-new.XXXXXX")" || tmp=""
+  if [[ -z "$tmp" ]]; then
+    [[ -z "$prev" ]] || rm -f "$prev"
+    BK_ERR="file del collegamento non creato: nulla è cambiato"
+    return 1
+  fi
+  if ! {
     printf '[gdrive]\ntype = drive\nscope = drive.file\n'
     if [[ -n "$id" ]]; then printf 'client_id = %s\nclient_secret = %s\n' "$id" "$sec"; fi
     printf 'token = %s\n' "$tok"
-  } >"$tmp"
-  chmod 600 "$tmp"
-  own root:root "$tmp"
-  mv -f "$tmp" "$conf"
+  } >"$tmp" || ! chmod 600 "$tmp" || ! own root:root "$tmp" || ! mv -f "$tmp" "$conf"; then
+    rm -f "$tmp"
+    [[ -z "$prev" ]] || rm -f "$prev"
+    BK_ERR="file del collegamento non scritto: nulla è cambiato"
+    return 1
+  fi
 
   read -ra cmd <<<"$BK_RCLONE"
   out="$("${cmd[@]}" mkdir "gdrive:$folder" 2>&1 </dev/null)" || rc=$?
@@ -622,12 +639,16 @@ bk_connect() {
   fi
   if ((rc != 0)); then
     # Il collegamento non è valido: torna il file di prima, o nessun file.
-    if [[ -n "$prev" ]]; then mv -f "$prev" "$conf"; else rm -f "$conf"; fi
+    if [[ -n "$prev" ]]; then
+      mv -f "$prev" "$conf" || rm -f "$prev"
+    else
+      rm -f "$conf"
+    fi
     BK_ERR="Google Drive non ha accettato il collegamento: $(bk_clean_msg "$out" "$tok" "$at" "$rt" "$sec")"
     log "vps-backup: collegamento non riuscito ($BK_ERR)"
     return 1
   fi
-  if [[ -n "$prev" ]]; then rm -f "$prev"; fi
+  [[ -z "$prev" ]] || rm -f "$prev"
   BK_FOLDER="$folder"
 }
 

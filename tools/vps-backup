@@ -24,8 +24,10 @@ if [[ -n "${SUDO_USER:-}" || -n "${VPS_BACKUP_VIA_SYSTEMD:-}" ]]; then
   VPS_LIB=$VPS_OPT/lib
   VPS_TEMPLATES=$VPS_OPT/templates
   VPS_LOG=/var/log/vps-tools.log
-  unset BK_DIR BK_BACKUPS BK_LOCK_DIR BK_CONFIG BK_STATE BK_RCLONE BK_RCLONE_CONF BK_TIME_DEFAULT \
-    SYSTEMD_DIR SITES_DIR SITES_WWW SITES_BACKUPS FM_RUNUSER
+  # RCLONE_*: rclone legge RCLONE_CONFIG e simili dall'ambiente; VPS_NO_CHOWN
+  # spegnerebbe i chown dei file scritti da root.
+  unset VPS_NO_CHOWN "${!RCLONE_@}" BK_DIR BK_BACKUPS BK_LOCK_DIR BK_CONFIG BK_STATE BK_RCLONE \
+    BK_RCLONE_CONF BK_TIME_DEFAULT BK_ERR BK_FOLDER BK_CONFIG_NEW SYSTEMD_DIR SITES_DIR SITES_WWW SITES_BACKUPS FM_RUNUSER
   [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
   chmod 640 "$VPS_LOG"
 fi
@@ -81,10 +83,24 @@ case "${1:-}" in
       json_err "Google Drive non collegato: collegalo prima di attivare il backup"
     fi
     install -d -m 700 "$BK_DIR"
-    printf '%s\n' "$nuova" | write_file "$BK_CONFIG" 600 root:root
     ora="$(jq -r '.time' <<<"$nuova")"
+    dropin="$SYSTEMD_DIR/vps-backup.timer.d/ora.conf"
     install -d -m 755 "$SYSTEMD_DIR/vps-backup.timer.d"
-    printf '[Timer]\nOnCalendar=\nOnCalendar=*-*-* %s:00\n' "$ora" | write_file "$SYSTEMD_DIR/vps-backup.timer.d/ora.conf" 644 root:root
+    # Prima il drop-in, poi config.json: se il secondo non si scrive, il drop-in
+    # torna com'era e l'orario in vigore resta quello di prima.
+    vecchio_dropin=""
+    if [[ -f "$dropin" ]]; then vecchio_dropin="$(cat "$dropin")"; fi
+    if ! printf '[Timer]\nOnCalendar=\nOnCalendar=*-*-* %s:00\n' "$ora" | write_file "$dropin" 644 root:root; then
+      json_err "orario del timer non scritto (dettagli in $VPS_LOG)"
+    fi
+    if ! printf '%s\n' "$nuova" | write_file "$BK_CONFIG" 600 root:root; then
+      if [[ -n "$vecchio_dropin" ]]; then
+        printf '%s\n' "$vecchio_dropin" | write_file "$dropin" 644 root:root || true
+      else
+        rm -f "$dropin"
+      fi
+      json_err "configurazione non salvata (dettagli in $VPS_LOG)"
+    fi
     if ! systemctl daemon-reload >>"$VPS_LOG" 2>&1; then
       _salvata_ma "configurazione salvata, ma systemd non l'ha ricaricata (dettagli in $VPS_LOG)"
     fi

@@ -1,3 +1,5 @@
+bats_require_minimum_version 1.5.0
+
 setup() {
   load test_helper
   # Cartelle di vps-monitor nel tmp del test (calcolate al caricamento delle librerie).
@@ -132,7 +134,7 @@ sys_setup() {
   jq -n '{panel:null, cloudflare:{enabled:false}, components:{redis:false}}' >"$VPS_OPT/manifest.json"
   opt_system_files
   grep -qx wpcli "$BATS_TEST_TMPDIR/sys.calls"
-  ! grep -qx acl "$BATS_TEST_TMPDIR/sys.calls"
+  run ! grep -qx acl "$BATS_TEST_TMPDIR/sys.calls"
 }
 
 @test "opt_system_files: WP-CLI non installato non ferma il resto" {
@@ -162,7 +164,7 @@ sys_setup() {
   [ "$(stat -c %a "$MON_DIR")" = 700 ]
   [ "$(stat -c %a "$MON_STATE_DIR")" = 700 ]
   grep -qxF 'daemon-reload' "$BATS_TEST_TMPDIR/systemctl.calls"
-  ! grep -q 'enable' "$BATS_TEST_TMPDIR/systemctl.calls"
+  run ! grep -q 'enable' "$BATS_TEST_TMPDIR/systemctl.calls"
 }
 
 @test "opt_system_files: configurazione già attiva (aggiornamento) = timer abilitato" {
@@ -272,7 +274,7 @@ sys_setup() {
   for d in panel sites restore tmp; do [ "$(stat -c %a "$BK_BACKUPS/$d")" = 700 ]; done
   [ "$(stat -c %a "$BK_CONFIG")" = 600 ]
   jq -e '.enabled == false and .time == "04:00" and (.folder | startswith("Plancia-"))' "$BK_CONFIG"
-  ! grep -q 'enable' "$BATS_TEST_TMPDIR/systemctl.calls"
+  run ! grep -q 'enable' "$BATS_TEST_TMPDIR/systemctl.calls"
 }
 
 @test "opt_system_files: la configurazione di backup esistente non si tocca; se attiva il timer si riabilita" {

@@ -389,8 +389,8 @@ fl_arc() {
 if [[ "$1" == env ]]; then shift; while [[ "$1" == -i || "$1" == *=* ]]; do shift; done; fi
 exec "$@"'
   FM_RUNUSER=runuser-ev bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz"
-  ! grep -q $'\033' "$VPS_LOG"
-  ! grep -q '^FAKE-LINE' "$VPS_LOG"
+  run ! grep -q $'\033' "$VPS_LOG"
+  run ! grep -q '^FAKE-LINE' "$VPS_LOG"
   grep -q 'ev' "$VPS_LOG"
 }
 
@@ -406,7 +406,7 @@ exec "$@"'
   [[ "$output" =~ (^|$'\n')l[rwx-]{9}.*public/l\ -\>\ "$BATS_TEST_TMPDIR"/segreto ]]
   tar -xzf "$w/files.tar.gz" -C "$w/files" --no-same-owner
   [ -L "$w/files/public/l" ]
-  ! grep -rq SENTINELLA-SEGRETA "$w/files" "$w/manifest.json"
+  run ! grep -rq SENTINELLA-SEGRETA "$w/files" "$w/manifest.json"
 }
 
 @test "bk_verify: bypass della divisione centrale di ' -> ' (nome e destinazione)" {
@@ -551,7 +551,7 @@ bk_tool() {
   grep -qxF 'type = drive' "$c"
   grep -qxF 'scope = drive.file' "$c"
   grep -q '^token = {.*"refresh_token":"1//SEGRETO-RINNOVO"' "$c"
-  ! grep -q client_id "$c"
+  run ! grep -q client_id "$c"
   grep -q -- "--config $c mkdir gdrive:Plancia-" "$BATS_TEST_TMPDIR/rclone.calls"
   grep -q 'rcat gdrive:Plancia-.*/.plancia-test' "$BATS_TEST_TMPDIR/rclone.calls"
   grep -q 'deletefile gdrive:Plancia-.*/.plancia-test' "$BATS_TEST_TMPDIR/rclone.calls"
@@ -563,9 +563,9 @@ bk_tool() {
   bk_tool_env
   bk_tool connect <<<"$TOKEN_OK"
   [ "$status" -eq 0 ]
-  ! grep -q 'SEGRETO' <<<"$output$stderr"
-  ! grep -q 'SEGRETO' "$VPS_LOG"
-  ! grep -q 'SEGRETO' "$BATS_TEST_TMPDIR/rclone.calls"
+  run ! grep -q 'SEGRETO' <<<"$output$stderr"
+  run ! grep -q 'SEGRETO' "$VPS_LOG"
+  run ! grep -q 'SEGRETO' "$BATS_TEST_TMPDIR/rclone.calls"
 }
 
 @test "vps-backup connect: client id e secret propri finiscono nel file" {
@@ -575,7 +575,7 @@ bk_tool() {
   c="$VPS_OPT/secrets/rclone.conf"
   grep -qxF 'client_id = mio-id.apps.googleusercontent.com' "$c"
   grep -qxF 'client_secret = GOCSPX-abc_DEF-123' "$c"
-  ! grep -q 'GOCSPX' <<<"$output$stderr"
+  run ! grep -q 'GOCSPX' <<<"$output$stderr"
 }
 
 @test "vps-backup connect: client id senza secret, o con caratteri strani, è rifiutato" {
@@ -605,8 +605,8 @@ bk_tool() {
   bk_tool connect <<<"$TOKEN_OK"
   [ "$status" -ne 0 ]
   jq -e '.ok == false and (.error | test("Invalid token"))' <<<"$output"
-  ! grep -q 'SEGRETO' <<<"$output$stderr"
-  ! grep -q 'SEGRETO' "$VPS_LOG"
+  run ! grep -q 'SEGRETO' <<<"$output$stderr"
+  run ! grep -q 'SEGRETO' "$VPS_LOG"
   [ -z "$(ls -A "$VPS_OPT/secrets" | grep rclone || true)" ]
 }
 
@@ -784,4 +784,70 @@ J
   grep -qxF 'OnCalendar=*-*-* 04:00:00' "$REPO_ROOT/templates/vps-backup.timer"
   grep -qxF 'Persistent=true' "$REPO_ROOT/templates/vps-backup.timer"
   grep -qxF 'WantedBy=timers.target' "$REPO_ROOT/templates/vps-backup.timer"
+}
+
+# --- fix round 1 -------------------------------------------------------------
+
+@test "vps-backup connect: mktemp che fallisce = errore, rclone.conf di prima intatto" {
+  bk_tool_env
+  echo vecchio >"$VPS_OPT/secrets/rclone.conf"
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  printf '#!/usr/bin/env bash\ncase "$1" in "%s"/*) exit 1;; esac\nexec /usr/bin/mktemp "$@"\n' "$VPS_OPT/secrets" >"$BATS_TEST_TMPDIR/bin/mktemp"
+  chmod +x "$BATS_TEST_TMPDIR/bin/mktemp"
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | test("nulla è cambiato"))' <<<"$output"
+  [ "$(cat "$VPS_OPT/secrets/rclone.conf")" = vecchio ]
+  [ ! -e "$BATS_TEST_TMPDIR/rclone.calls" ]
+}
+
+@test "vps-backup connect: copia di sicurezza che fallisce = rifiuto prima di toccare il file attuale" {
+  bk_tool_env
+  echo vecchio >"$VPS_OPT/secrets/rclone.conf"
+  make_stub cp 'exit 1'
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | test("nulla è cambiato"))' <<<"$output"
+  [ "$(cat "$VPS_OPT/secrets/rclone.conf")" = vecchio ]
+  [ -z "$(ls -A "$VPS_OPT/secrets" | grep -- '-prev\|-new' || true)" ]
+  [ ! -e "$BATS_TEST_TMPDIR/rclone.calls" ]
+}
+
+@test "vps-backup connect: copia di sicurezza vuota (cp che non copia) = rifiuto, mai ripristino di un file vuoto" {
+  bk_tool_env
+  echo vecchio >"$VPS_OPT/secrets/rclone.conf"
+  make_stub cp 'exit 0'
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -ne 0 ]
+  [ "$(cat "$VPS_OPT/secrets/rclone.conf")" = vecchio ]
+}
+
+@test "vps-backup connect: avanzi .rclone-prev/.rclone-new di un giro interrotto vengono tolti" {
+  bk_tool_env
+  echo a >"$VPS_OPT/secrets/.rclone-prev.AAAAAA"
+  echo b >"$VPS_OPT/secrets/.rclone-new.BBBBBB"
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -eq 0 ]
+  [ "$(ls -A "$VPS_OPT/secrets" | grep rclone)" = rclone.conf ]
+}
+
+@test "vps-backup config: config.json che non si scrive = errore e drop-in com'era" {
+  bk_tool_env
+  echo x >"$VPS_OPT/secrets/rclone.conf"
+  bk_tool config <<<'{"enabled":true,"time":"02:15","folder":"a"}'
+  [ "$status" -eq 0 ]
+  prima="$(cat "$SYSTEMD_DIR/vps-backup.timer.d/ora.conf")"
+  rm "$BK_CONFIG"
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  printf '#!/usr/bin/env bash\ncase "$1" in "%s"/*) exit 1;; esac\nexec /usr/bin/mktemp "$@"\n' "$BK_DIR" >"$BATS_TEST_TMPDIR/bin/mktemp"
+  chmod +x "$BATS_TEST_TMPDIR/bin/mktemp"
+  bk_tool config <<<'{"enabled":true,"time":"05:45","folder":"a"}'
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false' <<<"$output"
+  [ "$(cat "$SYSTEMD_DIR/vps-backup.timer.d/ora.conf")" = "$prima" ]
+  [ ! -e "$BK_CONFIG" ]
+}
+
+@test "vps-backup: sotto sudo l'ambiente di rclone e VPS_NO_CHOWN vengono tolti" {
+  grep -q 'unset VPS_NO_CHOWN "${!RCLONE_@}"' "$REPO_ROOT/tools/vps-backup"
 }
