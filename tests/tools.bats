@@ -1,3 +1,5 @@
+bats_require_minimum_version 1.5.0
+
 setup() {
   load test_helper
   setup_common
@@ -126,7 +128,7 @@ esac'
   [ "$(jq -r .purged <<<"$output")" = all ]
   grep -qF '/zones/zid1/purge_cache' "$BATS_TEST_TMPDIR/curl.args"
   grep -qF '{"purge_everything":true}' "$BATS_TEST_TMPDIR/curl.args"
-  ! grep -qF "$CF_TOK" "$BATS_TEST_TMPDIR/curl.args"
+  run ! grep -qF "$CF_TOK" "$BATS_TEST_TMPDIR/curl.args"
   ! grep -qF "$CF_TOK" "$VPS_LOG"
 }
 
@@ -230,7 +232,7 @@ _cf_sito() {
   run bash "$T/vps-cf-token" test
   [ "$status" -eq 0 ]
   [ "$(jq -r .zones <<<"$output")" = 3 ]
-  ! grep -qF "$tok" "$BATS_TEST_TMPDIR/curl.args"
+  run ! grep -qF "$tok" "$BATS_TEST_TMPDIR/curl.args"
   ! grep -qF "$tok" "$VPS_LOG"
 }
 

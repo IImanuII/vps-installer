@@ -1026,7 +1026,7 @@ nothing_written() {
   [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
   grep -q '^runuser -u site_blog_miosito_it' "$CALLS"
   grep -q 'files zip blog.miosito.it public/out.zip public/sito' "$VPS_LOG"
-  ! grep -aq SEGRETO-ALTRO-SITO "$R/public/out.zip"
+  run ! grep -aq SEGRETO-ALTRO-SITO "$R/public/out.zip"
   # esiste già -> conflitto, file intatto
   cp "$R/public/out.zip" "$BATS_TEST_TMPDIR/prima.zip"
   run vf zip blog.miosito.it public/out.zip -- public/sito
@@ -1068,7 +1068,7 @@ nothing_written() {
   [[ "$output" == *"sito/a.txt"* ]]
   [[ "$output" == *"sito/sub/-b"* ]]
   [[ "$output" == *"lrwx"*"sito/lnk"* ]]
-  ! grep -aq SEGRETO-ALTRO-SITO "$BATS_TEST_TMPDIR/dl.zip"
+  run ! grep -aq SEGRETO-ALTRO-SITO "$BATS_TEST_TMPDIR/dl.zip"
   grep -q '^runuser -u site_blog_miosito_it' "$CALLS"
   [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
   bash "$REPO_ROOT/tools/vps-files" download-zip blog.miosito.it public >"$BATS_TEST_TMPDIR/dl2.zip" 2>/dev/null

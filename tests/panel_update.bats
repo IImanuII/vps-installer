@@ -1,3 +1,5 @@
+bats_require_minimum_version 1.5.0
+
 setup() {
   load test_helper
   load panel_helper
@@ -186,6 +188,6 @@ tag_now() { git --git-dir="$PD_GIT_DIR" describe --tags --exact-match; }
   CURL_RC=22 run bash "$T" --ref v1.0.0
   [ "$status" -eq 1 ]
   [ "$(tag_now)" = v1.1.0 ]
-  ! grep -q 'DROP DATABASE' "$BATS_TEST_TMPDIR/mariadb.args"
+  run ! grep -q 'DROP DATABASE' "$BATS_TEST_TMPDIR/mariadb.args"
   [ "$(jq -r .panel.version "$VPS_OPT/manifest.json")" = 1.1.0 ]
 }

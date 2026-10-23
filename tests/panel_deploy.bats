@@ -1,3 +1,5 @@
+bats_require_minimum_version 1.5.0
+
 setup() {
   load test_helper
   load panel_helper
@@ -57,7 +59,7 @@ setup() {
 
 @test "pd_ver_gt" {
   pd_ver_gt 1.10.0 1.9.0
-  ! pd_ver_gt 1.9.0 1.10.0
+  run ! pd_ver_gt 1.9.0 1.10.0
   ! pd_ver_gt 1.0.0 1.0.0
 }
 
@@ -150,7 +152,7 @@ dev_release() {
 
 @test "pd_repo_ok: falso per cartella mancante e per link simbolico" {
   pd_load
-  ! pd_repo_ok
+  run ! pd_repo_ok
   pd_repo_init
   pd_repo_ok
   mv "$PD_GIT_DIR" "$BATS_TEST_TMPDIR/vera.git"
@@ -190,7 +192,7 @@ dev_release() {
   echo '-- manomesso' >"$P/install/schema.sql"
   pd_schema v1.0.0
   grep -qx -- '-- schema' "$BATS_TEST_TMPDIR/mariadb.sql"
-  ! grep -q manomesso "$BATS_TEST_TMPDIR/mariadb.sql"
+  run ! grep -q manomesso "$BATS_TEST_TMPDIR/mariadb.sql"
   grep -qx panel "$BATS_TEST_TMPDIR/mariadb.args"
 }
 
@@ -315,7 +317,7 @@ dev_release() {
 @test "pd_telegram_ok: il token non finisce negli argomenti di curl" {
   make_stub curl 'printf "%s\n" "$*" >"$BATS_TEST_TMPDIR/curl.argv"; cat >"$BATS_TEST_TMPDIR/curl.stdin"; echo "{\"ok\":true}"'
   PD_SKIP_TELEGRAM_CHECK=0 pd_telegram_ok "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-  ! grep -q AAAAAAAA "$BATS_TEST_TMPDIR/curl.argv"
+  run ! grep -q AAAAAAAA "$BATS_TEST_TMPDIR/curl.argv"
   grep -q 'bot123456:AAAAAAAA' "$BATS_TEST_TMPDIR/curl.stdin"
 }
 

@@ -1,3 +1,5 @@
+bats_require_minimum_version 1.5.0
+
 setup() {
   load test_helper
   setup_common
@@ -47,7 +49,7 @@ setup() {
 n=$(grep -c "systemctl restart" "$BATS_TEST_TMPDIR/calls"); [ "$n" -ge 2 ]'
   run redis_acl_setup
   [ "$status" -eq 1 ]
-  ! grep -q '^aclfile' "$REDIS_CONF"
+  run ! grep -q '^aclfile' "$REDIS_CONF"
   [ "$(cat "$REDIS_CONF")" = "port 6379" ]
   [ ! -e "$REDIS_ACL_FILE" ]
   [ "$(grep -c 'systemctl restart redis-server' "$BATS_TEST_TMPDIR/calls")" = 2 ]

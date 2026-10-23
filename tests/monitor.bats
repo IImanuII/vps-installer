@@ -257,7 +257,7 @@ with_telegram() { base_cfg >"$MON_CONFIG"; }
   curl_stub '{"ok":true,"result":{}}'
   run mon_send "ciao mondo"
   [ "$status" -eq 0 ]
-  ! grep -q "$TOK" "$BATS_TEST_TMPDIR/curl.args"
+  run ! grep -q "$TOK" "$BATS_TEST_TMPDIR/curl.args"
   grep -qxF "url = \"https://api.telegram.org/bot$TOK/sendMessage\"" "$BATS_TEST_TMPDIR/curl.stdin"
   grep -qxF -- '--data-urlencode' "$BATS_TEST_TMPDIR/curl.args"
   grep -qxF 'chat_id=-100123' "$BATS_TEST_TMPDIR/curl.args"
@@ -618,7 +618,7 @@ sent() {
   run bash -c "bash '$TOOL' status 2>/dev/null"
   jq -e '.checks | map(select(.id == "url:https://a.test/"))[0] | .kind == "url" and .state == "ok" and .code == 200 and .time_ms == 100' <<<"$output"
   jq -e '(.alerts | length) == 2 and (.last_run | test("^2026-10-16T"))' <<<"$output"
-  ! grep -qF "$TOK" "$T/curl.args"
+  run ! grep -qF "$TOK" "$T/curl.args"
   ! grep -qF "$TOK" "$VPS_LOG"
 }
 
@@ -846,7 +846,7 @@ sent() {
   touch "$T/down.nginx"
   MON_ROUND_S=0 run round "$N9"
   [ "$status" -eq 0 ]
-  ! grep -q '^restart' "$T/systemctl.calls"
+  run ! grep -q '^restart' "$T/systemctl.calls"
   jq -e '.cursor.periodic == null and .summary_day == null and .last_run != null' "$MON_STATE"
   jq -e 'has("checks") and (.checks | has("service:nginx") | not)' "$MON_STATE"
   [ -z "$(sent)" ]

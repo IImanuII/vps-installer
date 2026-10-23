@@ -1,3 +1,5 @@
+bats_require_minimum_version 1.5.0
+
 setup() {
   load test_helper
   export VPS_DEST="$BATS_TEST_TMPDIR/dest"
@@ -210,7 +212,7 @@ local_id() {
   [[ "$output" != *"answers.env"* ]]
   [[ "$output" != *"riprendere"* ]]
   [[ "$output" == *"--tools-only"* ]]
-  ! declare -f run_failed | sed -n '/if ((\$1))/,/else/p' | grep -q "read "
+  [ -z "$(declare -f run_failed | sed -n '/if (($1))/,/else/p' | grep "read " || true)" ]
   run run_failed 0 /root/install.sh </dev/null
   [[ "$output" == *"answers.env"* ]]
   [[ "$output" == *"riprendere"* ]]
