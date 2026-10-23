@@ -27,7 +27,7 @@ if [[ -n "${SUDO_USER:-}" || -n "${VPS_BACKUP_VIA_SYSTEMD:-}" ]]; then
   # RCLONE_*: rclone legge RCLONE_CONFIG e simili dall'ambiente; VPS_NO_CHOWN
   # spegnerebbe i chown dei file scritti da root.
   unset VPS_NO_CHOWN "${!RCLONE_@}" BK_DIR BK_BACKUPS BK_LOCK_DIR BK_CONFIG BK_STATE BK_RCLONE \
-    BK_RCLONE_CONF BK_TIME_DEFAULT BK_ERR BK_FOLDER BK_CONFIG_NEW SYSTEMD_DIR SITES_DIR SITES_WWW SITES_BACKUPS FM_RUNUSER
+    BK_RCLONE_CONF BK_TIME_DEFAULT BK_NOW BK_UNIT BK_PURGE_DAYS BK_RUN_DIR VPS_BACKUP_SELF BK_ERR BK_FOLDER BK_CONFIG_NEW SYSTEMD_DIR SITES_DIR SITES_WWW SITES_BACKUPS FM_RUNUSER
   [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
   chmod 640 "$VPS_LOG"
 fi
@@ -48,11 +48,33 @@ _salvata_ma() {
   exit 1
 }
 
+# _no_se_in_corso — connect, disconnect e config cambiano il collegamento che un giro
+# sta usando: si rifiutano finché il lock globale è preso (resta tenuto fino alla fine).
+_no_se_in_corso() {
+  bk_lock_global || json_err "backup in corso, riprova dopo"
+}
+
 case "${1:-}" in
   status)
     bk_status_json
     ;;
+  run)
+    # Il giro parte come unità systemd (fuori da sudo e da PHP-FPM); qui si controlla
+    # solo che non ce ne sia già uno.
+    [[ -f "$BK_RCLONE_CONF" ]] || json_err "Google Drive non collegato: collegalo prima di avviare un backup"
+    bk_lock_global || json_err "backup in corso"
+    bk_unlock_global
+    if ! systemd-run --unit vps-backup-run --collect --quiet --setenv=BK_UNIT=vps-backup-run       -p Nice=10 -p IOSchedulingClass=idle "${VPS_BACKUP_SELF:-/opt/vps/bin/vps-backup}" _run >>"$VPS_LOG" 2>&1; then
+      json_err "impossibile avviare il backup (dettagli in $VPS_LOG)"
+    fi
+    log "vps-backup: giro avviato a mano"
+    json_ok '{ok: true, started: true}'
+    ;;
+  _run)
+    bk_run_all
+    ;;
   connect)
+    _no_se_in_corso
     # Token + client id/secret facoltativi: poche righe, mai oltre 8 KiB.
     dati="$(read_stdin_limited 8193)"
     ((${#dati} <= 8192)) || json_err "dati troppo lunghi"
@@ -62,6 +84,7 @@ case "${1:-}" in
     json_ok --arg f "$folder" '{ok: true, folder: $f}'
     ;;
   disconnect)
+    _no_se_in_corso
     rm -f "$BK_RCLONE_CONF"
     # Senza collegamento un timer acceso fallirebbe ogni notte: si spegne e la
     # configurazione resta (orario e cartella) ma disattivata.
@@ -75,6 +98,7 @@ case "${1:-}" in
     json_ok
     ;;
   config)
+    _no_se_in_corso
     dati="$(read_stdin_limited 4097)"
     ((${#dati} <= 4096)) || json_err "configurazione troppo lunga"
     bk_config_apply "$dati" || json_err "$BK_ERR"
@@ -117,6 +141,6 @@ case "${1:-}" in
     json_ok
     ;;
   *)
-    json_err "uso: vps-backup status | connect (token da stdin) | disconnect | config (JSON da stdin)"
+    json_err "uso: vps-backup status | run | connect (token da stdin) | disconnect | config (JSON da stdin)"
     ;;
 esac
