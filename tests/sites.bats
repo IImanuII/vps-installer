@@ -5,6 +5,8 @@ setup() {
   load sites_helper
   setup_common
   sites_test_setup
+  export BK_BACKUPS="$BATS_TEST_TMPDIR/bk" BK_LOCK_DIR="$BATS_TEST_TMPDIR/locks"
+  mkdir -p "$BK_LOCK_DIR"
 }
 
 @test "site_slug: dominio corto e dominio lungo troncato con hash" {
@@ -398,10 +400,18 @@ nuovo() { # DOMINIO TIPO WWW DB [PASSWORD]
   [ ! -e "$SITES_WWW/blog.miosito.it" ]
   [ ! -e "$NGINX_CONF_D/blog.miosito.it.conf" ]
   [ ! -e "$PHP_POOL_D/site_blog_miosito_it.conf" ]
+  # archivio nel formato nuovo (lib/backup.sh): un solo file con manifest, file e dump
   tgz="$(ls "$SITES_BACKUPS"/blog.miosito.it-*.tar.gz)"
   [ "$(stat -c %a "$tgz")" = 600 ]
-  tar -tzf "$tgz" | grep -q 'blog.miosito.it/public/ciao.txt'
-  ls "$SITES_BACKUPS"/blog.miosito.it-*.sql.gz
+  [[ "$tgz" =~ blog\.miosito\.it-[0-9]{8}-[0-9]{6}\.tar\.gz$ ]]
+  [ "$(tar -tzf "$tgz" | head -n1)" = manifest.json ]
+  [ "$(bk_manifest "$tgz" | jq -r '"\(.domain) \(.type) \(.db)"')" = "blog.miosito.it php true" ]
+  tar -tzf "$tgz" | grep -qx db.sql.gz
+  mkdir "$BATS_TEST_TMPDIR/x"
+  tar -xzf "$tgz" -C "$BATS_TEST_TMPDIR/x"
+  tar -tzf "$BATS_TEST_TMPDIR/x/files.tar.gz" | grep -qx 'public/ciao.txt'
+  run ! ls "$SITES_BACKUPS"/blog.miosito.it-*.sql.gz
+  [ -z "$(ls -A "$BK_BACKUPS/tmp")" ]
   grep -q 'DROP DATABASE IF EXISTS `site_blog_miosito_it`' "$BATS_TEST_TMPDIR/mariadb.sql"
   grep -q '^DELETE .*/dns_records/rec1' "$BATS_TEST_TMPDIR/cf.log"
 }
@@ -495,10 +505,39 @@ nuovo() { # DOMINIO TIPO WWW DB [PASSWORD]
   nuovo blog.miosito.it static no no
   site_run create blog.miosito.it
   site_reg_update blog.miosito.it '.prev_state = .state | .state = "deleting"'
-  make_stub tar 'p=""; for a; do [ "$p" = -czf ] && echo x >"$a"; p=$a; done; exit 1'
+  # tar esce 1 solo quando legge public/ (come per un file cambiato nel frattempo)
+  make_stub tar 'tar_real=/usr/bin/tar; "$tar_real" "$@"; rc=$?; if [[ "$*" == *--warning=no-file-changed* && $rc -eq 0 ]]; then exit 1; fi; exit $rc'
   site_run delete blog.miosito.it
   run ! site_reg_exists blog.miosito.it
   [ ! -e "$SITES_WWW/blog.miosito.it" ]
+  [ -n "$(ls "$SITES_BACKUPS"/blog.miosito.it-*.tar.gz)" ]
+}
+
+@test "site_archive: disco quasi pieno, il sito non si cancella" {
+  nuovo blog.miosito.it static no no
+  site_run create blog.miosito.it
+  site_reg_update blog.miosito.it '.prev_state = .state | .state = "deleting"'
+  make_stub df 'printf "Filesystem 1-blocks Used Available Capacity Mounted
+/dev/x 1000 999 1000 99%% /
+"'
+  run site_run delete blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  [[ "$(site_reg_get blog.miosito.it .job.error)" == *"spazio insufficiente"*"niente è stato cancellato"* ]]
+  [ -d "$SITES_WWW/blog.miosito.it/public" ]
+}
+
+@test "site_run: un lavoro ignorato (stato che non è il suo) lascia libero il lock del sito" {
+  nuovo blog.miosito.it static no no
+  site_run create blog.miosito.it
+  # il sito è attivo: un delete fuori posto torna subito e non deve tenere il lock condiviso
+  run site_run delete blog.miosito.it
+  [ "$status" -eq 1 ]
+  site_run delete blog.miosito.it || true
+  run bk_site_locked site_blog_miosito_it
+  [ "$status" -eq 1 ]
+  # e un ripristino (lock esclusivo) può partire
+  flock -x -n "$BK_LOCK_DIR/vps-site.site_blog_miosito_it.lock" true
 }
 
 @test "site_refresh: eliminazione interrotta in remove va in errore, in archive torna com'era" {

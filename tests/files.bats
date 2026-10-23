@@ -1291,3 +1291,25 @@ zflag() {
   run vf write blog.miosito.it public/n.txt <<<"x"
   [ "$status" -eq 0 ]
 }
+
+@test "vps-files: un comando di scrittura tiene il lock condiviso del sito per tutta la sua durata" {
+  mk_fm_site
+  export BK_LOCK_DIR="$BATS_TEST_TMPDIR/locks"
+  mkdir -p "$BK_LOCK_DIR"
+  local lk="$BK_LOCK_DIR/vps-site.site_blog_miosito_it.lock" i held=no
+  # lo stdin arriva dopo 3 secondi: il comando è in corso (e ha già preso il lock) nel frattempo
+  { sleep 3; echo x; } | bash "$REPO_ROOT/tools/vps-files" write blog.miosito.it public/n.txt >/dev/null 2>&1 &
+  pid=$!
+  for i in {1..25}; do
+    if ! flock -x -n "$lk" true 2>/dev/null; then held=si; break; fi
+    sleep 0.1
+  done
+  [ "$held" = si ]
+  # un ripristino (lock esclusivo) è rifiutato finché il comando non finisce
+  run bk_site_lock site_blog_miosito_it
+  [ "$status" -eq 1 ]
+  wait "$pid"
+  pid=""
+  flock -x -n "$lk" true
+  [ -f "$R/public/n.txt" ]
+}

@@ -88,3 +88,35 @@ if [[ "$*" == *"plugin install"*redis-cache* ]]; then mkdir -p "$p/wp-content/pl
 if [[ "$*" == *"redis status"* ]]; then echo "Status: ${WP_REDIS_STATUS:-Connected}"; fi
 exit 0'
 }
+
+# fb_archive DOMINIO TIPO WWW(yes|no) DB(yes|no) [LOGIN] — archivia un sito finto in
+# $BK_BACKUPS/sites (formato nuovo) e poi lo fa sparire (registro e cartella): è il caso
+# di un sito eliminato. Lascia il nome della copia, come lo vuole list-local, in $FB_ARC.
+fb_archive() {
+  local d="$1" t="$2" www="$3" db="$4" login="${5:-}" root
+  root="$SITES_WWW/$d"
+  site_reg_new "$d" "$t" "$www" "$db"
+  site_reg_update "$d" '.state = "active"'
+  if [[ -n "$login" ]]; then
+    site_reg_update "$d" '.wordpress = {login_path: $l, admin_user: "gestore"}' --arg l "$login"
+  fi
+  mkdir -p "$root/public/wp-content" "$root/logs" "$root/tmp" "$BK_BACKUPS/sites"
+  echo "contenuto di $d" >"$root/public/index.php"
+  printf '<?php // wp-config vecchio\n' >"$root/wp-config.php"
+  FB_ARC="sites/$d-20261001-040000.tar.gz"
+  bk_archive "$d" "$BK_BACKUPS/$FB_ARC" || return 1
+  rm -f "$(site_reg_path "$d")"
+  rm -rf "$root"
+}
+
+# fb_backup_stub [RC] — finto vps-backup per VPS_BACKUP_SELF: annota gli argomenti in
+# $BATS_TEST_TMPDIR/fb.calls (e lo stato del sito in quel momento) ed esce con RC.
+fb_backup_stub() {
+  # shellcheck disable=SC2016
+  make_stub vps-backup-fb 'T="$BATS_TEST_TMPDIR"; echo "$*" >>"$T/fb.calls"
+state="$(jq -r .state "$SITES_DIR/$3.json" 2>/dev/null)"; echo "$state" >>"$T/fb.state"
+rc="${FB_STUB_RC:-0}"
+if [[ "$rc" == 0 ]]; then echo "{\"ok\":true,\"finished\":true,\"restore_ok\":true}"; else echo "{\"ok\":false,\"error\":\"${FB_STUB_ERR:-ripristino fallito}\"}"; fi
+exit "$rc"'
+  export VPS_BACKUP_SELF="$BATS_TEST_TMPDIR/bin/vps-backup-fb"
+}

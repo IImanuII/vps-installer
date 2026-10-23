@@ -906,6 +906,7 @@ case "$sub" in
       if [[ "$mode" == --dirs-only && -d "$f" ]]; then jq -nc --arg n "$(basename "$f")" "{Name:\$n,IsDir:true}"; fi
       if [[ "$mode" == --files-only && -f "$f" ]]; then jq -nc --arg n "$(basename "$f")" --argjson s "$(stat -c %s "$f")" "{Name:\$n,Size:\$s,IsDir:false}"; fi
     done | jq -s . ;;
+  cat) n=999999999; if [[ "$1" == --count ]]; then n="$2"; shift 2; fi; f="$(rem "$1")"; [[ -f "$f" ]] || { echo "object not found" >&2; exit 3; }; head -c "$n" "$f" ;;
   deletefile) rm -f "$(rem "${@: -1}")" ;;
   purge) rm -rf "$(rem "${@: -1}")" ;;
   cleanup) ;;
@@ -1476,7 +1477,8 @@ done
 [[ -z "${DUMP_EXTRA:-}" ]] || echo "$DUMP_EXTRA"
 exit 0'
   # shellcheck disable=SC2016
-  make_stub vps-cf-purge 'echo "vps-cf-purge $*" >>"$BATS_TEST_TMPDIR/cf.purge"; exit "${STUB_RC_cf_purge:-0}"'
+  make_stub vps-cf-purge 'n=0; for f in /proc/self/fd/*; do case "$(readlink "$f" 2>/dev/null)" in *vps-*.lock) n=$((n+1));; esac; done; echo $n >>"$BATS_TEST_TMPDIR/cf.lockfds"
+echo "vps-cf-purge $*" >>"$BATS_TEST_TMPDIR/cf.purge"; exit "${STUB_RC_cf_purge:-0}"'
   # redis-cli come in sites_helper, ma conta anche i lock ereditati
   # shellcheck disable=SC2016
   make_stub redis-cli 'n=0; for f in /proc/self/fd/*; do case "$(readlink "$f" 2>/dev/null)" in *vps-*.lock) n=$((n+1));; esac; done; echo $n >>"$BATS_TEST_TMPDIR/redis.lockfds"
@@ -2519,5 +2521,103 @@ exec /usr/bin/mv "$@"'
   [ "$(sort -u "$BATS_TEST_TMPDIR/curl.lockfds")" = 0 ]
   [ -s "$BATS_TEST_TMPDIR/redis.lockfds" ]
   [ "$(sort -u "$BATS_TEST_TMPDIR/redis.lockfds")" = 0 ]
+  # anche la pulizia della cache di Cloudflare (zona nel registro e Cloudflare attivo)
+  [ -s "$BATS_TEST_TMPDIR/cf.lockfds" ]
+  [ "$(sort -u "$BATS_TEST_TMPDIR/cf.lockfds")" = 0 ]
   jq -e '.last_restore.alert == "sent"' "$BK_STATE"
+}
+
+# ---------------------------------------------------------------------------
+# Task 5: avanzi della prova, messaggi di errore veritieri, manifest da Drive
+# ---------------------------------------------------------------------------
+
+@test "_restore files: scambio fallito e ritorno fallito (uscita 4), il messaggio non indica l'area di estrazione già tolta" {
+  rs_env
+  rs_site
+  local root="$SITES_WWW/a.it"
+  echo extra >"$root/public/zzz"
+  # la fase 1 sposta una voce e fallisce, e anche il ritorno (mv verso public/) fallisce
+  # shellcheck disable=SC2016
+  make_stub mv 'if [[ "$*" == *"-t public"* ]]; then exit 1; fi
+if [[ "$*" == *"-t tmp/.vpsbackup-old."* ]]; then
+  args=("$@"); i=0; for a in "${args[@]}"; do i=$((i+1)); [[ "$a" == -- ]] && break; done
+  /usr/bin/mv -t "${args[1]}" -- "${args[$i]}"
+  exit 1
+fi
+exec /usr/bin/mv "$@"'
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -ne 0 ]
+  jq -e '.last_restore.ok == false' "$BK_STATE"
+  local err
+  err="$(jq -r '.last_restore.error' "$BK_STATE")"
+  [[ "$err" == *"NON è tornato"* ]]
+  [[ "$err" == *"tmp/.vpsbackup-old."* ]]
+  [[ "$err" == *"public/ può esserci una parte dei file della copia"* ]]
+  [[ "$err" == *"copia di sicurezza"* ]]
+  # l'area di estrazione è stata tolta: il messaggio non manda a cercarci nulla
+  [[ "$err" != *".vpsbackup-x."* ]]
+  [ -z "$(ls -A "$root/tmp" | grep 'vpsbackup-x' || true)" ]
+  jq -e '.last_restore.alert' "$BK_STATE"
+}
+
+@test "_restore all: database fallito e annullamento dei file fallito, il messaggio dice che parte del nuovo può essere ancora in public/" {
+  rs_env
+  rs_site
+  touch "$BATS_TEST_TMPDIR/fail.load.site_a_it"
+  # l'annullamento sposta il contenuto nuovo in <vecchio>.new: qui non ci riesce
+  # shellcheck disable=SC2016
+  make_stub mv 'if [[ "$*" == *".new"* ]]; then exit 1; fi; exec /usr/bin/mv "$@"'
+  rs_run local a.it "$ARC_NAME" all
+  [ "$status" -ne 0 ]
+  local err
+  err="$(jq -r '.last_restore.error' "$BK_STATE")"
+  [[ "$err" == *"NON sono tornati tutti in public/"* ]]
+  [[ "$err" == *"una parte dei file nuovi può essere ancora in public/"* ]]
+  [[ "$err" == *"copia di sicurezza"* ]]
+}
+
+@test "_restore: l'utente e il database temporanei di una prova uccisa si tolgono all'inizio di ogni ripristino, anche 'files'" {
+  rs_env
+  rs_site
+  mkdir -p "$FAKEDB/site_a_it__ripristino"
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -eq 0 ]
+  [ ! -d "$FAKEDB/site_a_it__ripristino" ]
+  grep -q "DROP USER IF EXISTS 'site_a_it_r'" "$BATS_TEST_TMPDIR/grants.log"
+  # nemmeno un ripristino rifiutato subito dopo (copia di un altro sito) li lascia
+  mkdir -p "$FAKEDB/site_a_it__ripristino"
+  rs_run local a.it sites/b.it-20261001-0400.tar.gz files
+  [ "$status" -ne 0 ]
+}
+
+@test "_run: anche il giro notturno toglie utente e database temporanei di una prova uccisa" {
+  rs_env
+  rs_site
+  mkdir -p "$FAKEDB/site_a_it__ripristino"
+  : >"$BATS_TEST_TMPDIR/grants.log"
+  bk_tool _run
+  [ ! -d "$FAKEDB/site_a_it__ripristino" ]
+  grep -q "DROP USER IF EXISTS 'site_a_it_r'" "$BATS_TEST_TMPDIR/grants.log"
+}
+
+@test "bk_remote_manifest: legge solo l'inizio dell'archivio su Drive e restituisce il manifest; copia senza manifest = errore" {
+  rs_env
+  rs_site
+  mkdir -p "$DRIVE/F/a.it"
+  # un archivio grande: il manifest è il primo membro, bastano i primi 256 KiB
+  head -c 3000000 /dev/urandom >"$SITES_WWW/a.it/public/grande.bin"
+  bk_archive a.it "$DRIVE/F/a.it/a.it-20261001-0400.tar.gz"
+  BK_ERR=""
+  bk_remote_manifest a.it/a.it-20261001-0400.tar.gz
+  [ "$(jq -r '"\(.domain) \(.type) \(.db)"' <<<"$_BK_MANIFEST")" = "a.it php true" ]
+  grep -q -- 'cat --count 262144 gdrive:F/a.it/a.it-20261001-0400.tar.gz' "$BATS_TEST_TMPDIR/rclone.calls"
+  # un archivio vecchio (senza manifest) e un nome inesistente
+  tar -czf "$DRIVE/F/a.it/a.it-20260901-0400.tar.gz" -C "$SITES_WWW" a.it
+  run bk_remote_manifest a.it/a.it-20260901-0400.tar.gz
+  [ "$status" -eq 1 ]
+  bk_remote_manifest a.it/a.it-20260801-0400.tar.gz || true
+  [[ "$BK_ERR" == *"object not found"* ]]
+  run bk_remote_manifest _pannello/pannello-20261001-0400.sql.gz
+  [ "$status" -eq 1 ]
+  [ -z "$(ls -A "$BK_BACKUPS/tmp")" ]
 }

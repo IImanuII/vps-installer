@@ -5,6 +5,8 @@ setup() {
   load sites_helper
   setup_common
   sites_test_setup
+  export BK_BACKUPS="$BATS_TEST_TMPDIR/bk" BK_LOCK_DIR="$BATS_TEST_TMPDIR/locks"
+  mkdir -p "$BK_LOCK_DIR"
   T="$REPO_ROOT/tools/vps-site"
 }
 
@@ -397,4 +399,205 @@ wp_opts=(--title "Il blog" --admin-user gestore --admin-email io@miosito.it --lo
   [ "$status" -ne 0 ]
   [ "$(site_reg_get blog.miosito.it .state)" = active ]
   exec {lk}>&-
+}
+
+# --- create --from-backup ---------------------------------------------------
+
+@test "create --from-backup: sito WordPress da un archivio locale, tipo, www e percorso di login dal manifest" {
+  fb_archive blog.miosito.it wordpress yes yes accesso-7k2f
+  run --separate-stderr bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --from-backup '$FB_ARC'"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .state <<<"$output")" = creating ]
+  [ "$(site_reg_get blog.miosito.it .type)" = wordpress ]
+  [ "$(site_reg_get blog.miosito.it .www)" = true ]
+  [ "$(site_reg_get blog.miosito.it .db)" = true ]
+  [ "$(site_reg_get blog.miosito.it .from_backup.source)" = local ]
+  [ "$(site_reg_get blog.miosito.it .from_backup.name)" = "$FB_ARC" ]
+  [ "$(site_reg_get blog.miosito.it .from_backup.login_path)" = accesso-7k2f ]
+  # una sola password (il database), nessuna password admin né dati di WordPress da installare
+  [ "$(cat "$SITES_RUN/site_blog_miosito_it.pass")" = Password-db-1234567890 ]
+  [ "$(stat -c %a "$SITES_RUN/site_blog_miosito_it.pass")" = 600 ]
+  [ ! -e "$SITES_RUN/site_blog_miosito_it.wpargs" ]
+  [ ! -e "$SITES_RUN/site_blog_miosito_it.wppass" ]
+  grep -q '^systemd-run --unit vps-site-site_blog_miosito_it-create ' "$CALLS"
+  run grep -c 'Password-db' "$CALLS"
+  [ "$output" = 0 ]
+}
+
+@test "create --from-backup: sito statico e sito PHP senza database, nessuna password" {
+  fb_archive fisso.miosito.it static no no
+  vs create fisso.miosito.it --from-backup "$FB_ARC"
+  [ "$status" -eq 0 ]
+  [ "$(site_reg_get fisso.miosito.it '"\(.type) \(.www) \(.db)"')" = "static false false" ]
+  fb_archive dyn.miosito.it php no no
+  vs create dyn.miosito.it --from-backup "$FB_ARC"
+  [ "$status" -eq 0 ]
+  [ "$(site_reg_get dyn.miosito.it '"\(.type) \(.db) \(.wordpress)"')" = "php false null" ]
+}
+
+@test "create --from-backup: dominio diverso da quello del manifest o del nome, rifiutato" {
+  fb_archive blog.miosito.it php no no
+  cp "$BK_BACKUPS/$FB_ARC" "$BK_BACKUPS/sites/altro.miosito.it-20261001-040000.tar.gz"
+  vs create altro.miosito.it --from-backup sites/altro.miosito.it-20261001-040000.tar.gz
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"blog.miosito.it"*"altro.miosito.it"* ]]
+  vs create altro.miosito.it --from-backup "$FB_ARC"
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"blog.miosito.it"* ]]
+  run site_reg_exists altro.miosito.it
+  [ "$status" -eq 1 ]
+}
+
+@test "create --from-backup: copia vecchia, nomi non validi, opzioni in conflitto" {
+  fb_archive blog.miosito.it php no no
+  mkdir -p "$BATS_TEST_TMPDIR/vecchia/x"
+  tar -czf "$BK_BACKUPS/sites/vecchio.miosito.it-20260901-120000.tar.gz" -C "$BATS_TEST_TMPDIR/vecchia" x
+  vs create vecchio.miosito.it --from-backup sites/vecchio.miosito.it-20260901-120000.tar.gz
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"formato vecchio"* ]]
+  local n
+  for n in ../sites/x panel/blog.miosito.it-20261001-040000.tar.gz sites/blog.miosito.it-20261001-040000.sql.gz /etc/passwd "sites/a b" remote:_pannello/pannello-20261001-0400.sql.gz remote:x sites/inesistente.miosito.it-20261001-040000.tar.gz; do
+    vs create blog.miosito.it --from-backup "$n"
+    [ "$status" -eq 1 ] || { echo "accettato: $n"; false; }
+  done
+  vs create blog.miosito.it --from-backup "$FB_ARC" --type php
+  [ "$status" -eq 1 ]
+  vs create blog.miosito.it --from-backup "$FB_ARC" --www
+  [ "$status" -eq 1 ]
+  vs create blog.miosito.it --from-backup "$FB_ARC" --db
+  [ "$status" -eq 1 ]
+  vs create blog.miosito.it --from-backup "$FB_ARC" --title x
+  [ "$status" -eq 1 ]
+  vs create blog.miosito.it --from-backup
+  [[ "$(jq -r .error <<<"$output")" == uso:* ]]
+  run site_reg_exists blog.miosito.it
+  [ "$status" -eq 1 ]
+}
+
+@test "create --from-backup: manifest con valori strani rifiutato (tipo, login, coerenza, dominio)" {
+  fb_archive blog.miosito.it wordpress no yes accesso-7k2f
+  local w="$BATS_TEST_TMPDIR/m" arc="$BK_BACKUPS/$FB_ARC" f
+  mkdir -p "$w"
+  tar -xzf "$arc" -C "$w"
+  for f in '.type = "perl"' '.login_path = "wp-admin"' '.login_path = null' '.sha256.db = null' '.domain = "x.it"'; do
+    mkdir -p "$w/n"
+    cp "$w/files.tar.gz" "$w/db.sql.gz" "$w/n/"
+    jq "$f" "$w/manifest.json" >"$w/n/manifest.json"
+    tar -czf "$BK_BACKUPS/sites/blog.miosito.it-20261002-040000.tar.gz" -C "$w/n" manifest.json files.tar.gz db.sql.gz
+    run --separate-stderr bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --from-backup sites/blog.miosito.it-20261002-040000.tar.gz"
+    [ "$status" -eq 1 ] || { echo "accettato: $f"; false; }
+    rm -rf "$w/n"
+  done
+  run site_reg_exists blog.miosito.it
+  [ "$status" -eq 1 ]
+}
+
+@test "create --from-backup: password del database mancante o non valida, nessun registro" {
+  fb_archive blog.miosito.it php no yes
+  vs create blog.miosito.it --from-backup "$FB_ARC"
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"password"* ]]
+  run bash -c "printf 'corta\n' | bash '$T' create blog.miosito.it --from-backup '$FB_ARC'"
+  [ "$status" -eq 1 ]
+  run site_reg_exists blog.miosito.it
+  [ "$status" -eq 1 ]
+}
+
+@test "create --from-backup: WordPress richiede Redis con le ACL anche senza installarlo" {
+  fb_archive blog.miosito.it wordpress no yes accesso-7k2f
+  jq '.components.redis_acl = false' "$VPS_OPT/manifest.json" >"$BATS_TEST_TMPDIR/m" && mv "$BATS_TEST_TMPDIR/m" "$VPS_OPT/manifest.json"
+  run --separate-stderr bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --from-backup '$FB_ARC'"
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"--tools-only"* ]]
+}
+
+@test "_run create da archivio WordPress: nessun wp core install, wp-config e utente Redis nuovi, poi _restore all, sito attivo" {
+  fb_backup_stub
+  # www solo sul dominio principale della zona: qui il sottodominio non lo ha
+  fb_archive blog.miosito.it wordpress no yes accesso-7k2f
+  run --separate-stderr bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --from-backup '$FB_ARC'"
+  [ "$status" -eq 0 ]
+  run bash "$T" _run create blog.miosito.it
+  [ "$status" -eq 0 ]
+  # WordPress non si scarica né si installa: i file arrivano dall'archivio
+  run grep -E 'core (download|install)|plugin install' "$CALLS"
+  [ "$status" -eq 1 ]
+  # il ripristino parte dall'unità del lavoro, con la copia giusta e la modalità giusta
+  [ "$(cat "$BATS_TEST_TMPDIR/fb.calls")" = "_restore local blog.miosito.it $FB_ARC all" ]
+  # ... quando il sito è ancora "creating" (il pannello lo vede come una creazione)
+  [ "$(cat "$BATS_TEST_TMPDIR/fb.state")" = creating ]
+  [ "$(site_reg_get blog.miosito.it '"\(.state) \(.job.op) \(.job.step) \(.job.error)"')" = "active create done null" ]
+  [ "$(site_reg_get blog.miosito.it '"\(.type) \(.wordpress.login_path)"')" = "wordpress accesso-7k2f" ]
+  # wp-config.php nuovo, con la password nuova (non quella dell'archivio) e le chiavi
+  w="$SITES_WWW/blog.miosito.it/wp-config.php"
+  grep -q "define( 'DB_PASSWORD', 'Password-db-1234567890' );" "$w"
+  run grep -q 'wp-config vecchio' "$w"
+  [ "$status" -eq 1 ]
+  grep -q "^user site_blog_miosito_it on " "$REDIS_ACL_FILE"
+  [ -f "$CRON_D/vps-site-site_blog_miosito_it" ]
+  [ -f "$NGINX_CONF_D/blog.miosito.it.conf" ]
+  grep -qx 'DB_PASS=Password-db-1234567890' "$SITES_WWW/blog.miosito.it/db.env"
+  [ ! -e "$SITES_RUN/site_blog_miosito_it.pass" ]
+}
+
+@test "_run create da archivio senza database: _restore files (statico e PHP)" {
+  fb_backup_stub
+  fb_archive fisso.miosito.it static no no
+  vs create fisso.miosito.it --from-backup "$FB_ARC"
+  run bash "$T" _run create fisso.miosito.it
+  [ "$status" -eq 0 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/fb.calls")" = "_restore local fisso.miosito.it $FB_ARC files" ]
+  [ "$(site_reg_get fisso.miosito.it .state)" = active ]
+}
+
+@test "_run create da archivio: ripristino fallito, il sito resta attivo e vuoto con il motivo" {
+  fb_backup_stub
+  export FB_STUB_RC=1 FB_STUB_ERR="la copia è stata manomessa"
+  fb_archive blog.miosito.it wordpress no yes accesso-7k2f
+  run --separate-stderr bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --from-backup '$FB_ARC'"
+  run bash "$T" _run create blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  [ "$(site_reg_get blog.miosito.it .job.step)" = restore ]
+  [[ "$(site_reg_get blog.miosito.it .job.error)" == *"la copia è stata manomessa"* ]]
+  [ -d "$SITES_WWW/blog.miosito.it/public" ]
+  # il sito è comunque configurato come WordPress, pronto per un ripristino dalla pagina Backup
+  [ "$(site_reg_get blog.miosito.it .type)" = wordpress ]
+  [ -f "$NGINX_CONF_D/blog.miosito.it.conf" ]
+}
+
+@test "_run create da archivio: un passo prima del ripristino fallisce, si disfa tutto come in una creazione" {
+  fb_backup_stub
+  fb_archive blog.miosito.it wordpress no yes accesso-7k2f
+  run --separate-stderr bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --from-backup '$FB_ARC'"
+  export STUB_RC_certbot=1
+  run bash "$T" _run create blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = error ]
+  [ ! -e "$BATS_TEST_TMPDIR/fb.calls" ]
+}
+
+@test "vps-site: un comando su un sito tiene il lock condiviso fino alla fine; un lavoro (_run) per tutta la sua durata" {
+  run bash -c "printf 'Password-di-prova-123\n' | bash '$T' create blog.miosito.it --type php --db"
+  bash "$T" _run create blog.miosito.it
+  local lk="$BK_LOCK_DIR/vps-site.site_blog_miosito_it.lock" i held=no
+  # db-password legge la password da stdin: finché non arriva il comando è in corso
+  { sleep 3; echo 'Nuova-password-456789'; } | bash "$T" db-password blog.miosito.it >/dev/null 2>&1 &
+  pid=$!
+  for i in {1..25}; do
+    if ! flock -x -n "$lk" true 2>/dev/null; then held=si; break; fi
+    sleep 0.1
+  done
+  [ "$held" = si ]
+  wait "$pid"
+  pid=""
+  flock -x -n "$lk" true
+
+  # il lavoro: durante il suo corpo il lock c'è (mariadb finto lo controlla), a lavoro finito no
+  site_reg_update blog.miosito.it '.prev_state = .state | .state = "deleting"'
+  make_stub mariadb 'if flock -x -n "$BK_LOCK_DIR/vps-site.site_blog_miosito_it.lock" true; then echo libero >>"$BATS_TEST_TMPDIR/job.lock"; else echo preso >>"$BATS_TEST_TMPDIR/job.lock"; fi; cat >/dev/null; exit 0'
+  run bash "$T" _run delete blog.miosito.it
+  [ "$status" -eq 0 ]
+  [ -s "$BATS_TEST_TMPDIR/job.lock" ]
+  [ "$(sort -u "$BATS_TEST_TMPDIR/job.lock")" = preso ]
 }

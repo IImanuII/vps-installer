@@ -40,7 +40,14 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | `/opt/vps/backups/panel/` | `root:root` 700 / file 600 | dump del DB del pannello prima di ogni aggiornamento (ultimi 5) |
 | `/opt/vps/phpmyadmin/` | `root:panel` 750 / file 640 | phpMyAdmin |
 | `/opt/vps/sites/` | `root:panel` 750 / file 640 | registro dei siti di `vps-site` (un JSON per sito, nessun segreto) |
-| `/opt/vps/backups/sites/` | `root:root` 700 / file 600 | archivi dei siti eliminati (file + dump), cancellati dopo 30 giorni |
+| `/opt/vps/backups/sites/` | `root:root` 700 / file 600 | archivi dei siti eliminati, cancellati dopo 30 giorni. Dalla 1.7.0 `DOMINIO-AAAAMMGG-HHMMSS.tar.gz` nel formato dei backup (`manifest.json`, `files.tar.gz`, `db.sql.gz`): si può ricreare il sito. Quelli fatti prima (tar della cartella + `.sql.gz` a parte) restano, `restorable:false` |
+| `/opt/vps/backups/restore/` | `root:root` 700 / file 600 | copie di sicurezza fatte prima di ogni ripristino (stesso formato), 7 giorni |
+| `/opt/vps/backups/tmp/` | `root:root` 700 | lavoro del giro e dei ripristini (`bk.*`); svuotata a ogni uso, i residui di oltre 1 giorno si tolgono al giro dopo |
+| `/opt/vps/backup/config.json` | `root:root` 600 (cartella 700) | `{"enabled","time","folder"}` di `vps-backup` |
+| `/opt/vps/backup/state.json` | `root:root` 600 | `job`, `last_run`, `known`, `last_restore` (sez. `vps-backup`) |
+| `/opt/vps/secrets/rclone.conf` | `root:root` 600 | remote `gdrive` (rclone, scope `drive.file`) con il token di Drive; il pannello non lo legge |
+| `/etc/systemd/system/vps-backup.service`, `vps-backup.timer` | `root:root` 644 | `Type=oneshot`, `ExecStart=/opt/vps/bin/vps-backup _run`, `TimeoutStartSec=12h`; il timer (`OnCalendar` dal drop-in `vps-backup.timer.d/ora.conf`, `Persistent=true`) è spento finché il backup non è attivato |
+| `/run/vps-backup.lock`, `/run/vps-site.<slug>.lock` | root 600 | lock globale di `vps-backup` e lock per sito (esclusivo per giro e ripristino, condiviso per le scritture di `vps-files` e i lavori di `vps-site`) |
 | `/opt/vps/monitor/config.json` | `root:root` 600 (cartella 700) | configurazione di `vps-monitor` (con il token del bot: il pannello non la legge, usa `vps-monitor status`) |
 
 ### File di sistema (posizioni obbligate)
@@ -166,6 +173,7 @@ Forniti dall'installer v1.2 (eseguiti dal pannello, in sudoers):
 | `vps-site show <dominio>` | sì | `{"ok":true,"site":<registro>}` |
 | `vps-site create <dominio> --type static\|php [--www] [--db]` | no | `{"ok":true,"state":"creating"}` |
 | `vps-site create <dominio> --type wordpress [--www] --title T --admin-user U --admin-email E --login-path P [--cloudflare]` | no | `{"ok":true,"state":"creating"}` |
+| `vps-site create <dominio> --from-backup NOME` | no | `{"ok":true,"state":"creating"}` (dettagli nella sezione `vps-backup`) |
 | `vps-site wp-install <dominio> --title T --admin-user U --admin-email E --login-path P [--cloudflare]` | no | `{"ok":true,"state":"installing"}` |
 | `vps-site disable <dominio>` / `enable <dominio>` | sì | `{"ok":true,"state":"disabled"\|"active"}` |
 | `vps-site delete <dominio>` | no | `{"ok":true,"state":"deleting"}` |
@@ -255,13 +263,74 @@ Regole comuni:
 - Registro: `/var/log/vps-tools.log`, una riga per operazione che modifica (`files <comando> <dominio> <al massimo 20 percorsi> totale=N`), mai i contenuti. Per il registro del pannello: `files.upload|write|mkdir|rename|move|copy|delete|zip|unzip`, dettagli con al massimo 20 percorsi più `totale`.
 - Pacchetti `zip` e `unzip`: installati da `install.sh` e da `--tools-only` se mancano.
 
+Fornito dall'installer v1.7, **eseguito dal pannello** con sudo (è in `/etc/sudoers.d/vps-panel`): `vps-backup`, le copie dei siti e del pannello su Google Drive e il ripristino. Solo per il super_admin. Dalla 1.7.0 `vps-site` ha anche `create DOMINIO --from-backup NOME` (vedi sopra).
+
+Come per gli altri script: JSON su stdout, errori `{"ok":false,"error":"…"}` con uscita 1, stdin per i segreti, sotto sudo il comando si rilancia in un'unità systemd (`VPS_BACKUP_VIA_SYSTEMD`). `_run` (il giro, lanciato dal timer o da `run`) e `_restore` (il ripristino, lanciato da `restore`/`restore-local`) sono **interni** e sotto sudo rispondono `{"ok":false,"error":"comando interno"}`. Il token di Drive passa solo da stdin e non compare mai in argomenti, registro, `status` o risposte.
+
+| Comando | stdin | Risposta |
+|---|---|---|
+| `vps-backup status` | — | vedi sotto |
+| `vps-backup connect` | riga 1: token JSON di `rclone authorize "drive" …`; righe 2-3 facoltative (insieme): client id e client secret propri | `{"ok":true,"folder":"…"}` |
+| `vps-backup disconnect` | — | `{"ok":true}`; toglie `rclone.conf`, imposta `enabled:false` (orario e cartella restano) e ferma il timer |
+| `vps-backup config` | `{"enabled":bool,"time":"HH:MM","folder":"…"}` (`folder` facoltativo) | `{"ok":true}` |
+| `vps-backup run` | — | `{"ok":true,"started":true}`: il giro parte come unità `vps-backup-run`; "backup in corso" se ce n'è già uno |
+| `vps-backup list-local` | — | `{"ok":true,"items":[{"kind":"panel\|site\|restore","name":"cartella/file","domain":str\|null,"date":"AAAA-MM-GGTHH:MM:SS","size":int,"expires":"AAAA-MM-GG"\|null,"restorable":bool}]}`, dalla più recente |
+| `vps-backup read-local NOME` | — | **byte del file** su stdout |
+| `vps-backup delete-local NOME` | — | `{"ok":true}` |
+| `vps-backup list-remote` | — | `{"ok":true,"sites":[{"domain","present":bool,"copies":[{"name":"dominio/file","date","size"}]}],"panel":[{"name":"_pannello/file","date","size"}]}` |
+| `vps-backup read-remote NOME` | — | **byte del file** scaricato da Drive, su stdout |
+| `vps-backup restore DOMINIO dominio/file all\|db\|files` | — | `{"ok":true,"started":true}` |
+| `vps-backup restore-local NOME all\|db\|files` | — | `{"ok":true,"started":true}` |
+
+**Regole comuni**
+- `connect`: il token deve essere un solo oggetto JSON con `access_token` e `refresh_token`; client id e secret `[A-Za-z0-9._~-]{1,256}`, stdin al massimo 8 KiB. Scrive `/opt/vps/secrets/rclone.conf` (root 600, remote `gdrive`, scope `drive.file`), crea la cartella su Drive e vi scrive e cancella un file di prova; se qualcosa non va torna il collegamento di prima e l'errore è `Google Drive non ha accettato il collegamento: …` (testo di rclone ripulito dai token). `config` rifiuta un'ora non `HH:MM`, cartella fuori da `[A-Za-z0-9._-]{1,64}` (anche `.` e `..`), `enabled` non booleano e `enabled:true` a Drive scollegato. Scrive `config.json`, il drop-in `vps-backup.timer.d/ora.conf` (`OnCalendar=*-*-* HH:MM:00`), poi `daemon-reload` e `enable --now` o `disable --now` del timer; se il file è salvato ma systemd non obbedisce: `{"ok":false,"saved":true,"error":"…"}`. Predefiniti: `enabled` falso, ora 04:00, cartella `Plancia-<hostname>`.
+- `connect`, `disconnect`, `config` e `delete-local` prendono il lock globale: mentre un giro o un ripristino è in corso rispondono `backup in corso, riprova dopo`.
+- **Lock del sito**: finché un ripristino o la copia notturna di un sito è in corso, i comandi che lo modificano rispondono `ripristino in corso (o copia del sito in corso): riprova tra poco` (`vps-files` write, mkdir, rename, move, copy, delete, zip, unzip; `vps-site` wp-install, disable, enable, delete, db-create, db-password; un `_run` di eliminazione o installazione WordPress già in coda si ferma e torna allo stato di prima). Le letture non sono bloccate. Chi scrive tiene un lock condiviso per tutta la durata del comando, quindi un ripristino non parte mentre scrive (`ripristino in corso su questo sito` / `backup in corso`).
+- **Nomi** (`NOME`): `list-local`/`read-local`/`delete-local`/`restore-local` usano `panel/FILE.sql.gz`, `sites/DOMINIO-AAAAMMGG-HHMM[SS].tar.gz|.sql.gz` o `restore/DOMINIO-AAAAMMGG-HHMM[SS].tar.gz`, esattamente come li restituisce `list-local`; `list-remote`/`read-remote`/`restore` usano `dominio/dominio-AAAAMMGG-HHMM.tar.gz` o `_pannello/pannello-AAAAMMGG-HHMM.sql.gz`. Niente `..`, niente `/` oltre al primo, niente collegamenti simbolici, file regolari.
+- `list-local`: `date` è la data di modifica del file (ora locale della VPS, senza fuso). `expires` = modifica + 30 giorni (`site`), + 7 giorni (`restore`), `null` per il pannello (ultimi 5 dump). `restorable:true` solo per un `.tar.gz` il cui primo membro è `manifest.json` (formato 1.7.0): gli archivi vecchi (tar di tutta la cartella + `.sql.gz` a parte, due voci) sono `restorable:false`, si possono solo scaricare o eliminare. `restore` (copie di sicurezza dei ripristini) e `site` si ripristinano e servono a ricreare un sito eliminato.
+- `list-remote`: solo i nomi che crea il giro, dal più recente; una cartella ancora inesistente dà elenchi vuoti; Drive scollegato = errore `Google Drive non collegato…`; `present` dice se il dominio è ancora nel registro dei siti (altrimenti è un sito eliminato che ha ancora copie).
+- **Stream**: `read-local` e `read-remote` scrivono byte grezzi; con uscita ≠ 0 il chiamante scarta quanto ricevuto (un JSON di errore può seguire dati parziali). `read-remote` scarica prima in `backups/tmp` (controlla spazio e dimensione) e poi manda su stdout.
+- **Avvio di un ripristino** (`restore`, `restore-local`): controlla argomenti, che il sito sia nel registro in stato `active` o `disabled`, che Drive sia collegato (solo `restore`), che l'archivio locale esista e abbia il manifest, e che non ci sia un giro o un altro ripristino in corso (`backup in corso`) né un lavoro sul sito (`ripristino in corso su questo sito`). Poi lancia `_restore` come unità `vps-backup-restore-<slug>`: l'esito si legge da `status`. `all` richiede che archivio e sito coincidano sul database (altrimenti "ripristina solo i file"); `db` richiede il database in entrambi.
+
+**`status`**
+
+```json
+{"ok":true,"connected":true,"folder":"Plancia-vps01","enabled":true,"time":"04:00",
+ "job":null,
+ "interrupted":false,"interrupted_job":null,
+ "last_run":{"started":"ISO","finished":"ISO","ok":true,
+   "sites":[{"domain","ok":bool,"reason":str|null,"file":str|null,"size":int,"deleted":int}],
+   "panel":{"ok":bool,"error":str|null,"file":str|null,"size":int,"deleted":int},
+   "purged":["dominio"],"alert":null|"sent"|"not_configured"|"failed: …"},
+ "last_restore":{"domain","mode":"all|db|files","source":"local|remote","name","started","finished","ok":bool,
+   "error":str|null,"safety":"dominio-AAAAMMGG-HHMMSS.tar.gz"|null,"backup_date":"ISO"|null,"alert":null|"sent"|"not_configured"|"failed: …"},
+ "drive":{"used":int,"total":int}|null}
+```
+
+- `job` (lavoro in corso, `null` se nessuno): giro `{"unit","op":"run","started","step":"start|site|upload|retention|panel|purge","domain":str|null}`; ripristino `{"unit","op":"restore","started","step":"start|download|verify|extract|dryrun|safety|files|database|cache","domain","safety":"…"|null}`. Un `job` rimasto in `state.json` senza che nessuno lavori (processo ucciso, riavvio) non è più `job`: `job:null`, `interrupted:true` e `interrupted_job` con quel lavoro. Si guarda il lock globale e le unità `vps-backup-run`, `vps-backup` e `vps-backup-restore-*`.
+- **`job.safety` / `interrupted_job.safety` può nominare un file che non esiste ancora**: il nome viene scritto al passo `safety`, *prima* che la copia di sicurezza sia finita; se il processo muore durante la copia il file manca o è parziale. Il pannello deve dire "potrebbe non esistere" e controllare con `list-local` (cartella `restore/`). `last_restore.safety` invece è valorizzato solo se il file esiste davvero.
+- `last_run.ok` è vero solo se nessun sito e il pannello sono riusciti; durante un giro `last_run` resta quello del giro prima. Un giro con almeno un sito o il pannello falliti manda **un solo** messaggio Telegram (`💾 <hostname>: Backup: N siti non salvati` + una riga `dominio: motivo`, anche `pannello: motivo`), anche con la sorveglianza spenta; `alert` dice com'è andata. `drive` è `null` se Drive non è collegato o `rclone about` non risponde; `total` 0 = spazio illimitato.
+- `last_restore` resta fino al ripristino dopo. Ogni ripristino manda un messaggio Telegram (riuscito o no).
+- `state.json` ha anche `known` (i domini già salvati da questa installazione): non è nella risposta, serve a non cancellare da Drive le copie di altri.
+
+**Il giro** (`_run`, ogni notte alle 04:00 per impostazione predefinita, o `run`): un archivio per sito attivo o disattivato, uno per volta; lock globale `/run/vps-backup.lock` e, mentre un sito si archivia, `/run/vps-site.<slug>.lock`. Un sito che non si riesce a salvare (sito occupato, `spazio insufficiente`, archivio o caricamento non riusciti, Drive non risponde) non ferma gli altri. Su Drive: `<cartella>/<dominio>/<dominio>-AAAAMMGG-HHMM.tar.gz` e `<cartella>/_pannello/pannello-AAAAMMGG-HHMM.sql.gz`; si tengono le **ultime 3 copie riuscite** (mai la copia appena caricata e controllata), le eliminazioni sono definitive (`--drive-use-trash=false`). I siti che questa installazione aveva salvato e che non sono più nel registro perdono le copie su Drive 30 giorni dopo l'ultima. `backups/restore/` si pota a 7 giorni (nel giro e da `vps-site _prune`), `backups/sites/` a 30.
+
+**Archivio di un sito** (`.tar.gz`, tutti file regolari): `manifest.json` (primo membro: `domain`, `type`, `www`, `db`, `slug`, `login_path` WordPress o `null`, `date` ISO, `installer_version`, `parts`, `sha256: {files, db}`), `files.tar.gz` (`public/` letto come utente del sito, link conservati come link; più `wp-config.php` letto da root; niente `logs/` né `tmp/`) e `db.sql.gz` se il sito ha un database. Prima di ripristinare, `bk_verify` rifiuta nomi assoluti o con `..`, file speciali, link che escono dal sito, checksum diversi.
+
+**Ripristino** (`_restore`): scarico (se da Drive), controllo dell'archivio, dominio del manifest uguale a quello del sito, estrazione di `public/` come utente del sito in `tmp/.vpsbackup-x.*`, prova del dump in `<slug>__ripristino` con un utente temporaneo; solo dopo **copia di sicurezza** (`backups/restore/<dominio>-AAAAMMGG-HHMMSS.tar.gz`, 7 giorni, solo delle parti che si sovrascrivono), poi scambio dei file (il contenuto di `public/` passa da `tmp/.vpsbackup-old.*`, ACL di `www-data` riapplicate), poi il database, poi cache Redis e Cloudflare. Se un passo fallisce si torna alla copia di sicurezza e il messaggio lo dice; se anche il ritorno fallisce l'errore e il messaggio Telegram dicono dov'è il contenuto di prima (`ATTENZIONE: …`). `wp-config.php` **non si ripristina mai**. Il dump si carica come utente del sito con `mariadb --sandbox --binary-mode --local-infile=0`, mai come root.
+
+**Limiti noti**: durante il caricamento del database il sito è brevemente incoerente (nessuna pagina di manutenzione). Un processo ucciso a metà lascia avanzi in `tmp/` del sito (`.vpsbackup-old.*`, `.vpsbackup-x.*`, `.vpsbackup-c.*`) e la copia di sicurezza: gli avanzi più vecchi di 24 ore si tolgono all'inizio del ripristino/giro successivo; il sito interrotto non si ripara da solo. Il dump di un archivio manomesso, essendo caricato con le credenziali dell'utente del sito, potrebbe cambiare la password del database di quell'utente (`ALTER USER` su sé stesso): è un rischio accettato (richiede di poter scrivere su Drive) e `db.env`/`wp-config.php` non lo rilevano.
+
+**Registro azioni del pannello**: `backup.connect|disconnect|config|run|restore|recreate|delete_local`, mai il token. Registro degli strumenti (`/var/log/vps-tools.log`): una riga per giro, ripristino e connessione, mai segreti.
+
+`vps-site create DOMINIO --from-backup NOME` (sincrono fino all'avvio, poi lavoro in background `job.op = "create"`): `NOME` è `sites/FILE` o `restore/FILE` (come in `list-local`) oppure `remote:dominio/file` (come in `list-remote`). Tipo, `www`, database e `login_path` vengono dal manifest (non si danno `--type`, `--www`, `--db` né le opzioni di WordPress: errore). Il dominio deve essere quello del manifest e del nome del file. **stdin: una riga con la password del database nuovo, solo se la copia ha un database** (stesse regole di `db-password`). Il sito si crea come una creazione normale (DNS, utente, cartelle, pool, certificato, vhost, database); per WordPress niente download né `wp core install`: utente Redis nuovo e `wp-config.php` nuovo (credenziali nuove, chiavi nuove); poi parte `vps-backup _restore` in modalità `all` (`files` senza database). Il sito resta `creating` (`job.step` `restore`) finché il ripristino non finisce; poi `active` e `job.step` `done`. Se il ripristino fallisce il sito resta **`active` e vuoto**, con `job.step` `restore` e `job.error` che spiega perché ("sito creato ma vuoto, ripristino non riuscito: …"): si può riprovare dalla pagina Backup con `restore`/`restore-local`; se invece fallisce un passo di creazione si disfa tutto come in una creazione normale (`error`, si pulisce con `delete`). `list`/`show` mostrano `from_backup: {source:"local"|"remote", name, login_path}` e, per WordPress, `wordpress` con `login_path` (da `manifest`), `admin_user: null`, `cloudflare_plugin: false`. L'eliminazione di un sito scrive l'archivio finale nello stesso formato (`backups/sites/<dominio>-AAAAMMGG-HHMMSS.tar.gz`, root 600): un disco quasi pieno ferma l'eliminazione ("spazio insufficiente… niente è stato cancellato"). Limite: `wp-config.php` nuovo usa il prefisso di tabella `wp_`; un sito importato con un altro prefisso va corretto a mano.
+
 Previsti per il pannello (da scrivere con il pannello, stesse regole):
 
 | Script | Cosa farà |
 |---|---|
 | `vps-cache` | attiva/disattiva/svuota cache FastCGI di un sito |
 | `vps-service` | restart/reload di nginx, php-fpm, mariadb, redis (whitelist) |
-| `vps-backup` | configurazione rclone ed esecuzione backup |
 | `vps-f2b` | elenco/sblocco IP bannati |
 | `vps-user` | cambio password utente admin, gestione chiavi SSH |
 
@@ -283,7 +352,7 @@ Convenzione: DB e utenti dei siti hanno nome `site_<slug>` (es. `site_miosito_it
 - [ ] **Email:** pagina di configurazione SMTP (host, porta, utente, password, mittente, destinatario avvisi), pulsante "invia email di prova", link alle guide per **Gmail app password** e **Brevo** (con nota su SPF/DKIM per mittente sul proprio dominio). Usa `vps-smtp`.
 - [x] **Cloudflare:** fatto (Plancia 2.4.0): cambio/verifica token, svuotamento cache. Usa `vps-cf-token`, `vps-cf-purge`, `vps-cf-ips-update`.
 - [ ] **phpMyAdmin:** versione installata vs ultima, aggiornamento, cambio password basic auth. Usa `vps-pma-update`, `vps-pma-pass`.
-- [ ] **Backup rclone:** configurazione OAuth Google Drive, pianificazione, retention, stato ultimo backup. Usa `vps-backup`.
+- [ ] **Backup:** pagina Backup (Plancia 2.7.0): collegamento a Google Drive, pianificazione, stato e copie locali e su Drive, ripristino, siti eliminati ricreabili. Usa `vps-backup` e `vps-site create --from-backup` (installer 1.7.0).
 - [ ] **Siti:** creazione statico / PHP fatta con `vps-site` (installer 1.2); WordPress fatto con `vps-site create --type wordpress` e `vps-site wp-install` (installer 1.3); resta la cache (`vps-cache`, 2c).
 - [x] **Stato server:** fatto (Plancia 2.5.0): dashboard da `vps-status` e `vps-monitor status`, pagina Avvisi con `vps-monitor config`/`test`.
 - [ ] **Sicurezza:** IP bannati da fail2ban, sblocco. Usa `vps-f2b`.

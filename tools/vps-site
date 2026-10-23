@@ -29,7 +29,8 @@ if [[ -n "${SUDO_USER:-}" || -n "${VPS_SITE_VIA_SYSTEMD:-}" ]]; then
   # seconda linea di difesa, nel caso l'ambiente passasse comunque.
   unset CF_API SITES_DIR SITES_WWW SITES_BACKUPS SITES_LOCK SITES_LOCK_WAIT SITES_RUN NGINX_CONF_D \
     PHP_POOL_D LOGROTATE_D VPS_SITE_SELF VPS_NO_CHOWN SITE_ERROR_FILE \
-    WP_BIN REDIS_ACL_FILE REDIS_ADMIN_SECRET CRON_D BK_LOCK_DIR BK_BACKUPS
+    WP_BIN REDIS_ACL_FILE REDIS_ADMIN_SECRET CRON_D BK_LOCK_DIR BK_BACKUPS BK_DIR BK_STATE BK_RCLONE \
+    BK_RCLONE_CONF VPS_BACKUP_SELF FM_RUNUSER
   [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
   chmod 640 "$VPS_LOG"
 fi
@@ -56,7 +57,7 @@ esac
 tool_init
 
 usage() {
-  json_err "uso: vps-site zones | list | show D | create D --type static|php [--www] [--db] | create D --type wordpress [--www] --title T --admin-user U --admin-email E --login-path P [--cloudflare] | wp-install D --title T --admin-user U --admin-email E --login-path P [--cloudflare] | disable D | enable D | delete D | db-create D | db-password D (password da stdin per --db, db-create, db-password, wp-install; due righe per create wordpress: database e admin WordPress)"
+  json_err "uso: vps-site zones | list | show D | create D --type static|php [--www] [--db] | create D --type wordpress [--www] --title T --admin-user U --admin-email E --login-path P [--cloudflare] | create D --from-backup NOME (sites/FILE, restore/FILE o remote:dominio/file; password del database da stdin se la copia ha un database) | wp-install D --title T --admin-user U --admin-email E --login-path P [--cloudflare] | disable D | enable D | delete D | db-create D | db-password D (password da stdin per --db, db-create, db-password, wp-install; due righe per create wordpress: database e admin WordPress)"
 }
 
 need_cf() {
@@ -191,7 +192,7 @@ case "$cmd" in
   create)
     d="${1:-}"
     shift || true
-    type="" www=no db=no
+    type="" www=no db=no fb=""
     wp_args=()
     while (($#)); do
       case "$1" in
@@ -210,6 +211,11 @@ case "$cmd" in
           db=yes
           shift
           ;;
+        --from-backup)
+          [[ -z "$fb" && $# -ge 2 ]] || usage
+          fb="$2"
+          shift 2
+          ;;
         --title | --admin-user | --admin-email | --login-path)
           [[ $# -ge 2 ]] || usage
           wp_args+=("$1" "$2")
@@ -222,14 +228,24 @@ case "$cmd" in
         *) usage ;;
       esac
     done
-    [[ "$type" == static || "$type" == php || "$type" == wordpress ]] || json_err "tipo non valido: usa --type static, php o wordpress"
-    # le opzioni di WordPress hanno senso solo con il suo tipo
-    [[ "$type" == wordpress || ${#wp_args[@]} -eq 0 ]] || usage
-    [[ "$type" != wordpress || "$db" == no ]] || json_err "WordPress ha sempre il database: togli --db"
-    [[ "$db" == no || "$type" == php ]] || json_err "il database si crea solo per i siti PHP"
-    if [[ "$type" == wordpress ]]; then
-      db=yes
-      parse_wp_opts "${wp_args[@]}"
+    if [[ -n "$fb" ]]; then
+      # ricreato da una copia: tipo, www e database vengono dal manifest, WordPress non
+      # si installa (i file e il database arrivano dal ripristino)
+      [[ -z "$type" && "$www" == no && "$db" == no && ${#wp_args[@]} -eq 0 ]] \
+        || json_err "con --from-backup il tipo, www e il database vengono dalla copia: togli --type, --www, --db e le opzioni di WordPress"
+      valid_domain "$d" || json_err "dominio non valido: $d"
+      site_fb_load "$d" "$fb" || json_err "$FB_ERR"
+      type="$FB_TYPE" www="$FB_WWW" db="$FB_DB"
+    else
+      [[ "$type" == static || "$type" == php || "$type" == wordpress ]] || json_err "tipo non valido: usa --type static, php o wordpress"
+      # le opzioni di WordPress hanno senso solo con il suo tipo
+      [[ "$type" == wordpress || ${#wp_args[@]} -eq 0 ]] || usage
+      [[ "$type" != wordpress || "$db" == no ]] || json_err "WordPress ha sempre il database: togli --db"
+      [[ "$db" == no || "$type" == php ]] || json_err "il database si crea solo per i siti PHP"
+      if [[ "$type" == wordpress ]]; then
+        db=yes
+        parse_wp_opts "${wp_args[@]}"
+      fi
     fi
     reg_lock
     msg="$(site_validate_new "$d")" || json_err "$msg"
@@ -239,7 +255,11 @@ case "$cmd" in
       json_err "www.$d è il dominio del pannello: crea il sito senza --www"
     fi
     need_cf
-    if [[ "$type" == wordpress ]]; then
+    if [[ -n "$fb" ]]; then
+      [[ "$type" != wordpress ]] || need_wp
+      # una riga: la password del database nuovo (se la copia ha un database)
+      [[ "$db" == no ]] || read_password
+    elif [[ "$type" == wordpress ]]; then
       need_wp
       # due righe: password del database, poi password admin di WordPress
       { IFS= read -r DB_PASSWORD; IFS= read -r WP_ADMIN_PASS; } < <(read_stdin_limited 512) || true
@@ -251,7 +271,12 @@ case "$cmd" in
       read_password
     fi
     site_reg_new "$d" "$type" "$www" "$db"
-    [[ "$type" != wordpress ]] || write_wp_files "$d"
+    if [[ -n "$fb" ]]; then
+      site_reg_update "$d" '.from_backup = {source: $s, name: $n, login_path: (if $l == "" then null else $l end)}' \
+        --arg s "$FB_SRC" --arg n "$FB_NAME" --arg l "$FB_LOGIN"
+    elif [[ "$type" == wordpress ]]; then
+      write_wp_files "$d"
+    fi
     if [[ "$db" == yes ]]; then
       install -d -m 700 "$SITES_RUN"
       (

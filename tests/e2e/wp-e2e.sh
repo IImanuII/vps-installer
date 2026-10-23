@@ -400,7 +400,7 @@ out="$(rs PING)"
 [[ ! -e "$CRON_D/vps-site-$s1" && ! -e "$CRON_D/vps-site-$s2" ]] || fail "cron rimasti"
 for d in "$D1" "$D2"; do
   ls "$SITES_BACKUPS/$d"-*.tar.gz >/dev/null || fail "archivio file di $d"
-  ls "$SITES_BACKUPS/$d"-*.sql.gz >/dev/null || fail "dump di $d"
+  [[ "$(tar -tzf "$(compgen -G "$SITES_BACKUPS/$d-*.tar.gz" | head -n1)" | head -n1)" == manifest.json ]] || fail "archivio di $d senza manifest"
   [[ ! -e "$SITES_WWW/$d" ]] || fail "cartella di $d ancora presente"
   id "site_${d//./_}" >/dev/null 2>&1 && fail "utente di $d ancora presente"
   # site_redis_purge: un sito ricreato con lo stesso dominio non deve trovare la cache di questo.
@@ -408,9 +408,8 @@ for d in "$D1" "$D2"; do
   [[ -z "$left" ]] || fail "chiavi Redis di $d rimaste dopo l'eliminazione: $(head -n 5 <<<"$left")"
 done
 tarf="$(compgen -G "$SITES_BACKUPS/$D1-*.tar.gz" | head -n1)"
-[[ "$(tar -tzf "$tarf")" == *"$D1/wp-config.php"* ]] || fail "wp-config.php non è nell'archivio"
-sqlf="$(compgen -G "$SITES_BACKUPS/$D1-*.sql.gz" | head -n1)"
-[[ "$(zcat "$sqlf")" == *wp_options* ]] || fail "il dump non contiene le tabelle di WordPress"
+[[ "$(tar -xzOf "$tarf" files.tar.gz | tar -tz)" == *"wp-config.php"* ]] || fail "wp-config.php non è nell'archivio"
+[[ "$(tar -xzOf "$tarf" db.sql.gz | zcat)" == *wp_options* ]] || fail "il dump non contiene le tabelle di WordPress"
 
 # Le password non finiscono mai nel registro degli strumenti.
 for v in WPPASS DBPASS DBPASS2; do

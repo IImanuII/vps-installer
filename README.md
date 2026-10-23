@@ -44,7 +44,7 @@ sudo vps-panel-update      # poi, per ogni nuovo rilascio
 Su una VPS installata con una versione precedente alla 1.1, prima:
 
 ```bash
-curl -fsSLO https://github.com/IImanuII/vps-installer/releases/download/v1.6.1/install.sh
+curl -fsSLO https://github.com/IImanuII/vps-installer/releases/download/v1.7.0/install.sh
 sudo bash install.sh --tools-only
 ```
 
@@ -113,6 +113,9 @@ Da terminale: `sudo /opt/vps/bin/vps-monitor status` (stato in JSON) e
 - End-to-end dei siti (WSL, root): `sudo bash tests/e2e/site-e2e.sh`.
 - End-to-end di WordPress (WSL, root, serve internet): `sudo bash tests/e2e/wp-e2e.sh`
   (Redis con ACL e WP-CLI veri; `redis.conf` torna com'era alla fine).
+- End-to-end dei backup (WSL, root, installa `rclone` se manca): `sudo bash tests/e2e/backup-e2e.sh`
+  (rclone vero con un remote locale al posto di Drive, sito vero, giro, ripristino,
+  ricreazione da archivio).
 - Spec v1.1: [docs/specs/2026-10-11-vps-installer-v1.1-design.md](docs/specs/2026-10-11-vps-installer-v1.1-design.md)
 
 ## File manager
@@ -126,3 +129,28 @@ collegamenti simbolici non si seguono mai e gli zip malevoli (percorsi con `..` 
 assoluti, collegamenti, bombe) sono rifiutati. L'installer aggiunge i pacchetti `zip`
 e `unzip`, e con `--tools-only` aggiunge `fastcgi_read_timeout 150s` al vhost del
 pannello (le operazioni durano fino a 120 s). Contratto in `docs/PANEL-HANDOFF.md`.
+
+## Backup
+
+Dalla 1.7.0 `vps-backup` (che il pannello esegue con sudo) salva ogni notte un archivio
+per sito e il database del pannello su Google Drive (`rclone` dal pacchetto Debian,
+scope `drive.file`, token in `/opt/vps/secrets/rclone.conf` root 600), tiene le ultime 3
+copie, ripristina file, database o tutto con una copia di sicurezza (`backups/restore/`,
+7 giorni) e ricrea i siti eliminati: `vps-site create DOMINIO --from-backup NOME` riparte
+da un archivio locale (`sites/FILE`) o da Drive (`remote:dominio/file`), senza reinstallare
+WordPress. L'archivio del sito eliminato (`backups/sites/`, 30 giorni) ha lo stesso
+formato dei backup notturni; quelli fatti prima della 1.7.0 si possono solo scaricare.
+Il timer `vps-backup.timer` resta spento finché il backup non è attivato da Plancia
+(ora predefinita 04:00). Contratto in `docs/PANEL-HANDOFF.md`.
+
+Da sapere:
+
+- Un ripristino interrotto (processo ucciso, riavvio) lascia in `tmp/` del sito gli avanzi
+  `.vpsbackup-old.*`, `.vpsbackup-x.*` e `.vpsbackup-c.*` e la copia di sicurezza in
+  `backups/restore/`; gli avanzi di oltre 24 ore si tolgono da soli all'inizio del
+  ripristino o del giro successivo, il sito non si ripara da solo.
+- Il database di un archivio si carica con l'utente del sito (mai root, `--sandbox`): un
+  archivio manomesso da chi può scrivere su Drive non diventa root, ma potrebbe cambiare
+  la password del database di quel sito. Rischio accettato.
+- Il ripristino non tocca mai `wp-config.php`; un sito ricreato ne riceve uno nuovo, con
+  credenziali nuove e tabelle col prefisso `wp_`.

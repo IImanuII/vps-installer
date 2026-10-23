@@ -214,7 +214,7 @@ bk_archive() {
 # risale, quindi passa dal file LAVORO/err).
 _bk_archive_in() {
   local d="$1" out="$2" w="$3" parts="${4:-all}" info slug root rc=0 type login hasdb www first
-  info="$(fm_site_check "$d" 2>&1)" || {
+  info="$(fm_site_check "$d" "deleting creating" 2>&1)" || {
     printf '%s\n' "$info" >"$w/err"
     return 1
   }
@@ -982,6 +982,7 @@ _bk_one_site() {
     return 1
   fi
   bk_prune_site_tmp "$slug" "$(site_root "$d")"
+  if [[ "$(site_reg_get "$d" .db 2>/dev/null || true)" == true ]]; then _bk_db_tmp_clean "$slug"; fi
   if ! size="$(_bk_site_size "$d")"; then
     bk_site_unlock
     _bk_add_site "$d" false "dimensione del sito non leggibile"
@@ -1430,6 +1431,40 @@ bk_remote_fetch() {
   fi
 }
 
+# bk_remote_manifest NOME — manifest.json di una copia su Drive (NOME = dominio/file) in
+# _BK_MANIFEST, senza scaricarla tutta: il manifest è il primo membro dell'archivio, quindi
+# bastano i primi 256 KiB (tar estrae il primo membro anche da un gzip troncato). Serve
+# a `vps-site create --from-backup` per configurare il sito prima del lavoro lungo.
+# BK_ERR e 1 se non si riesce. Non si fida del contenuto: chi chiama lo controlla.
+_BK_MANIFEST=""
+bk_remote_manifest() {
+  local name="${1-}" folder w
+  _BK_MANIFEST=""
+  bk_remote_parse "$name" || {
+    BK_ERR="nome della copia non valido"
+    return 1
+  }
+  _bk_remote_init || return 1
+  folder="$(jq -r .folder <<<"$(bk_config_json)")"
+  w="$(bk_tmp_dir)" || {
+    BK_ERR="cartella temporanea non disponibile"
+    return 1
+  }
+  if ! _bk_nolock timeout 300 "${_BK_RC[@]}" cat --count 262144 "gdrive:$folder/$_BK_RD/$_BK_RF" >"$w/head" 2>"$w/err" </dev/null; then
+    BK_ERR="Google Drive non risponde: $(bk_clean_msg "$(cat "$w/err" 2>/dev/null || true)")"
+    rm -rf -- "$w"
+    return 1
+  fi
+  tar -xzOf "$w/head" manifest.json >"$w/m.json" 2>/dev/null || true
+  if ! jq -e 'type == "object"' "$w/m.json" >/dev/null 2>&1; then
+    BK_ERR="manifest della copia non leggibile (non è una copia nel formato nuovo?)"
+    rm -rf -- "$w"
+    return 1
+  fi
+  _BK_MANIFEST="$(cat "$w/m.json")"
+  rm -rf -- "$w"
+}
+
 # --- ripristino --------------------------------------------------------------------
 
 # Script eseguiti come utente del sito (sh di Debian, niente bash). L'area di
@@ -1630,7 +1665,8 @@ _bk_swap_files() {
       return 1
       ;;
     4)
-      BK_ERR="scambio dei file non riuscito e qualcosa NON è tornato al suo posto: il contenuto di prima è in $root/$old, quello arrivato dalla copia in $root/$_BK_STAGE; usa la copia di sicurezza ${_BK_SAFETY##*/}"
+      # l'area di estrazione viene tolta subito dopo: non si indica come luogo dei file
+      BK_ERR="scambio dei file non riuscito e qualcosa NON è tornato al suo posto: il contenuto di prima è in $root/$old e in public/ può esserci una parte dei file della copia; usa la copia di sicurezza ${_BK_SAFETY##*/}"
       _BK_R_NOTE=hard
       return 1
       ;;
@@ -1655,7 +1691,7 @@ _bk_files_undo() {
     _BK_OLD=""
     return 0
   fi
-  BK_ERR="$BK_ERR; i file di prima NON sono tornati in public/: sono in $2/$_BK_OLD (e il contenuto nuovo in $2/$_BK_OLD.new); usa la copia di sicurezza ${_BK_SAFETY##*/}"
+  BK_ERR="$BK_ERR; i file di prima NON sono tornati tutti in public/: sono in $2/$_BK_OLD (una parte dei file nuovi può essere ancora in public/, il resto in $2/$_BK_OLD.new); usa la copia di sicurezza ${_BK_SAFETY##*/}"
   _BK_R_NOTE=hard
   return 1
 }
@@ -2006,13 +2042,17 @@ _bk_restore_do() {
 # state.json, manda sempre un messaggio Telegram. Stampa il riepilogo JSON; 0 se
 # riuscito, 1 altrimenti (anche se non è potuto partire).
 bk_restore_run() {
-  local src="${1-}" d="${2-}" name="${3-}" mode="${4-}" info slug root lrc=0 ok=true label text alert fin bdate
+  local src="${1-}" d="${2-}" name="${3-}" mode="${4-}" info slug root lrc=0 ok=true label text alert fin bdate extra
   _BK_R_DOM="$d"
   if [[ "$src" != local && "$src" != remote ]] || [[ ! "$mode" =~ ^(all|db|files)$ ]]; then
     printf '{"ok":false,"error":"argomenti non validi"}\n'
     return 1
   fi
-  info="$(fm_site_check "$d" 2>&1)" || {
+  # Un sito ricreato da una copia (vps-site create --from-backup) è ancora "creating"
+  # quando parte il ripristino, che è l'ultimo passo della sua creazione.
+  extra=""
+  if [[ "$(site_reg_get "$d" '.from_backup != null' 2>/dev/null || true)" == true ]]; then extra=creating; fi
+  info="$(fm_site_check "$d" "$extra" 2>&1)" || {
     jq -nc --arg e "$info" '{ok: false, error: $e}'
     return 1
   }
@@ -2046,6 +2086,9 @@ bk_restore_run() {
   [[ -n "$_BK_LAST_RESTORE" ]] || _BK_LAST_RESTORE='null'
   _bk_rprogress start
   bk_prune_site_tmp "$slug" "$root"
+  # avanzi di una prova uccisa a metà (utente e database temporanei): via anche se
+  # questo ripristino non toccherà il database
+  if [[ "$(site_reg_get "$d" .db 2>/dev/null || true)" == true ]]; then _bk_db_tmp_clean "$slug"; fi
   log "vps-backup: ripristino di $d ($mode) da $src ${name//[^[:print:]]/?}"
 
   _bk_restore_do "$src" "$d" "$name" "$mode" "$slug" "$root" || ok=false

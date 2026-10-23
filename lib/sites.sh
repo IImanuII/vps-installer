@@ -12,6 +12,7 @@
 : "${PHP_POOL_D:=/etc/php/$PHP_VERSION/fpm/pool.d}"
 : "${LOGROTATE_D:=/etc/logrotate.d}"
 : "${VPS_SITE_SELF:=$VPS_OPT/bin/vps-site}"
+: "${VPS_BACKUP_SELF:=$VPS_OPT/bin/vps-backup}"
 
 # site_slug DOMINIO — nome di utente, gruppo, database e utente DB del sito.
 # Linux accetta al massimo 32 caratteri: oltre, si tronca e si aggiunge un pezzo
@@ -523,8 +524,152 @@ site_create_step() {
       ;;
     wp) site_wp_install_files "$2" "$3" ;;
     plugins) site_wp_plugins "$2" ;;
+    wpcfg) site_fb_wpcfg "$2" "$3" ;;
     *) return 1 ;;
   esac
+}
+
+# --- sito ricreato da una copia (vps-site create D --from-backup NOME) ---------------
+
+# site_fb_load DOMINIO NOME — NOME è "sites/<file>" o "restore/<file>" (una copia locale,
+# come la elenca list-local) oppure "remote:dominio/file" (Drive). Legge il manifest e
+# imposta FB_SRC (local|remote), FB_NAME (come lo vuole `vps-backup _restore`), FB_TYPE,
+# FB_WWW e FB_DB (yes|no), FB_LOGIN (percorso di login WordPress). Restituisce 1 con il
+# motivo in FB_ERR. Il manifest non è autenticato (sta nell'archivio, come i checksum):
+# qui serve solo a configurare il sito nuovo, e ogni valore si controlla; l'archivio
+# vero lo controlla `_restore` (bk_verify) prima di toccare qualcosa.
+# shellcheck disable=SC2034 # le variabili FB_* le legge vps-site
+site_fb_load() {
+  local d="$1" nome="$2" path m mdom
+  FB_ERR="" FB_SRC="" FB_NAME="" FB_TYPE="" FB_WWW="" FB_DB="" FB_LOGIN=""
+  if [[ "$nome" == remote:* ]]; then
+    FB_SRC=remote
+    FB_NAME="${nome#remote:}"
+    if ! bk_remote_parse "$FB_NAME" || [[ "$_BK_RD" == _pannello ]]; then
+      FB_ERR="nome della copia non valido: usa remote:dominio/file"
+      return 1
+    fi
+    if [[ "$_BK_RD" != "$d" ]]; then
+      FB_ERR="la copia è di $_BK_RD, non di $d"
+      return 1
+    fi
+    BK_ERR=""
+    bk_remote_manifest "$FB_NAME" || {
+      FB_ERR="${BK_ERR:-manifest della copia non leggibile}"
+      return 1
+    }
+    m="$_BK_MANIFEST"
+  else
+    FB_SRC=local
+    FB_NAME="$nome"
+    if ! bk_local_parse "$nome" || [[ "$_BK_LK" == panel || "$_BK_LF" != *.tar.gz ]]; then
+      FB_ERR="nome della copia non valido: usa sites/FILE o restore/FILE (come in list-local) o remote:dominio/file"
+      return 1
+    fi
+    if [[ "$_BK_LD" != "$d" ]]; then
+      FB_ERR="la copia è di $_BK_LD, non di $d"
+      return 1
+    fi
+    path="$(bk_local_path "$nome")" || {
+      FB_ERR="copia non trovata: $nome"
+      return 1
+    }
+    if [[ "$(tar -tzf "$path" 2>/dev/null | head -n1 || true)" != manifest.json ]]; then
+      FB_ERR="copia nel formato vecchio, senza manifest: non si può ricreare il sito da qui"
+      return 1
+    fi
+    m="$(bk_manifest "$path")" || m=""
+  fi
+  if ! jq -e 'type == "object"' <<<"$m" >/dev/null 2>&1; then
+    FB_ERR="manifest della copia non leggibile"
+    return 1
+  fi
+  mdom="$(jq -r '.domain // ""' <<<"$m")"
+  if [[ "$mdom" != "$d" ]]; then
+    FB_ERR="la copia è del sito ${mdom:-sconosciuto}, non di $d"
+    return 1
+  fi
+  FB_TYPE="$(jq -r '.type // ""' <<<"$m")"
+  if ! in_list "$FB_TYPE" static php wordpress; then
+    FB_ERR="tipo di sito non valido nella copia"
+    return 1
+  fi
+  FB_WWW="$(jq -r 'if .www == true then "yes" else "no" end' <<<"$m")"
+  FB_DB="$(jq -r 'if ((.sha256.db // "") | type) == "string" and (.sha256.db // "") != "" then "yes" else "no" end' <<<"$m")"
+  if [[ "$FB_TYPE" == static && "$FB_DB" == yes ]] || [[ "$FB_TYPE" == wordpress && "$FB_DB" == no ]]; then
+    FB_ERR="la copia non è coerente: tipo $FB_TYPE e database $FB_DB"
+    return 1
+  fi
+  if [[ "$FB_TYPE" == wordpress ]]; then
+    FB_LOGIN="$(jq -r '.login_path // ""' <<<"$m")"
+    site_wp_valid_path "$FB_LOGIN" || {
+      FB_ERR="percorso di login WordPress non valido nella copia"
+      return 1
+    }
+  fi
+}
+
+# site_fb_wpcfg DOMINIO DB_PASSWORD — passo "wpcfg": per un WordPress ricreato da una copia
+# niente download né installazione (i file arrivano dal ripristino): servono l'utente
+# Redis e un wp-config.php nuovi, con credenziali nuove. Quello dell'archivio non si
+# ripristina mai.
+site_fb_wpcfg() {
+  local redis_pw
+  redis_pw="$(rand_secret 48)"
+  site_wp_config_write "$1" "$2" "$redis_pw" || return 1
+  site_redis_user_add "$1" "$redis_pw"
+}
+
+# site_fb_restore DOMINIO — passo "restore": file e database dalla copia, con lo stesso
+# codice del ripristino della pagina Backup (`vps-backup _restore`, un processo a parte:
+# prende i suoi lock e manda il suo messaggio Telegram). Il sito nuovo e la copia devono
+# coincidere sul database: tutto, altrimenti solo i file.
+site_fb_restore() {
+  local d="$1" src name mode out rc=0 err st
+  src="$(site_reg_get "$d" .from_backup.source)"
+  name="$(site_reg_get "$d" .from_backup.name)"
+  mode=files
+  [[ "$(site_reg_get "$d" .db)" != true ]] || mode=all
+  out="$("$VPS_BACKUP_SELF" _restore "$src" "$d" "$name" "$mode" 2>>"$VPS_LOG")" || rc=$?
+  ((rc == 0)) && return 0
+  err="$(jq -r '.error // empty' <<<"$out" 2>/dev/null | head -n1 || true)"
+  st="${BK_STATE:-$VPS_OPT/backup/state.json}"
+  if [[ -z "$err" && -f "$st" ]]; then
+    err="$(jq -r '.last_restore.error // empty' "$st" 2>/dev/null | head -n1 || true)"
+  fi
+  site_fail "${err:-ripristino non riuscito (dettagli in $VPS_LOG)}"
+  return 1
+}
+
+# site_fb_settle DOMINIO — un WordPress ricreato diventa tale nel registro, con il suo
+# vhost e il cron. Si fa anche se il ripristino è fallito: il sito esiste, e un
+# ripristino fatto dopo dalla pagina Backup deve trovarlo già a posto.
+site_fb_settle() {
+  local d="$1"
+  [[ "$(site_reg_get "$d" .type)" == wordpress ]] || return 0
+  site_reg_update "$d" '.wordpress = {login_path: $p, admin_user: null, cloudflare_plugin: false, installed_at: $at}' \
+    --arg p "$(site_reg_get "$d" '.from_backup.login_path // ""')" --arg at "$(date -Iseconds)" || return 1
+  site_vhost_add "$d" normal || return 1
+  site_wp_cron_add "$d"
+}
+
+# site_job_restore DOMINIO — ultimo passo di una creazione da copia. Se il ripristino
+# non riesce il sito resta com'è (attivo e vuoto, come uno appena creato): il motivo va
+# in job.error e il ripristino si può rifare dalla pagina Backup.
+site_job_restore() {
+  local d="$1" msg
+  if ! site_step "$d" create restore site_fb_restore "$d"; then
+    msg="$(site_error_text restore)"
+    (site_fb_settle "$d") || log "ATTENZIONE: configurazione WordPress di $d non completata"
+    site_reg_update "$d" '.state = "active"'
+    site_job "$d" create restore "sito creato ma vuoto, ripristino non riuscito: $msg"
+    return 1
+  fi
+  if ! (site_fb_settle "$d"); then
+    site_reg_update "$d" '.state = "active"'
+    site_job "$d" create restore "file e database ripristinati, ma la configurazione di WordPress non è completa (dettagli in $VPS_LOG)"
+    return 1
+  fi
 }
 
 # site_undo_create DOMINIO PASSO... — disfa i passi tentati, dall'ultimo al primo.
@@ -552,15 +697,16 @@ site_undo_create() {
 }
 
 site_job_create() {
-  local d="$1" slug type pass="" step msg
+  local d="$1" slug type pass="" step msg fb=false
   local steps=(dns user) tried=()
   slug="$(site_reg_get "$d" .slug)"
   type="$(site_reg_get "$d" .type)"
+  [[ "$(site_reg_get "$d" '.from_backup != null')" != true ]] || fb=true
   if [[ "$(site_reg_get "$d" .db)" == true ]]; then
     pass="$(cat "$SITES_RUN/$slug.pass" 2>/dev/null || true)"
     rm -f "$SITES_RUN/$slug.pass"
   fi
-  if [[ "$type" == wordpress ]]; then
+  if [[ "$type" == wordpress && "$fb" == false ]]; then
     # Letti (e cancellati) subito: la password admin non resta in /run se il
     # lavoro si ferma prima. WordPress senza database non esiste.
     if ! site_wp_args_read "$d" || [[ "$(site_reg_get "$d" .db)" != true ]]; then
@@ -577,7 +723,12 @@ site_job_create() {
   [[ "$type" != php && "$type" != wordpress ]] || steps+=(php)
   steps+=(cert nginx)
   [[ "$(site_reg_get "$d" .db)" != true ]] || steps+=(db)
-  [[ "$type" != wordpress ]] || steps+=(wp plugins)
+  if [[ "$type" == wordpress && "$fb" == true ]]; then
+    # niente WordPress da installare: solo wp-config.php e utente Redis nuovi
+    steps+=(wpcfg)
+  elif [[ "$type" == wordpress ]]; then
+    steps+=(wp plugins)
+  fi
   for step in "${steps[@]}"; do
     tried+=("$step")
     if ! site_step "$d" create "$step" site_create_step "$step" "$d" "$pass"; then
@@ -589,6 +740,9 @@ site_job_create() {
     fi
   done
   (site_logrotate_add "$d") || log "ATTENZIONE: rotazione dei log di $d non configurata"
+  # Da copia: il sito esiste, un errore del ripristino non lo disfa (site_job_restore).
+  # Resta "creating" finché finisce: il pannello lo vede come una creazione.
+  if [[ "$fb" == true ]]; then site_job_restore "$d" || return 1; fi
   # Stato e lavoro in una sola scrittura: il pannello non deve mai vedere un
   # sito attivo con il lavoro ancora a metà.
   site_reg_update "$d" \
@@ -596,32 +750,25 @@ site_job_create() {
     --arg at "$(date -Iseconds)" --arg ts "$(date +%s)"
 }
 
-# site_archive DOMINIO — file e dump del sito in SITES_BACKUPS (root 600). Se
-# qualcosa non va non resta un archivio a metà e si restituisce errore.
+# site_archive DOMINIO — l'archivio finale del sito in SITES_BACKUPS (root 600), nello
+# stesso formato delle copie notturne (lib/backup.sh: manifest.json, files.tar.gz con
+# public/ e wp-config.php, db.sql.gz): da lì si può ricreare il sito. Se qualcosa non
+# va non resta un archivio a metà e si restituisce errore. Prima si controlla lo
+# spazio: un disco pieno non deve far perdere un sito che si sta eliminando.
 site_archive() {
-  local d="$1" slug base ok=1 rc=0
-  slug="$(site_reg_get "$d" .slug)"
-  base="$SITES_BACKUPS/$d-$(date +%Y%m%d-%H%M%S)"
-  install -d -m 700 "$SITES_BACKUPS" || return 1
-  # tar esce 1 se un file cambia mentre lo legge (i log di un sito vivo
-  # crescono): l'archivio è buono. Solo 2 o più è un errore vero.
-  (
-    umask 077
-    tar --warning=no-file-changed -czf "$base.tar.gz" -C "$SITES_WWW" "$d"
-  ) >>"$VPS_LOG" 2>&1 || rc=$?
-  ((rc <= 1)) || ok=0
-  if ((ok)) && [[ "$(site_reg_get "$d" .db)" == true ]]; then
-    (
-      umask 077
-      set -o pipefail
-      mariadb-dump --single-transaction "$slug" | gzip >"$base.sql.gz"
-    ) 2>>"$VPS_LOG" || ok=0
+  local d="$1" out size
+  out="$SITES_BACKUPS/$d-$(date +%Y%m%d-%H%M%S).tar.gz"
+  install -d -m 700 "$SITES_BACKUPS" "$BK_BACKUPS" "$BK_BACKUPS/tmp" || return 1
+  if ! size="$(_bk_site_size "$d")" || ! bk_space_ok "$SITES_BACKUPS" "$size" || ! bk_space_ok "$BK_BACKUPS/tmp" "$size"; then
+    site_fail "archivio di $d non riuscito: spazio insufficiente o dimensione non leggibile, niente è stato cancellato"
+    return 1
   fi
-  if ((ok)); then
+  # BK_ERR: bk_archive dice perché (tar esce 1 per un file cambiato mentre lo legge:
+  # è un successo, lo gestisce lui).
+  if bk_archive "$d" "$out"; then
     return 0
   fi
-  rm -f "$base.tar.gz" "$base.sql.gz"
-  site_fail "archivio di $d non riuscito: niente è stato cancellato (dettagli in $VPS_LOG)"
+  site_fail "archivio di $d non riuscito (${BK_ERR:-errore}): niente è stato cancellato (dettagli in $VPS_LOG)"
 }
 
 # site_job_delete DOMINIO — archivio (salvo un sito in errore: c'è solo da
@@ -734,6 +881,7 @@ site_run() {
   if [[ "$op" == create && "$state" != creating ]] || [[ "$op" == delete && "$state" != deleting ]] \
     || [[ "$op" == wpinstall && "$state" != installing ]]; then
     exec 9>&-
+    bk_site_unlock
     log "vps-site _run: $d è in stato $state, $op ignorato"
     site_run_files_clean "$op" "$d"
     return 1

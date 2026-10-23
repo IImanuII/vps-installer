@@ -8,10 +8,12 @@
 # Umask dei file creati: 002, come in sites_wp.sh (file 664, cartelle 775): restano
 # modificabili dall'admin del gruppo e dal sito, come via SFTP.
 
-# fm_site_check DOMINIO — stampa "slug radice"; 1 con messaggio se il sito non
-# esiste nel registro di vps-site o non è in stato active|disabled.
+# fm_site_check DOMINIO [STATI_IN_PIU] — stampa "slug radice"; 1 con messaggio se il
+# sito non esiste nel registro di vps-site o non è in stato active|disabled (o uno
+# di STATI_IN_PIU, separati da spazio: l'archivio finale di un sito si fa mentre è
+# in "deleting", il ripristino di un sito ricreato da una copia mentre è "creating").
 fm_site_check() {
-  local d="${1-}" state slug
+  local d="${1-}" state slug extra="${2-}"
   if ! valid_domain "$d"; then
     echo "dominio non valido" >&2
     return 1
@@ -21,7 +23,7 @@ fm_site_check() {
     return 1
   fi
   state="$(site_reg_get "$d" .state)" || return 1
-  if [[ "$state" != active && "$state" != disabled ]]; then
+  if [[ "$state" != active && "$state" != disabled && ( -z "$extra" || " $extra " != *" $state "* ) ]]; then
     echo "il sito $d è in stato $state: riprova più tardi" >&2
     return 1
   fi
