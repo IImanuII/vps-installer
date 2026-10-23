@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# vps-pma-pass set — nuova password (da stdin) per la basic auth di phpMyAdmin.
+# vps-pma-pass set|dbadmin — nuova password (da stdin).
+#   set     basic auth di phpMyAdmin
+#   dbadmin password MariaDB di panel_dbadmin + DBADMIN_PASS in <pannello>/config/.env
 # Sotto sudo l'ambiente del chiamante non deve influenzare lo script.
 if [[ -n "${SUDO_USER:-}" ]]; then
   VPS_OPT=/opt/vps
   VPS_LIB=$VPS_OPT/lib
   VPS_TEMPLATES=$VPS_OPT/templates
   VPS_LOG=/var/log/vps-tools.log
-  unset MSMTPRC_LINK HTPASSWD_PMA ALIASES_FILE PMA_DIR NGINX_SNIPPETS CF_API CF_IPS_URL PMA_BASE_URL
+  unset MSMTPRC_LINK HTPASSWD_PMA ALIASES_FILE PMA_DIR NGINX_SNIPPETS CF_API CF_IPS_URL PMA_BASE_URL \
+    PD_LOCK VPS_PMA_LOCK_WAIT VPS_NO_CHOWN
   [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
   chmod 640 "$VPS_LOG"
 fi
@@ -18,12 +21,26 @@ for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
 done
 tool_init
 
-[[ "${1:-}" == set ]] || json_err "uso: vps-pma-pass set (password da stdin)"
+mode="${1:-}"
+[[ "$mode" == set || "$mode" == dbadmin ]] || json_err "uso: vps-pma-pass set|dbadmin (password da stdin)"
 pass="$(read_stdin_limited 257)"
 pass="${pass%$'\n'}"
 (($(printf '%s' "$pass" | wc -c) <= 72)) || json_err "password troppo lunga: massimo 72 caratteri"
 valid_password "$pass" || json_err "password non valida: minimo 12 caratteri, una riga"
-user="$(jq -r '.admin_user // empty' "$(manifest_path)")"
-valid_username "$user" || json_err "utente admin non valido nel manifest"
-printf '%s' "$pass" | pma_set_basic_auth "$user"
+
+if [[ "$mode" == set ]]; then
+  user="$(jq -r '.admin_user // empty' "$(manifest_path)")"
+  valid_username "$user" || json_err "utente admin non valido nel manifest"
+  printf '%s' "$pass" | pma_set_basic_auth "$user"
+  json_ok
+  exit 0
+fi
+
+# --- dbadmin -----------------------------------------------------------------
+# Il .env del pannello (e chi lo legge) taglia spazi e apici ai bordi del valore:
+# una password così verrebbe riletta diversa da quella messa in MariaDB.
+case "$pass" in
+  [[:space:]\'\"]* | *[[:space:]\'\"]) json_err "password non valida: non può iniziare o finire con spazio o apice" ;;
+esac
+pma_dbadmin_set "$pass"
 json_ok

@@ -69,6 +69,16 @@ read -rs T && printf '%s' "$T" | sudo /opt/vps/bin/vps-cf-token set; unset T
 
 `set` controlla che il token veda la zona del pannello e quelle di tutti i siti registrati prima di salvarlo.
 
+## Password di `panel_dbadmin`
+
+Per cambiarla (MariaDB e `DBADMIN_PASS` in `config/.env` insieme; se il `.env` non si aggiorna, MariaDB torna alla password di prima):
+
+```bash
+read -rs P && printf '%s' "$P" | sudo /opt/vps/bin/vps-pma-pass dbadmin; unset P
+```
+
+12-72 caratteri, una riga, senza spazio o apice all'inizio o in fondo. Nessun reload necessario.
+
 ## Avvisi e sorveglianza
 
 Dalla 1.5.0 `vps-monitor` gira come root ogni minuto (timer systemd

@@ -1,3 +1,5 @@
+bats_require_minimum_version 1.5.0
+
 setup() {
   load test_helper
   setup_common
@@ -197,4 +199,128 @@ pma_web_env() {
   run bash -c "set -Eeuo pipefail; export VPS_OPT='$VPS_OPT' VPS_LOG='$VPS_LOG' PMA_DIR='$BATS_TEST_TMPDIR/nessuno'; for f in '$REPO_ROOT'/lib/*.sh; do source \"\$f\"; done; p=\"\$(pma_controlpass_from_config)\"; echo \"[\$p]\""
   [ "$status" -eq 0 ]
   [ "$output" = "[]" ]
+}
+
+# --- vps-pma-pass dbadmin ---------------------------------------------------
+
+dbadmin_setup() {
+  export VPS_LIB="$REPO_ROOT/lib" PD_LOCK="$BATS_TEST_TMPDIR/panel.lock"
+  PROOT="$BATS_TEST_TMPDIR/www/panel.example.com"
+  mkdir -p "$PROOT/config"
+  jq -n --arg p "$PROOT" '{admin_user:"manu", panel:{domain:"panel.example.com", path:$p}}' >"$VPS_OPT/manifest.json"
+  printf '# conf\nDB_HOST=localhost\nDB_PASS=segretoDB\nDBADMIN_USER=panel_dbadmin\nDBADMIN_PASS=vecchiaPassword1\nAPP_KEY=abc=def\n' >"$PROOT/config/.env"
+  chmod 640 "$PROOT/config/.env"
+  # il vero mariadb: SQL su stdin; qui si registrano stdin e argomenti
+  make_stub mariadb 'cat >>"$BATS_TEST_TMPDIR/mariadb.stdin"; printf "%s\n" "$*" >>"$BATS_TEST_TMPDIR/mariadb.args"; exit "${STUB_MARIADB_RC:-0}"'
+  DBA="$REPO_ROOT/tools/vps-pma-pass"
+}
+
+@test "vps-pma-pass dbadmin: ALTER su stdin, .env aggiornato solo in DBADMIN_PASS" {
+  dbadmin_setup
+  run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"ok":true}' ]
+  grep -q "ALTER USER 'panel_dbadmin'@'localhost' IDENTIFIED BY 'NuovaPassword-123'" "$BATS_TEST_TMPDIR/mariadb.stdin"
+  run ! grep -q 'NuovaPassword' "$BATS_TEST_TMPDIR/mariadb.args"
+  [ "$(env_get "$PROOT/config/.env" DBADMIN_PASS)" = 'NuovaPassword-123' ]
+  [ "$(env_get "$PROOT/config/.env" APP_KEY)" = 'abc=def' ]
+  [ "$(env_get "$PROOT/config/.env" DB_PASS)" = segretoDB ]
+  [ "$(head -1 "$PROOT/config/.env")" = '# conf' ]
+  [ "$(stat -c %a "$PROOT/config/.env")" = 640 ]
+  run ! grep -q 'NuovaPassword' "$VPS_LOG"
+  run compgen -G "$PROOT/config/.tmp.*"
+  [ "$status" -ne 0 ]
+}
+
+@test "vps-pma-pass dbadmin: apice e backslash escapati nell'SQL, scritti interi nel .env" {
+  dbadmin_setup
+  pw="a'b\c\"d#e f%g\$h&i"
+  PW="$pw" run bash -c "printf '%s' \"\$PW\" | bash '$DBA' dbadmin"
+  [ "$status" -eq 0 ]
+  grep -qF "IDENTIFIED BY 'a''b\\\\c\"d#e f%g\$h&i';" "$BATS_TEST_TMPDIR/mariadb.stdin"
+  [ "$(env_get "$PROOT/config/.env" DBADMIN_PASS)" = "$pw" ]
+}
+
+@test "vps-pma-pass dbadmin: ALTER fallito lascia il .env intatto" {
+  dbadmin_setup
+  cp "$PROOT/config/.env" "$BATS_TEST_TMPDIR/env.prima"
+  STUB_MARIADB_RC=1 run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .ok <<<"${lines[-1]}")" = false ]
+  cmp "$PROOT/config/.env" "$BATS_TEST_TMPDIR/env.prima"
+  [[ "$output" != *NuovaPassword* ]]
+  run ! grep -q 'NuovaPassword' "$VPS_LOG"
+}
+
+@test "vps-pma-pass dbadmin: .env non scrivibile, password MariaDB rimessa come prima" {
+  dbadmin_setup
+  cp "$PROOT/config/.env" "$BATS_TEST_TMPDIR/env.prima"
+  make_stub mv 'exit 1'
+  run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .ok <<<"${lines[-1]}")" = false ]
+  [ "$(grep -c '^ALTER USER' "$BATS_TEST_TMPDIR/mariadb.stdin")" = 2 ]
+  tail -1 "$BATS_TEST_TMPDIR/mariadb.stdin" | grep -q "IDENTIFIED BY 'vecchiaPassword1'"
+  cmp "$PROOT/config/.env" "$BATS_TEST_TMPDIR/env.prima"
+  [[ "$output" != *NuovaPassword* ]]
+  run ! grep -q 'NuovaPassword' "$VPS_LOG"
+}
+
+@test "vps-pma-pass dbadmin: password di 11 caratteri, con a capo, troppo lunga o con apici ai bordi" {
+  dbadmin_setup
+  run bash -c "printf '%s' 'undici-chars' | head -c 11 | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"12 caratteri"* ]]
+  run bash -c "printf 'prima-riga-lunga\nseconda' | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  run bash -c "printf '%073d' 1 | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  run bash -c "printf '%s' \"'apicePerBordo123\" | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  run bash -c "printf '%s' 'spazioInFondo123 ' | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  [ ! -e "$BATS_TEST_TMPDIR/mariadb.stdin" ]
+}
+
+@test "vps-pma-pass dbadmin: .env mancante o pannello assente nel manifest" {
+  dbadmin_setup
+  rm "$PROOT/config/.env"
+  run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  [ ! -e "$BATS_TEST_TMPDIR/mariadb.stdin" ]
+  jq -n '{admin_user:"manu"}' >"$VPS_OPT/manifest.json"
+  run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  [ ! -e "$BATS_TEST_TMPDIR/mariadb.stdin" ]
+}
+
+@test "vps-pma-pass dbadmin: aggiunge DBADMIN_PASS se manca" {
+  dbadmin_setup
+  printf 'DB_HOST=localhost\n' >"$PROOT/config/.env"
+  run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  [ "$status" -eq 0 ]
+  [ "$(env_get "$PROOT/config/.env" DBADMIN_PASS)" = 'NuovaPassword-123' ]
+  [ "$(env_get "$PROOT/config/.env" DB_HOST)" = localhost ]
+}
+
+@test "vps-pma-pass dbadmin: un altro processo tiene il lock, nessuna modifica" {
+  dbadmin_setup
+  exec 8>"$PD_LOCK"
+  flock -n 8
+  VPS_PMA_LOCK_WAIT=1 run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  exec 8>&-
+  [ "$status" -eq 1 ]
+  [ ! -e "$BATS_TEST_TMPDIR/mariadb.stdin" ]
+}
+
+@test "vps-pma-pass: uso senza set né dbadmin" {
+  dbadmin_setup
+  run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' altro"
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"set|dbadmin"* ]]
+}
+
+@test "sudoers: vps-pma-pass (set e dbadmin) è consentito al pannello" {
+  grep -q '^panel ALL=(root) NOPASSWD:.*/opt/vps/bin/vps-pma-pass\(,\|$\)' "$REPO_ROOT/templates/sudoers-vps-panel"
+  run ! grep -q 'vps-pma-pass [a-z]' "$REPO_ROOT/templates/sudoers-vps-panel"
 }

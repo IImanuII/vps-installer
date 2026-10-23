@@ -104,3 +104,43 @@ pma_set_basic_auth() {
   own root:www-data "$HTPASSWD_PMA"
   chmod 640 "$HTPASSWD_PMA"
 }
+
+# _pma_dbadmin_alter PASSWORD — ALTER USER come root dal socket. L'SQL passa da
+# stdin (la password non finisce mai negli argomenti di processo) e l'output di
+# mariadb, che nei messaggi d'errore può citare l'SQL, si registra ripulito.
+_pma_dbadmin_alter() {
+  local out rc=0
+  out="$(printf "ALTER USER 'panel_dbadmin'@'localhost' IDENTIFIED BY %s;\n" "$(sql_quote "$1")" | mariadb 2>&1)" || rc=$?
+  ((rc == 0)) && return 0
+  out="${out//"$1"/***}"
+  log "mariadb (ALTER USER panel_dbadmin) non riuscito: ${out:0:300}"
+  return 1
+}
+
+# pma_dbadmin_set PASSWORD — cambia la password di panel_dbadmin in MariaDB e
+# DBADMIN_PASS nel .env del pannello (radice dal manifest). Valore scritto grezzo,
+# come lo scrive l'installer; la riga viene aggiunta se manca. Il pannello non legge
+# DBADMIN_* (Config::CHIAVI): nessun reload di PHP-FPM necessario.
+pma_dbadmin_set() {
+  local new="$1" m root env old owner mode
+  m="$(manifest_path)"
+  [[ -f "$m" ]] || die "Manifest $m mancante: la VPS non è stata preparata da vps-installer"
+  root="$(jq -r '.panel.path // empty' "$m")"
+  [[ -n "$root" ]] || die "Il manifest non ha un pannello (panel.path)"
+  env="$root/config/.env"
+  [[ -f "$env" && ! -L "$env" ]] || die "File $env mancante: password non cambiata"
+  # stesso lock di vps-panel-update/install, che riscrivono questo .env
+  exec 9>"${PD_LOCK:-/run/vps-panel-update.lock}" || die "Lock del pannello non apribile"
+  flock -w "${VPS_PMA_LOCK_WAIT:-30}" 9 || die "Un aggiornamento del pannello è in corso: riprova tra poco"
+  old="$(env_get "$env" DBADMIN_PASS)"
+  owner="$(stat -c '%U:%G' "$env")"
+  mode="$(stat -c '%a' "$env")"
+  _pma_dbadmin_alter "$new" || die "password di panel_dbadmin non cambiata (dettagli in $VPS_LOG)"
+  if ! printf 'DBADMIN_PASS=%s\n' "$new" | env_merge "$env" "$mode" "$owner" 2>>"$VPS_LOG"; then
+    # .env invariato: MariaDB torna alla password che il .env ancora contiene
+    if [[ -n "$old" ]] && _pma_dbadmin_alter "$old"; then
+      die "$env non scrivibile: password di panel_dbadmin rimasta quella di prima"
+    fi
+    die "ATTENZIONE: password di panel_dbadmin cambiata in MariaDB ma $env non aggiornato"
+  fi
+}
