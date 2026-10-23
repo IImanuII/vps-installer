@@ -9,7 +9,7 @@ if [[ -n "${SUDO_USER:-}" ]]; then
   VPS_LIB=$VPS_OPT/lib
   VPS_TEMPLATES=$VPS_OPT/templates
   VPS_LOG=/var/log/vps-tools.log
-  unset CF_API FM_RUNUSER SITES_DIR SITES_WWW
+  unset CF_API FM_RUNUSER SITES_DIR SITES_WWW BK_LOCK_DIR
   [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
   chmod 640 "$VPS_LOG"
 fi
@@ -420,6 +420,14 @@ esac
 info="$(fm_site_check "$dom" 2>&1)" || json_err "$info"
 slug="${info%% *}"
 root="${info#* }"
+
+# Un ripristino (o la copia notturna del sito) tiene il lock del sito: le scritture
+# aspettano, altrimenti si perderebbero o rovinerebbero il contenuto che sta arrivando.
+case "$cmd" in
+  write | mkdir | rename | move | copy | delete | zip | unzip)
+    if bk_site_locked "$slug"; then json_err "ripristino in corso (o copia del sito in corso): riprova tra poco"; fi
+    ;;
+esac
 
 p=""
 area=""

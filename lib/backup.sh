@@ -147,12 +147,19 @@ _bk_log_file() {
     "$(head -c 500 "$1" | LC_ALL=C tr -c '[:print:]' '?')" >>"$VPS_LOG" 2>/dev/null || true
 }
 
-# bk_archive DOMINIO OUT — scrive l'archivio del sito in OUT. Tutto si costruisce in
+# bk_archive DOMINIO OUT [PARTI] — scrive l'archivio del sito in OUT. Tutto si costruisce in
 # una cartella temporanea e si sposta in OUT solo a lavoro finito: se qualcosa
 # fallisce non resta nulla di ciò che questa chiamata ha creato (un OUT già esistente
 # non si tocca) e BK_ERR dice perché. Uscita 0/1.
+# PARTI (all|files|db, predefinito all) serve alla copia di sicurezza di un ripristino,
+# che salva solo ciò che si sta per sovrascrivere: la parte non salvata resta un
+# files.tar.gz vuoto (o senza db.sql.gz), che un ripristino di quella parte rifiuta.
 bk_archive() {
-  local d="${1-}" out="${2-}" w rc=0 existed=0
+  local d="${1-}" out="${2-}" parts="${3:-all}" w rc=0 existed=0
+  if [[ "$parts" != all && "$parts" != files && "$parts" != db ]]; then
+    BK_ERR="parti da salvare non valide"
+    return 1
+  fi
   BK_ERR=""
   if [[ -z "$out" ]]; then
     BK_ERR="percorso di destinazione mancante"
@@ -163,7 +170,7 @@ bk_archive() {
     BK_ERR="cartella temporanea non disponibile"
     return 1
   }
-  (umask 077 && _bk_archive_in "$d" "$out" "$w") || rc=$?
+  (umask 077 && _bk_archive_in "$d" "$out" "$w" "$parts") || rc=$?
   if ((rc)) && [[ -s "$w/err" ]]; then
     BK_ERR="$(head -n1 "$w/err")"
   fi
@@ -178,7 +185,7 @@ bk_archive() {
 # _bk_archive_in DOMINIO OUT LAVORO — corpo di bk_archive (in una subshell: BK_ERR non
 # risale, quindi passa dal file LAVORO/err).
 _bk_archive_in() {
-  local d="$1" out="$2" w="$3" info slug root rc=0 type login hasdb www first
+  local d="$1" out="$2" w="$3" parts="${4:-all}" info slug root rc=0 type login hasdb www first
   info="$(fm_site_check "$d" 2>&1)" || {
     printf '%s\n' "$info" >"$w/err"
     return 1
@@ -193,7 +200,7 @@ _bk_archive_in() {
   # public/ come utente del sito: root non segue mai link piazzati dal sito. Il tar
   # va su stdout rediretto a un file (niente pipe: alcune build le rifiutano). I link
   # restano link. Uscita 1 di tar = un file è cambiato mentre lo leggeva: va bene.
-  if [[ -d "$root/public" ]]; then
+  if [[ "$parts" != db && -d "$root/public" ]]; then
     fm_as_site "$slug" "$root" env LC_ALL=C.UTF-8 tar --warning=no-file-changed -cf - public \
       >"$w/files.tar" 2>"$w/tar.err" || rc=$?
     _bk_log_file "$w/tar.err" "tar di $d"
@@ -216,11 +223,11 @@ _bk_archive_in() {
 
   # wp-config.php è di root (640) fuori da public/: lo legge root direttamente, ma
   # mai se è un link (lo mette root, ma non si segue nulla per principio).
-  if [[ -L "$root/wp-config.php" ]]; then
+  if [[ "$parts" != db && -L "$root/wp-config.php" ]]; then
     echo "wp-config.php è un collegamento: sito non archiviato" >"$w/err"
     return 1
   fi
-  if [[ -f "$root/wp-config.php" ]]; then
+  if [[ "$parts" != db && -f "$root/wp-config.php" ]]; then
     LC_ALL=C.UTF-8 _bk_nolock tar --append --file="$w/files.tar" -C "$root" wp-config.php 2>"$w/tar2.err" || {
       _bk_log_file "$w/tar2.err" "wp-config.php di $d"
       echo "wp-config.php non aggiunto all'archivio" >"$w/err"
@@ -233,7 +240,7 @@ _bk_archive_in() {
   }
 
   local dbsha=""
-  if [[ "$hasdb" == true ]]; then
+  if [[ "$hasdb" == true && "$parts" != files ]]; then
     # dump su file, poi gzip: se il dump fallisce lo si sa dal suo codice di uscita
     _bk_nolock mariadb-dump --single-transaction --routines --events "$slug" >"$w/db.sql" 2>"$w/dump.err" || {
       _bk_log_file "$w/dump.err" "dump di $d"
@@ -249,11 +256,11 @@ _bk_archive_in() {
 
   jq -n --arg d "$d" --arg t "$type" --arg slug "$slug" --arg login "$login" \
     --arg www "$www" --arg db "$hasdb" --arg at "$(date -Iseconds)" \
-    --arg v "$VPS_INSTALLER_VERSION" \
+    --arg v "$VPS_INSTALLER_VERSION" --arg parts "$parts" \
     --arg fsha "$(sha256sum "$w/files.tar.gz" | cut -d' ' -f1)" --arg dsha "$dbsha" '
     {domain: $d, type: $t, www: ($www == "true"), db: ($db == "true"), slug: $slug,
      login_path: (if $login == "" then null else $login end), date: $at,
-     installer_version: $v,
+     installer_version: $v, parts: $parts,
      sha256: {files: $fsha, db: (if $dsha == "" then null else $dsha end)}}' >"$w/manifest.json" || {
     echo "manifest non scritto" >"$w/err"
     return 1
@@ -580,7 +587,8 @@ bk_status_json() {
   fi
   jq -nc --argjson c "$cfg" --argjson s "$state" --argjson d "$drive" --argjson conn "$conn" --argjson i "$interrupted" \
     '{ok: true, connected: $conn, folder: $c.folder, enabled: $c.enabled, time: $c.time,
-      job: ($s.job // null), interrupted: $i, last_run: ($s.last_run // null), drive: $d}'
+      job: ($s.job // null), interrupted: $i, last_run: ($s.last_run // null),
+      last_restore: ($s.last_restore // null), drive: $d}'
 }
 
 # bk_connect DATI_STDIN — riga 1: token JSON di `rclone authorize`; righe 2-3
@@ -742,10 +750,11 @@ bk_unlock_global() {
   fi
 }
 
-# bk_unit_alive — 0 se l'unità di un giro (a mano o del timer) sta girando o partendo.
+# bk_unit_alive — 0 se l'unità di un giro (a mano o del timer) o di un ripristino
+# sta girando o partendo.
 bk_unit_alive() {
   local out
-  out="$(systemctl is-active vps-backup-run.service vps-backup.service 2>/dev/null || true)"
+  out="$(systemctl is-active vps-backup-run.service vps-backup.service 'vps-backup-restore-*.service' 2>/dev/null || true)"
   grep -qE '^(active|activating|reloading|deactivating)$' <<<"$out"
 }
 
@@ -775,30 +784,45 @@ _BK_PURGED='[]'
 _BK_STARTED=""
 _BK_PREV_LAST='null'
 _BK_KNOWN='[]'
+_BK_RCRC=0
+_BK_LAST_RESTORE='null'
 
 # _bk_rcq ARGOMENTI... — rclone con stdout in _BK_OUT e messaggio d'errore ripulito
 # (una riga, senza token) in _BK_ERRMSG. Mai stdin dal terminale.
 _bk_rcq() {
-  local rc=0 ef="$BK_RUN_DIR/rc.err"
+  local rc=0 ef own=0
+  # Fuori da un giro (list-remote, read-remote) non c'è una cartella di lavoro: il
+  # file degli errori è un temporaneo che si toglie subito.
+  if [[ -n "$BK_RUN_DIR" ]]; then
+    ef="$BK_RUN_DIR/rc.err"
+  else
+    ef="$(mktemp)" || return 1
+    own=1
+  fi
   _BK_OUT="$(_bk_nolock "${_BK_RC[@]}" "$@" 2>"$ef" </dev/null)" || rc=$?
   _BK_ERRMSG=""
+  _BK_RCRC="$rc"
   if ((rc != 0)); then _BK_ERRMSG="$(bk_clean_msg "$(cat "$ef" 2>/dev/null || true)")"; fi
+  if ((own)); then rm -f -- "$ef"; fi
   return "$rc"
 }
 
-# _bk_state_write JOB LAST — state.json (600) con sostituzione atomica. `known` sono
+# _bk_state_write JOB LAST — state.json (600) con sostituzione atomica. L'esito
+# dell'ultimo ripristino (last_restore) sta nello stesso file: un giro non lo cancella.
+# `known` sono
 # i domini che questa installazione ha già salvato almeno una volta: solo quelli si
 # potranno eliminare da Drive (una VPS ricostruita non cancella le copie di altri).
 _bk_state_write() {
   install -d -m 700 "$BK_DIR" || return 1
-  jq -nc --argjson j "$1" --argjson l "$2" --argjson k "$_BK_KNOWN" '{job: $j, last_run: $l, known: $k}'     | write_file "$BK_STATE" 600 root:root
+  jq -nc --argjson j "$1" --argjson l "$2" --argjson k "$_BK_KNOWN" --argjson r "$_BK_LAST_RESTORE" \
+    '{job: $j, last_run: $l, known: $k, last_restore: $r}' | write_file "$BK_STATE" 600 root:root
 }
 
 # _bk_progress PASSO [DOMINIO] — il pannello legge job.step e job.domain.
 _bk_progress() {
   local job
   job="$(jq -nc --arg u "${BK_UNIT:-vps-backup.service}" --arg s "$_BK_STARTED" --arg st "$1" --arg d "${2-}" \
-    '{unit: $u, started: $s, step: $st, domain: (if $d == "" then null else $d end)}')"
+    '{unit: $u, op: "run", started: $s, step: $st, domain: (if $d == "" then null else $d end)}')"
   _bk_state_write "$job" "$_BK_PREV_LAST" || log "vps-backup: state.json non scritto"
 }
 
@@ -890,20 +914,20 @@ _bk_known_del() {
   _BK_KNOWN="$(jq -c --arg d "$1" 'map(select(. != $d))' <<<"$_BK_KNOWN")"
 }
 
-# _bk_site_size DOMINIO — stima in byte di quanto pesa l'archivio: public/ (du -P non
+# _bk_site_size DOMINIO [PARTI] — stima in byte di quanto pesa l'archivio: public/ (du -P non
 # segue i link), wp-config.php e, se c'è, il database. Stampa il numero; 1 se
 # public/ non si legge.
 _bk_site_size() {
-  local d="$1" root pub=0 wp=0 db=0 slug v
+  local d="$1" parts="${2:-all}" root pub=0 wp=0 db=0 slug v
   root="$(site_root "$d")"
-  if [[ -d "$root/public" ]]; then
+  if [[ "$parts" != db && -d "$root/public" ]]; then
     pub="$(du -sbP -- "$root/public" 2>/dev/null | cut -f1 || true)"
     [[ "$pub" =~ ^[0-9]{1,16}$ ]] || return 1
   fi
-  if [[ -f "$root/wp-config.php" && ! -L "$root/wp-config.php" ]]; then
+  if [[ "$parts" != db && -f "$root/wp-config.php" && ! -L "$root/wp-config.php" ]]; then
     wp="$(stat -c %s "$root/wp-config.php" 2>/dev/null || echo 0)"
   fi
-  if [[ "$(site_reg_get "$d" .db 2>/dev/null || true)" == true ]]; then
+  if [[ "$parts" != files && "$(site_reg_get "$d" .db 2>/dev/null || true)" == true ]]; then
     slug="$(site_reg_get "$d" .slug 2>/dev/null || true)"
     if [[ "$slug" =~ ^site_[a-z0-9_]{1,27}$ ]]; then
       v="$(_bk_nolock mariadb -N -B -e "SELECT COALESCE(SUM(data_length + index_length), 0) FROM information_schema.tables WHERE table_schema = '$slug'" 2>/dev/null </dev/null | head -n1 || true)"
@@ -1093,12 +1117,15 @@ bk_run_all() {
   # (bk.run.*) si tolgono a qualunque età; gli altri avanzi bk.* dopo un giorno.
   find "$BK_BACKUPS/tmp" -mindepth 1 -maxdepth 1 -name 'bk.run.*' -exec rm -rf -- {} + 2>/dev/null || true
   find "$BK_BACKUPS/tmp" -mindepth 1 -maxdepth 1 -name 'bk.*' -mmin +1440 -exec rm -rf -- {} + 2>/dev/null || true
+  bk_prune_restore
   BK_RUN_DIR="$(mktemp -d "$BK_BACKUPS/tmp/bk.run.XXXXXX")"
   # shellcheck disable=SC2064
   trap "rm -rf -- '$BK_RUN_DIR'" EXIT
   _BK_STARTED="$(date -Iseconds)"
-  _BK_SITES='[]' _BK_PANEL='null' _BK_PURGED='[]' _BK_PREV_LAST='null' _BK_KNOWN='[]'
+  _BK_SITES='[]' _BK_PANEL='null' _BK_PURGED='[]' _BK_PREV_LAST='null' _BK_KNOWN='[]' _BK_LAST_RESTORE='null'
   if [[ -f "$BK_STATE" ]]; then
+    _BK_LAST_RESTORE="$(jq -c '.last_restore // null' "$BK_STATE" 2>/dev/null)" || _BK_LAST_RESTORE='null'
+    [[ -n "$_BK_LAST_RESTORE" ]] || _BK_LAST_RESTORE='null'
     _BK_PREV_LAST="$(jq -c '.last_run // null' "$BK_STATE" 2>/dev/null)" || _BK_PREV_LAST='null'
     _BK_KNOWN="$(jq -c '(.known // []) | if type == "array" then map(select(type == "string")) else [] end' "$BK_STATE" 2>/dev/null)" || _BK_KNOWN='[]'
   fi
@@ -1145,4 +1172,782 @@ bk_run_all() {
   printf '%s\n' "$st"
   if [[ "$(jq -r .ok <<<"$last")" != true ]]; then rc=1; fi
   return "$rc"
+}
+
+# --- copie locali, copie su Drive, ripristino (Task 4) ---------------------------
+
+: "${BK_CF_PURGE:=$VPS_OPT/bin/vps-cf-purge}"
+
+# bk_prune_restore — le copie di sicurezza dei ripristini restano 7 giorni.
+bk_prune_restore() {
+  [[ -d "$BK_BACKUPS/restore" ]] || return 0
+  find "$BK_BACKUPS/restore" -maxdepth 1 -type f -name '*.tar.gz' -mmin +10080 -delete 2>/dev/null || true
+}
+
+# bk_local_parse NOME — NOME è "cartella/file" dentro backups/{panel,sites,restore}: la
+# forma dei nomi è fissa, niente "/" oltre al primo, niente "..". Imposta _BK_LK
+# (cartella), _BK_LF (file), _BK_LD (dominio, vuoto per il pannello). 1 se non valido.
+_BK_LK="" _BK_LF="" _BK_LD=""
+bk_local_parse() {
+  local n="${1-}" k f d
+  _BK_LK="" _BK_LF="" _BK_LD=""
+  [[ "$n" =~ ^(panel|sites|restore)/([A-Za-z0-9][A-Za-z0-9._-]{0,200})$ ]] || return 1
+  k="${BASH_REMATCH[1]}"
+  f="${BASH_REMATCH[2]}"
+  [[ "$f" != *..* ]] || return 1
+  # BASH_REMATCH va copiato subito: valid_domain usa a sua volta un'espressione regolare
+  case "$k" in
+    panel)
+      [[ "$f" =~ \.sql\.gz$ ]] || return 1
+      ;;
+    sites)
+      [[ "$f" =~ ^(.+)-[0-9]{8}-[0-9]{4}([0-9]{2})?\.(tar|sql)\.gz$ ]] || return 1
+      d="${BASH_REMATCH[1]}"
+      valid_domain "$d" || return 1
+      _BK_LD="$d"
+      ;;
+    restore)
+      [[ "$f" =~ ^(.+)-[0-9]{8}-[0-9]{4}([0-9]{2})?\.tar\.gz$ ]] || return 1
+      d="${BASH_REMATCH[1]}"
+      valid_domain "$d" || return 1
+      _BK_LD="$d"
+      ;;
+  esac
+  _BK_LK="$k"
+  _BK_LF="$f"
+}
+
+# bk_local_path NOME — percorso del file locale, solo se è un file regolare e non un
+# collegamento (anche la cartella non deve esserlo). Stampa il percorso.
+bk_local_path() {
+  bk_local_parse "${1-}" || return 1
+  local d="$BK_BACKUPS/$_BK_LK" p="$BK_BACKUPS/$_BK_LK/$_BK_LF"
+  [[ -d "$d" && ! -L "$d" && -f "$p" && ! -L "$p" ]] || return 1
+  printf '%s' "$p"
+}
+
+# bk_list_local_json — {ok, items[]} con le copie di backups/{panel,sites,restore}.
+# `restorable`: archivio nel formato nuovo (primo membro manifest.json); gli archivi
+# vecchi (tar di tutta la cartella + dump a parte) si possono solo scaricare.
+# `expires`: data di scadenza (modifica + 30 giorni per sites, + 7 per restore, null
+# per il pannello, di cui restano gli ultimi 5).
+bk_list_local_json() {
+  local k dir p f mt days exp restorable first kind dom sz TAB=$'\t' tbl=""
+  for k in panel sites restore; do
+    dir="$BK_BACKUPS/$k"
+    [[ -d "$dir" && ! -L "$dir" ]] || continue
+    for p in "$dir"/*; do
+      [[ -f "$p" && ! -L "$p" ]] || continue
+      f="${p##*/}"
+      bk_local_parse "$k/$f" || continue
+      mt="$(stat -c %Y "$p")" || continue
+      sz="$(stat -c %s "$p")" || continue
+      restorable=false
+      exp=""
+      dom="$_BK_LD"
+      case "$k" in
+        panel) kind=panel ;;
+        sites)
+          kind=site
+          days=30
+          ;;
+        restore)
+          kind=restore
+          days=7
+          ;;
+      esac
+      if [[ "$k" != panel ]]; then
+        exp="$(date -d "@$((mt + days * 86400))" +%F)" || exp=""
+        if [[ "$f" == *.tar.gz ]]; then
+          first="$(tar -tzf "$p" 2>/dev/null | head -n1 || true)"
+          if [[ "$first" == manifest.json ]]; then restorable=true; fi
+        fi
+      fi
+      tbl+="$kind$TAB$k/$f$TAB$dom$TAB$mt$TAB$sz$TAB$exp$TAB$restorable"$'\n'
+    done
+  done
+  printf '%s' "$tbl" | jq -Rnc '
+    [inputs | split("\t") | {kind: .[0], name: .[1], domain: (if .[2] == "" then null else .[2] end),
+       t: (.[3] | tonumber), size: (.[4] | tonumber),
+       expires: (if .[5] == "" then null else .[5] end), restorable: (.[6] == "true")}]
+    | sort_by(-.t, .name)
+    | map({kind, name, domain, date: (.t | strflocaltime("%Y-%m-%dT%H:%M:%S")), size, expires, restorable})
+    | {ok: true, items: .}'
+}
+
+# bk_remote_parse NOME — "dominio/file" o "_pannello/file" con i nomi che crea il giro.
+# Imposta _BK_RD (cartella su Drive) e _BK_RF (file). 1 se non valido.
+_BK_RD="" _BK_RF=""
+bk_remote_parse() {
+  local n="${1-}" d f
+  _BK_RD="" _BK_RF=""
+  [[ "$n" =~ ^([A-Za-z0-9_.-]+)/([A-Za-z0-9._-]+)$ ]] || return 1
+  d="${BASH_REMATCH[1]}"
+  f="${BASH_REMATCH[2]}"
+  if [[ "$d" == _pannello ]]; then
+    [[ "$f" =~ $_BK_PANEL_RE ]] || return 1
+  else
+    valid_domain "$d" || return 1
+    [[ "$f" =~ $(_bk_site_re "$d") ]] || return 1
+  fi
+  _BK_RD="$d"
+  _BK_RF="$f"
+}
+
+# _bk_remote_init — Drive collegato e comando rclone pronto. Imposta BK_ERR e 1 se no.
+_bk_remote_init() {
+  if [[ ! -f "$BK_RCLONE_CONF" ]]; then
+    BK_ERR="Google Drive non collegato: collegalo dalla pagina Backup"
+    return 1
+  fi
+  read -ra _BK_RC <<<"$BK_RCLONE"
+}
+
+# bk_list_remote_json — {ok, sites[{domain, present, copies[{name,date,size}]}], panel[]}
+# con i soli file dai nomi che crea il giro (gli altri sono di altri e non si mostrano).
+# Una cartella di backup ancora inesistente dà elenchi vuoti.
+bk_list_remote_json() {
+  local folder dirs d tag present re size name TAB=$'\t' tbl="" line
+  _bk_remote_init || return 1
+  folder="$(jq -r .folder <<<"$(bk_config_json)")"
+  if ! _bk_rcq lsjson --dirs-only "gdrive:$folder"; then
+    if ((_BK_RCRC == 3)); then
+      printf '{"ok":true,"sites":[],"panel":[]}\n'
+      return 0
+    fi
+    BK_ERR="Google Drive non risponde: $_BK_ERRMSG"
+    return 1
+  fi
+  dirs="$(jq -r '.[] | select(.Name | test("^[A-Za-z0-9_][A-Za-z0-9._-]*$")) | .Name' <<<"$_BK_OUT" 2>/dev/null)" || {
+    BK_ERR="risposta di Drive non leggibile"
+    return 1
+  }
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    if [[ "$d" == _pannello ]]; then
+      tag=P
+      present=false
+      re="$_BK_PANEL_RE"
+    elif valid_domain "$d"; then
+      tag=S
+      present=false
+      if site_reg_exists "$d"; then present=true; fi
+      re="$(_bk_site_re "$d")"
+    else
+      continue
+    fi
+    if ! _bk_ls_files "$folder/$d"; then
+      BK_ERR="Google Drive non risponde: $_BK_ERRMSG"
+      return 1
+    fi
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      size="${line%%|*}"
+      name="${line#*|}"
+      [[ "$size" =~ ^[0-9]{1,18}$ && "$name" =~ $re ]] || continue
+      tbl+="$tag$TAB$d$TAB$present$TAB$d/$name$TAB$size"$'\n'
+    done <<<"$_BK_LST"
+  done <<<"$dirs"
+  printf '%s' "$tbl" | jq -Rnc '
+    def mk: {name: .[3], date: (.[3] | capture("-(?<y>[0-9]{4})(?<m>[0-9]{2})(?<d>[0-9]{2})-(?<h>[0-9]{2})(?<i>[0-9]{2})\\.")
+                               | "\(.y)-\(.m)-\(.d)T\(.h):\(.i):00"), size: (.[4] | tonumber)};
+    [inputs | split("\t")] as $r
+    | {ok: true,
+       sites: ([$r[] | select(.[0] == "S")] | group_by(.[1])
+               | map({domain: .[0][1], present: (.[0][2] == "true"), copies: (sort_by(.[3]) | reverse | map(mk))})),
+       panel: ([$r[] | select(.[0] == "P")] | sort_by(.[3]) | reverse | map(mk))}'
+}
+
+# bk_remote_fetch NOME DEST — scarica la copia da Drive in DEST (file nuovo). Prima si
+# guarda che esista con la dimensione attesa e che ci sia spazio; dopo, che la
+# dimensione torni. BK_ERR dice perché se fallisce.
+bk_remote_fetch() {
+  local name="${1-}" dest="${2-}" folder size got
+  bk_remote_parse "$name" || {
+    BK_ERR="nome della copia non valido"
+    return 1
+  }
+  _bk_remote_init || return 1
+  folder="$(jq -r .folder <<<"$(bk_config_json)")"
+  if ! _bk_ls_files "$folder/$_BK_RD"; then
+    if ((_BK_RCRC == 3)); then
+      BK_ERR="copia non trovata su Drive: $name"
+    else
+      BK_ERR="Google Drive non risponde: $_BK_ERRMSG"
+    fi
+    return 1
+  fi
+  size="$(awk -F'|' -v n="$_BK_RF" '$2 == n {print $1; exit}' <<<"$_BK_LST")"
+  if [[ ! "$size" =~ ^[0-9]{1,18}$ ]]; then
+    BK_ERR="copia non trovata su Drive: $name"
+    return 1
+  fi
+  if ! bk_space_ok "$(dirname -- "$dest")" "$size"; then
+    BK_ERR="spazio insufficiente per scaricare la copia"
+    return 1
+  fi
+  if ! _bk_rcq copyto "gdrive:$folder/$_BK_RD/$_BK_RF" "$dest"; then
+    rm -f -- "$dest"
+    BK_ERR="scaricamento da Drive non riuscito: $_BK_ERRMSG"
+    return 1
+  fi
+  got="$(stat -c %s "$dest" 2>/dev/null || echo -1)"
+  if [[ "$got" != "$size" ]]; then
+    rm -f -- "$dest"
+    BK_ERR="la copia scaricata ha dimensione diversa (attesa $size, trovata $got)"
+    return 1
+  fi
+}
+
+# --- ripristino --------------------------------------------------------------------
+
+# Script eseguiti come utente del sito (sh di Debian, niente bash). L'area di
+# estrazione sta in tmp/ del sito, che è del sito: nessun percorso passa da root.
+
+# Controllo dell'area di estrazione dopo tar (seconda linea di difesa, dopo bk_verify):
+# argomenti AREA RADICE. Rifiuta file speciali, collegamenti simbolici che (risolti
+# con realpath -m dentro l'area) escono dall'area, e file con più collegamenti fisici
+# di quelli presenti nell'area (cioè un legame con qualcosa di fuori). Un collegamento
+# assoluto vale solo se punta dentro RADICE, e lo si guarda come se la radice fosse
+# l'area. Stampa il primo problema, esce con 1.
+read -r -d '' BK_SH_WALK <<'EOS' || true
+s="$1"; r="$2"
+cd "$s" || exit 2
+S="$(pwd -P)"
+bad="$(find -P . -mindepth 1 ! -type f ! -type d ! -type l -print -quit)"
+if [ -n "$bad" ]; then
+  printf 'file speciale (dispositivo, fifo o socket): %s\n' "$bad"
+  exit 1
+fi
+find -P . -type l -exec sh -c '
+S="$1"; R="$2"; shift 2
+for l; do
+  t="$(readlink -- "$l")" || exit 1
+  case "$t" in
+    "$R" | "$R"/*) t="$S${t#"$R"}" ;;
+    /*) printf "collegamento assoluto fuori dal sito: %s\n" "$l"; exit 1 ;;
+    *) t="$(dirname -- "$l")/$t" ;;
+  esac
+  x="$(realpath -m -- "$t")" || exit 1
+  case "$x" in
+    "$S" | "$S"/*) ;;
+    *) printf "collegamento che esce dal sito: %s\n" "$l"; exit 1 ;;
+  esac
+done' sh "$S" "$r" {} + || exit 1
+find -P . -type f -links +1 -printf '%i %n\n' | awk '{ c[$1]++; n[$1] = $2 } END { for (i in c) if (c[i] != n[i]) { print "collegamento fisico verso un file fuori dall area di estrazione"; exit 1 } }' || exit 1
+exit 0
+EOS
+
+# Scambio del contenuto di public/: il vecchio va in una cartella di tmp/ (stesso
+# filesystem, quindi solo rinomine), il nuovo ci entra dall'area di estrazione. La
+# cartella public/ non si sostituisce: è di root nella radice (che il sito non può
+# modificare) e porta permessi e ACL che servono a Nginx. Uscite: 0 fatto; 3 non
+# riuscito ma il vecchio contenuto è tornato; 4 non riuscito e il vecchio contenuto
+# non è tornato (resta nella cartella); 65/66/1 niente è stato spostato.
+read -r -d '' BK_SH_SWAP <<'EOS' || true
+s="$1"; old="$2"
+{ [ -d "$s/public" ] && [ ! -L "$s/public" ]; } || exit 65
+{ [ -d public ] && [ ! -L public ]; } || exit 66
+mkdir "$old" || exit 1
+if find public -mindepth 1 -maxdepth 1 -exec mv -t "$old" -- {} + \
+  && find "$s/public" -mindepth 1 -maxdepth 1 -exec mv -t public -- {} +; then
+  rm -rf -- "$s"
+  # Nginx (www-data) legge public/ grazie alle ACL: i file arrivati dall'archivio non
+  # le hanno, e uno a 640 o 600 darebbe 403. Come per i file creati dal sito.
+  setfacl -R -m u:www-data:rX -m d:u:www-data:rX public >/dev/null 2>&1 || true
+  exit 0
+fi
+find public -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null
+if find "$old" -mindepth 1 -maxdepth 1 -exec mv -t public -- {} + && rmdir "$old"; then
+  rm -rf -- "$s"
+  exit 3
+fi
+exit 4
+EOS
+
+# Rimette il contenuto di prima (dopo uno scambio riuscito ma un passo successivo fallito).
+read -r -d '' BK_SH_UNDO <<'EOS' || true
+old="$1"
+find public -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null
+find "$old" -mindepth 1 -maxdepth 1 -exec mv -t public -- {} + || exit 1
+rmdir "$old" || exit 1
+EOS
+
+# _bk_walk_staging SLUG RADICE AREA — esegue BK_SH_WALK come utente del sito. 0 se
+# l'area è pulita; altrimenti stampa il motivo, lo mette in BK_ERR e restituisce 1.
+_bk_walk_staging() {
+  local slug="$1" root="$2" stage="$3" out rc=0
+  out="$(fm_as_site "$slug" "$root" timeout 900 sh -c "$BK_SH_WALK" sh "$stage" "$root" 2>/dev/null)" || rc=$?
+  if ((rc != 0)); then
+    out="$(printf '%s' "$out" | head -n1 | LC_ALL=C tr -c '[:print:]' '?' | head -c 300)"
+    [[ -n "$out" ]] || out="controllo dei file estratti non riuscito (codice $rc)"
+    BK_ERR="contenuto della copia non sicuro: $out"
+    printf '%s\n' "$out"
+    return 1
+  fi
+}
+
+_BK_STAGE="" _BK_OLD="" _BK_SAFETY="" _BK_R_DOM="" _BK_R_NOTE="" _BK_R_BDATE=""
+
+# _bk_stage_files SLUG RADICE FILES.TAR.GZ — estrae public/ come utente del sito in una
+# cartella vuota nuova di tmp/ (mai in public/) e la controlla. Imposta _BK_STAGE
+# (percorso relativo alla radice). BK_ERR se fallisce; l'area, se creata, resta
+# in _BK_STAGE e la toglie chi chiama.
+_bk_stage_files() {
+  local slug="$1" root="$2" files="$3" first s
+  _BK_STAGE=""
+  first="$(tar -tzf "$files" 2>/dev/null | head -n1 || true)"
+  if [[ "$first" != public && "$first" != public/ ]]; then
+    BK_ERR="la copia non contiene public/ (non è una copia dei file)"
+    return 1
+  fi
+  if ! bk_space_ok "$root/tmp" "$(($(stat -c %s "$files") * 2))"; then
+    BK_ERR="spazio insufficiente per estrarre la copia"
+    return 1
+  fi
+  # avanzi di ripristini interrotti (kill, riavvio)
+  fm_as_site "$slug" "$root" sh -c 'find tmp -maxdepth 1 -name ".vpsbackup-x.*" -mmin +1440 -exec rm -rf -- {} + 2>/dev/null; exit 0' sh >/dev/null 2>&1 || true
+  s="$(fm_as_site "$slug" "$root" mktemp -d tmp/.vpsbackup-x.XXXXXX 2>/dev/null)" || s=""
+  if [[ ! "$s" =~ ^tmp/\.vpsbackup-x\.[A-Za-z0-9]{6}$ ]]; then
+    BK_ERR="area di estrazione non creata (tmp/ del sito non scrivibile)"
+    return 1
+  fi
+  _BK_STAGE="$s"
+  # umask del sito (fm_as_site), proprietario l'utente del sito, permessi dell'archivio
+  # limitati dalla umask (niente setuid): nessuna fiducia nell'archivio.
+  if ! fm_as_site "$slug" "$root" env LC_ALL=C.UTF-8 timeout 7200 tar -xzf - -C "$s" --no-same-owner --no-same-permissions -- public \
+    <"$files" 2>"$BK_RUN_DIR/untar.err"; then
+    _bk_log_file "$BK_RUN_DIR/untar.err" "estrazione per $slug"
+    BK_ERR="estrazione dei file non riuscita"
+    return 1
+  fi
+  _bk_walk_staging "$slug" "$root" "$s" >/dev/null || return 1
+}
+
+# _bk_stage_clean SLUG RADICE — toglie l'area di estrazione, se c'è.
+_bk_stage_clean() {
+  [[ "$_BK_STAGE" =~ ^tmp/\.vpsbackup-x\.[A-Za-z0-9]{6}$ ]] || return 0
+  fm_as_site "$1" "$2" rm -rf -- "$_BK_STAGE" >/dev/null 2>&1 || log "ATTENZIONE: area di estrazione $2/$_BK_STAGE non rimossa"
+  _BK_STAGE=""
+}
+
+# _bk_swap_files SLUG RADICE — scambia il contenuto di public/ con quello dell'area.
+# Imposta _BK_OLD (dove sta il contenuto di prima) se riesce.
+_bk_swap_files() {
+  local slug="$1" root="$2" old rc=0
+  old="tmp/.vpsbackup-old.$(date +%Y%m%d%H%M%S)"
+  fm_as_site "$slug" "$root" timeout 3600 sh -c "$BK_SH_SWAP" sh "$_BK_STAGE" "$old" >"$BK_RUN_DIR/swap.out" 2>&1 || rc=$?
+  case "$rc" in
+    0)
+      _BK_OLD="$old"
+      _BK_STAGE=""
+      ;;
+    3)
+      _BK_STAGE=""
+      BK_ERR="scambio dei file non riuscito: il contenuto di prima è tornato al suo posto"
+      return 1
+      ;;
+    4)
+      BK_ERR="scambio dei file non riuscito e il contenuto di prima NON è tornato in public/: è in $root/$old (copia di sicurezza: ${_BK_SAFETY:-nessuna})"
+      _BK_R_NOTE=hard
+      return 1
+      ;;
+    *)
+      BK_ERR="scambio dei file non riuscito (codice $rc), public/ non è stata toccata"
+      return 1
+      ;;
+  esac
+}
+
+# _bk_files_commit SLUG RADICE — ripristino riuscito: il contenuto di prima si toglie.
+_bk_files_commit() {
+  [[ "$_BK_OLD" =~ ^tmp/\.vpsbackup-old\.[0-9]{14}$ ]] || return 0
+  fm_as_site "$1" "$2" rm -rf -- "$_BK_OLD" >/dev/null 2>&1 || log "ATTENZIONE: contenuto di prima $2/$_BK_OLD non rimosso"
+  _BK_OLD=""
+}
+
+# _bk_files_undo SLUG RADICE — un passo dopo lo scambio è fallito: public/ torna com'era.
+_bk_files_undo() {
+  [[ "$_BK_OLD" =~ ^tmp/\.vpsbackup-old\.[0-9]{14}$ ]] || return 0
+  if fm_as_site "$1" "$2" timeout 3600 sh -c "$BK_SH_UNDO" sh "$_BK_OLD" >/dev/null 2>&1; then
+    _BK_OLD=""
+    return 0
+  fi
+  BK_ERR="$BK_ERR; i file di prima NON sono tornati in public/: sono in $2/$_BK_OLD"
+  _BK_R_NOTE=hard
+  return 1
+}
+
+# --- database ---------------------------------------------------------------------
+#
+# Scelta: il dump non si carica con root. L'archivio può venire da Drive e il suo
+# SQL non è autenticato (il checksum sta nello stesso archivio): come root potrebbe
+# creare utenti o toccare altri database. Si carica con l'utente del sito, che può
+# lavorare solo sul proprio database (e, per il tempo della prova, su
+# <slug>__ripristino, di cui riceve un permesso che poi si toglie).
+# Prima una prova in <slug>__ripristino, senza toccare il sito: un dump rotto o troncato
+# si scopre lì. Poi il database del sito si elimina e si ricrea e vi si carica il dump
+# (invece di RENAME TABLE dal temporaneo: così viste, routine, eventi e trigger,
+# che RENAME TABLE non sposta tra database, restano). Se il caricamento vero fallisce
+# si ricarica la copia di sicurezza. I permessi dell'utente non cambiano.
+
+# _bk_sql SQL — istruzioni come root (socket) da stdin; l'errore, ripulito, in _BK_SQLERR.
+_bk_sql() {
+  local rc=0
+  _bk_nolock mariadb <<<"$1" >>"$VPS_LOG" 2>"$BK_RUN_DIR/sql.err" || rc=$?
+  _BK_SQLERR=""
+  if ((rc != 0)); then _BK_SQLERR="$(bk_clean_msg "$(cat "$BK_RUN_DIR/sql.err" 2>/dev/null || true)")"; fi
+  return "$rc"
+}
+
+# _bk_db_cnf SLUG RADICE — file di opzioni (600, nella cartella di lavoro di root) con
+# utente e password del sito, letta da db.env (di root nella radice): la password non
+# passa mai dagli argomenti.
+_bk_db_cnf() {
+  local pw
+  pw="$(env_get "$2/db.env" DB_PASS)"
+  [[ -n "$pw" && "$pw" != *\"* && "$pw" != *\\* && "$pw" != *$'\n'* ]] || return 1
+  (
+    umask 077
+    printf '[client]\nuser=%s\npassword="%s"\n' "$1" "$pw" >"$BK_RUN_DIR/my.cnf"
+  )
+}
+
+_BK_LOADERR=""
+# _bk_db_load DATABASE DUMP.GZ — carica il dump con l'utente del sito. gzip, sed e
+# mariadb in una pipeline con pipefail: un .gz troncato è un errore anche se SQL già
+# eseguito. sed toglie DEFINER=`utente`@`host` dalle sole righe di definizione di
+# oggetti (iniziano con /*!NNNNN o CREATE/ALTER; le righe INSERT non si toccano):
+# un trigger o una vista creati un tempo da root non si caricherebbero con l'utente
+# del sito (serve il privilegio SET USER), e così diventano suoi.
+_bk_db_load() {
+  local rc=0
+  (
+    set -o pipefail
+    _bk_nolock gzip -dc "$2" \
+      | _bk_nolock sed -E '/^(\/\*![0-9]+ |CREATE |ALTER )/ s/DEFINER=`[^`]*`@`[^`]*`//g' \
+      | _bk_nolock mariadb --defaults-file="$BK_RUN_DIR/my.cnf" "$1"
+  ) >>"$VPS_LOG" 2>"$BK_RUN_DIR/load.err" || rc=$?
+  _BK_LOADERR=""
+  if ((rc != 0)); then _BK_LOADERR="$(bk_clean_msg "$(cat "$BK_RUN_DIR/load.err" 2>/dev/null || true)")"; fi
+  return "$rc"
+}
+
+# _bk_db_recreate SLUG — database del sito vuoto (i permessi non si toccano).
+_bk_db_recreate() {
+  _bk_sql "DROP DATABASE IF EXISTS \`$1\`;
+CREATE DATABASE \`$1\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+}
+
+# _bk_db_dryrun SLUG RADICE DUMP.GZ — prova di caricamento in <slug>__ripristino.
+_bk_db_dryrun() {
+  local slug="$1" t="${1}__ripristino" esc rc=0
+  if ! sql_ident_ok "$t" || ! _bk_db_cnf "$slug" "$2"; then
+    BK_ERR="password del database non leggibile (db.env)"
+    return 1
+  fi
+  esc="${t//_/\\_}"
+  if ! _bk_sql "DROP DATABASE IF EXISTS \`$t\`;
+CREATE DATABASE \`$t\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+GRANT ALL PRIVILEGES ON \`$esc\`.* TO '$slug'@'localhost';"; then
+    BK_ERR="database temporaneo non creato: $_BK_SQLERR"
+    _bk_sql "REVOKE ALL PRIVILEGES ON \`$esc\`.* FROM '$slug'@'localhost';
+DROP DATABASE IF EXISTS \`$t\`;" || true
+    return 1
+  fi
+  _bk_db_load "$t" "$3" || rc=$?
+  _bk_sql "REVOKE ALL PRIVILEGES ON \`$esc\`.* FROM '$slug'@'localhost';
+DROP DATABASE IF EXISTS \`$t\`;" || log "ATTENZIONE: database temporaneo $t non rimosso ($_BK_SQLERR)"
+  if ((rc != 0)); then
+    BK_ERR="il dump del database non si carica: $_BK_LOADERR"
+    return 1
+  fi
+}
+
+# _bk_db_swap SLUG DUMP.GZ SICUREZZA — il database del sito diventa il dump. Se fallisce
+# si ricarica il dump della copia di sicurezza SICUREZZA (archivio).
+_bk_db_swap() {
+  local slug="$1" dump="$2" safety="$3" msg
+  if _bk_db_recreate "$slug" && _bk_db_load "$slug" "$dump"; then
+    return 0
+  fi
+  msg="${_BK_LOADERR:-$_BK_SQLERR}"
+  mkdir -p "$BK_RUN_DIR/s"
+  if tar -xzf "$safety" -C "$BK_RUN_DIR/s" --no-same-owner --no-same-permissions db.sql.gz 2>/dev/null \
+    && _bk_db_recreate "$slug" && _bk_db_load "$slug" "$BK_RUN_DIR/s/db.sql.gz"; then
+    BK_ERR="caricamento del database non riuscito ($msg): il database è tornato com'era"
+    return 1
+  fi
+  BK_ERR="caricamento del database non riuscito ($msg) e la copia di sicurezza non si è ricaricata: il database potrebbe essere incompleto, la copia è $safety"
+  _BK_R_NOTE=hard
+  return 1
+}
+
+# --- cache e avviso -----------------------------------------------------------------
+
+# _bk_flush_cache DOMINIO SLUG — chiavi Redis del sito (se ha l'utente ACL) e zona
+# Cloudflare (se attivo). Un errore si registra e basta: il ripristino è fatto.
+_bk_flush_cache() {
+  local d="$1" slug="$2" zone
+  if grep -q "^user $slug " "$REDIS_ACL_FILE" 2>/dev/null; then
+    site_redis_purge "$d" >/dev/null 2>&1 || log "ATTENZIONE: cache Redis di $d non svuotata"
+  fi
+  zone="$(site_reg_get "$d" '.zone // ""' 2>/dev/null || true)"
+  if [[ -n "$zone" && "$(jq -r '.cloudflare.enabled // false' "$(manifest_path)" 2>/dev/null || true)" == true && -x "$BK_CF_PURGE" ]]; then
+    _bk_nolock "$BK_CF_PURGE" "$zone" --all >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: cache Cloudflare di $zone non svuotata"
+  fi
+}
+
+# _bk_send TESTO — manda il messaggio e stampa l'esito per last_restore.alert.
+_bk_send() {
+  local rc=0
+  mon_send "$1" || rc=$?
+  if ((rc == 0)); then
+    printf '"sent"'
+  elif [[ "${MON_SEND_ERR:-}" == "Telegram non configurato" ]]; then
+    printf '"not_configured"'
+  else
+    jq -nc --arg e "${MON_SEND_ERR:-errore sconosciuto}" '"failed: " + $e'
+  fi
+}
+
+# _bk_rprogress PASSO — il pannello legge job.op, job.step e job.domain.
+_bk_rprogress() {
+  local job
+  job="$(jq -nc --arg u "${BK_UNIT:-vps-backup-restore}" --arg s "$_BK_STARTED" --arg st "$1" --arg d "$_BK_R_DOM" \
+    '{unit: $u, op: "restore", started: $s, step: $st, domain: $d}')"
+  _bk_state_write "$job" "$_BK_PREV_LAST" || log "vps-backup: state.json non scritto"
+}
+
+# _bk_restore_do SRC DOMINIO NOME MODO SLUG RADICE — i passi. Prima tutto ciò che non
+# tocca il sito (scarico, controlli, estrazione nell'area, prova del dump), poi la
+# copia di sicurezza, poi gli scambi. Un archivio rifiutato prima non lascia quindi
+# nessuna copia di sicurezza. Imposta BK_ERR; 0 se riuscito.
+_bk_restore_do() {
+  local src="$1" d="$2" name="$3" mode="$4" slug="$5" root="$6"
+  local w="$BK_RUN_DIR" arc mdom sitedb hasdb parts sz files_done=0
+  BK_ERR=""
+  _BK_R_NOTE=""
+  _BK_SAFETY=""
+  _BK_STAGE=""
+  _BK_OLD=""
+  _BK_R_BDATE=""
+
+  # 1. la copia
+  if [[ "$src" == local ]]; then
+    if ! bk_local_parse "$name" || [[ "$_BK_LK" == panel || "$_BK_LF" != *.tar.gz ]]; then
+      BK_ERR="nome della copia non valido"
+      return 1
+    fi
+    [[ "$_BK_LD" == "$d" ]] || {
+      BK_ERR="la copia è di $_BK_LD, non di $d"
+      return 1
+    }
+    arc="$(bk_local_path "$name")" || {
+      BK_ERR="copia non trovata"
+      return 1
+    }
+  else
+    _bk_rprogress download
+    if ! bk_remote_parse "$name" || [[ "$_BK_RD" != "$d" ]]; then
+      BK_ERR="nome della copia non valido per $d"
+      return 1
+    fi
+    arc="$w/dl.tar.gz"
+    bk_remote_fetch "$name" "$arc" || return 1
+  fi
+
+  # 2. controllo dell'archivio (checksum, nomi, collegamenti) e del dominio
+  _bk_rprogress verify
+  bk_verify "$arc" || return 1
+  mkdir -p "$w/x"
+  tar -xzf "$arc" -C "$w/x" --no-same-owner --no-same-permissions manifest.json files.tar.gz 2>/dev/null || {
+    BK_ERR="archivio non leggibile"
+    return 1
+  }
+  mdom="$(jq -r '.domain // ""' "$w/x/manifest.json")"
+  if [[ "$mdom" != "$d" ]]; then
+    BK_ERR="la copia è del sito ${mdom:-sconosciuto}, non di $d"
+    return 1
+  fi
+  _BK_R_BDATE="$(jq -r '.date // ""' "$w/x/manifest.json")"
+  hasdb=false
+  if [[ -n "$(jq -r '.sha256.db // ""' "$w/x/manifest.json")" ]]; then
+    hasdb=true
+    tar -xzf "$arc" -C "$w/x" --no-same-owner --no-same-permissions db.sql.gz 2>/dev/null || {
+      BK_ERR="database della copia non leggibile"
+      return 1
+    }
+  fi
+  sitedb="$(site_reg_get "$d" .db)"
+  case "$mode" in
+    db)
+      if [[ "$hasdb" != true ]]; then
+        BK_ERR="la copia non contiene il database"
+        return 1
+      fi
+      if [[ "$sitedb" != true ]]; then
+        BK_ERR="il sito non ha un database"
+        return 1
+      fi
+      parts=db
+      ;;
+    files) parts=files ;;
+    all)
+      if [[ "$hasdb" != "$([[ "$sitedb" == true ]] && echo true || echo false)" ]]; then
+        BK_ERR="la copia e il sito non coincidono sul database: ripristina solo i file"
+        return 1
+      fi
+      parts=all
+      ;;
+  esac
+
+  # 3. prove senza toccare il sito: file nell'area di estrazione, dump nel temporaneo
+  if [[ "$mode" != db ]]; then
+    _bk_rprogress extract
+    if ! _bk_stage_files "$slug" "$root" "$w/x/files.tar.gz"; then
+      _bk_stage_clean "$slug" "$root"
+      return 1
+    fi
+  fi
+  if [[ "$mode" != files ]]; then
+    _bk_rprogress dryrun
+    if ! _bk_db_dryrun "$slug" "$root" "$w/x/db.sql.gz"; then
+      _bk_stage_clean "$slug" "$root"
+      return 1
+    fi
+  fi
+
+  # 4. copia di sicurezza di ciò che si sta per sovrascrivere
+  _bk_rprogress safety
+  if ! sz="$(_bk_site_size "$d" "$parts")"; then
+    _bk_stage_clean "$slug" "$root"
+    BK_ERR="dimensione del sito non leggibile"
+    return 1
+  fi
+  if ! bk_space_ok "$BK_BACKUPS/tmp" "$sz"; then
+    _bk_stage_clean "$slug" "$root"
+    BK_ERR="spazio insufficiente per la copia di sicurezza"
+    return 1
+  fi
+  install -d -m 700 "$BK_BACKUPS/restore" || {
+    _bk_stage_clean "$slug" "$root"
+    BK_ERR="cartella delle copie di sicurezza non disponibile"
+    return 1
+  }
+  _BK_SAFETY="$BK_BACKUPS/restore/$d-$(date +%Y%m%d-%H%M%S).tar.gz"
+  if ! bk_archive "$d" "$_BK_SAFETY" "$parts"; then
+    BK_ERR="copia di sicurezza non riuscita: ${BK_ERR:-errore}"
+    _BK_SAFETY=""
+    _bk_stage_clean "$slug" "$root"
+    return 1
+  fi
+
+  # 5. gli scambi
+  if [[ "$mode" != db ]]; then
+    _bk_rprogress files
+    if ! _bk_swap_files "$slug" "$root"; then
+      _bk_stage_clean "$slug" "$root"
+      return 1
+    fi
+    files_done=1
+  fi
+  if [[ "$mode" != files ]]; then
+    _bk_rprogress database
+    if ! _bk_db_swap "$slug" "$w/x/db.sql.gz" "$_BK_SAFETY"; then
+      # tutto o niente: anche i file tornano come prima
+      if ((files_done)); then _bk_files_undo "$slug" "$root" || true; fi
+      return 1
+    fi
+  fi
+  _bk_files_commit "$slug" "$root"
+
+  # 6. cache (solo registro in caso d'errore)
+  _bk_rprogress cache
+  _bk_flush_cache "$d" "$slug"
+}
+
+# bk_restore_run SRC DOMINIO NOME MODO — il ripristino (comando interno _restore, in
+# un'unità systemd). SRC è local (NOME = cartella/file) o remote (NOME = dominio/file).
+# Prende il lock globale e quello del sito per tutto il tempo, scrive il lavoro in
+# state.json, manda sempre un messaggio Telegram. Stampa il riepilogo JSON; 0 se
+# riuscito, 1 altrimenti (anche se non è potuto partire).
+bk_restore_run() {
+  local src="${1-}" d="${2-}" name="${3-}" mode="${4-}" info slug root lrc=0 ok=true label text alert fin bdate
+  _BK_R_DOM="$d"
+  if [[ "$src" != local && "$src" != remote ]] || [[ ! "$mode" =~ ^(all|db|files)$ ]]; then
+    printf '{"ok":false,"error":"argomenti non validi"}\n'
+    return 1
+  fi
+  info="$(fm_site_check "$d" 2>&1)" || {
+    jq -nc --arg e "$info" '{ok: false, error: $e}'
+    return 1
+  }
+  slug="${info%% *}"
+  root="${info#* }"
+  if ! bk_lock_global; then
+    printf '{"ok":false,"error":"backup in corso"}\n'
+    return 1
+  fi
+  bk_site_lock "$slug" || lrc=$?
+  if ((lrc == 1)); then
+    printf '{"ok":false,"error":"ripristino in corso su questo sito"}\n'
+    return 1
+  elif ((lrc != 0)); then
+    printf '{"ok":false,"error":"registro del sito non valido"}\n'
+    return 1
+  fi
+  install -d -m 700 "$BK_BACKUPS" "$BK_BACKUPS/tmp"
+  BK_RUN_DIR="$(mktemp -d "$BK_BACKUPS/tmp/bk.restore.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -rf -- '$BK_RUN_DIR'" EXIT
+  _BK_STARTED="$(date -Iseconds)"
+  _BK_PREV_LAST='null' _BK_KNOWN='[]' _BK_LAST_RESTORE='null'
+  if [[ -f "$BK_STATE" ]]; then
+    _BK_PREV_LAST="$(jq -c '.last_run // null' "$BK_STATE" 2>/dev/null)" || _BK_PREV_LAST='null'
+    _BK_KNOWN="$(jq -c '(.known // []) | if type == "array" then map(select(type == "string")) else [] end' "$BK_STATE" 2>/dev/null)" || _BK_KNOWN='[]'
+    _BK_LAST_RESTORE="$(jq -c '.last_restore // null' "$BK_STATE" 2>/dev/null)" || _BK_LAST_RESTORE='null'
+  fi
+  [[ -n "$_BK_PREV_LAST" ]] || _BK_PREV_LAST='null'
+  [[ -n "$_BK_KNOWN" ]] || _BK_KNOWN='[]'
+  [[ -n "$_BK_LAST_RESTORE" ]] || _BK_LAST_RESTORE='null'
+  _bk_rprogress start
+  log "vps-backup: ripristino di $d ($mode) da $src ${name//[^[:print:]]/?}"
+
+  _bk_restore_do "$src" "$d" "$name" "$mode" "$slug" "$root" || ok=false
+  # area di estrazione o contenuto di prima rimasti: se il ripristino è fallito non
+  # deve restare nulla di ciò che questo processo ha creato (tranne, se serve, il
+  # contenuto di prima che non è tornato: lo dice BK_ERR).
+  if [[ "$ok" == false ]]; then _bk_stage_clean "$slug" "$root"; fi
+
+  case "$mode" in
+    all) label="tutto" ;;
+    db) label="database" ;;
+    *) label="file" ;;
+  esac
+  bdate=""
+  if [[ -n "$_BK_R_BDATE" ]]; then bdate="$(date -d "$_BK_R_BDATE" '+%d/%m %H:%M' 2>/dev/null || true)"; fi
+  if [[ "$ok" == true ]]; then
+    text="♻️ $(hostname): $d ripristinato al ${bdate:-data sconosciuta}: $label"
+  else
+    text="♻️ $(hostname): ripristino di $d NON riuscito ($label): ${BK_ERR:-errore}"
+    if [[ "$_BK_R_NOTE" == hard ]]; then
+      text+=$'\n'"ATTENZIONE: il sito non è tornato del tutto com'era, servono mani: vedi il messaggio sopra."
+    else
+      text+=$'\n'"Il sito è com'era prima."
+    fi
+  fi
+  alert="$(_bk_send "$text")"
+  fin="$(date -Iseconds)"
+  _BK_LAST_RESTORE="$(jq -nc --arg d "$d" --arg m "$mode" --arg s "$src" --arg n "$name" --arg st "$_BK_STARTED" --arg f "$fin" \
+    --argjson ok "$ok" --arg e "$([[ "$ok" == true ]] && echo "" || echo "${BK_ERR:-errore}")" \
+    --arg sf "$([[ -n "$_BK_SAFETY" && -f "$_BK_SAFETY" ]] && basename -- "$_BK_SAFETY" || echo "")" \
+    --arg bd "$_BK_R_BDATE" --argjson al "$alert" \
+    '{domain: $d, mode: $m, source: $s, name: $n, started: $st, finished: $f, ok: $ok,
+      error: (if $e == "" then null else $e end), safety: (if $sf == "" then null else $sf end),
+      backup_date: (if $bd == "" then null else $bd end), alert: $al}')"
+  _bk_state_write null "$_BK_PREV_LAST" || log "vps-backup: state.json non scritto"
+  log "vps-backup: ripristino di $d finito (ok=$ok)"
+  jq -nc --argjson ok "$ok" '{ok: true, finished: true, restore_ok: $ok}'
+  [[ "$ok" == true ]]
 }

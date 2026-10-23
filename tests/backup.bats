@@ -710,7 +710,7 @@ bk_tool() {
   bk_tool_env
   bk_tool status
   [ "$status" -eq 0 ]
-  jq -e --arg f "Plancia-$(hostname -s)" '. == {ok:true,connected:false,folder:$f,enabled:false,time:"04:00",job:null,interrupted:false,last_run:null,drive:null}' <<<"$output"
+  jq -e --arg f "Plancia-$(hostname -s)" '. == {ok:true,connected:false,folder:$f,enabled:false,time:"04:00",job:null,interrupted:false,last_run:null,last_restore:null,drive:null}' <<<"$output"
   [ ! -e "$BATS_TEST_TMPDIR/rclone.calls" ]
 }
 
@@ -894,6 +894,7 @@ rem() { echo "$D/${1#gdrive:}"; }
 case "$sub" in
   mkdir) mkdir -p "$(rem "$1")" ;;
   copyto)
+    if [[ "$1" == gdrive:* ]]; then cp "$(rem "$1")" "$2" || exit 1; exit 0; fi
     mkdir -p "$(dirname "$(rem "$2")")"
     cp "$BK_STATE" "$T/state.during" 2>/dev/null || true
     if [[ -f "$T/rclone.trunc" ]]; then head -c 3 "$1" >"$(rem "$2")"; else cp "$1" "$(rem "$2")"; fi ;;
@@ -1401,4 +1402,938 @@ exec /usr/bin/mv "$@"'
   [ "$status" -eq 0 ]
   [ -s "$BATS_TEST_TMPDIR/lock.at.systemctl" ]
   [ "$(sort -u "$BATS_TEST_TMPDIR/lock.at.systemctl")" = free ]
+}
+
+# ---------------------------------------------------------------------------
+# Copie locali, copie su Drive, ripristino (Task 4)
+# ---------------------------------------------------------------------------
+
+# rs_env — ambiente dei ripristini: Drive finto (bk_run_env) più un finto server SQL
+# che tiene i database in $FAKEDB/<db>/<tabella> e capisce solo le poche istruzioni
+# che il codice usa. Chi non è root può lavorare solo sul proprio database
+# (e su <slug>__ripristino); la riga BROKEN simula un dump rotto.
+rs_env() {
+  bk_run_env
+  export FAKEDB="$BATS_TEST_TMPDIR/fakedb" BK_CF_PURGE="$BATS_TEST_TMPDIR/bin/vps-cf-purge"
+  mkdir -p "$FAKEDB"
+  # shellcheck disable=SC2016
+  make_stub mariadb 'T="$BATS_TEST_TMPDIR"; F="$T/fakedb"
+echo "mariadb $*" >>"$T/mariadb.calls"
+cp "$BK_STATE" "$T/state.during.$(date +%s%N)" 2>/dev/null || true
+for l in "$BK_LOCK_DIR"/vps-site.*.lock "$BK_LOCK_DIR"/vps-backup.lock; do
+  [[ -e "$l" ]] || continue
+  if flock -n "$l" true; then echo "libero $(basename "$l")" >>"$T/lock.seen"; else echo "preso $(basename "$l")" >>"$T/lock.seen"; fi
+done
+user=root; db=""; q=""
+while (($#)); do
+  case "$1" in
+    --defaults-file=*) cnf="${1#*=}"; user="$(sed -n "s/^user=//p" "$cnf")"; cp "$cnf" "$T/cnf.seen" ;;
+    -e) q="$2"; shift ;;
+    -*) ;;
+    *) db="$1" ;;
+  esac
+  shift
+done
+if [[ -n "$q" ]]; then in="$q"; else in="$(cat)"; fi
+[[ "$user" == root ]] || printf '%s\n' "$in" >>"$T/load.stdin"
+if [[ "$user" != root && -n "$db" && "$db" != "$user" && "$db" != "${user}__ripristino" ]]; then echo "ERROR 1044 access denied" >&2; exit 1; fi
+if [[ "$user" != root && -f "$T/fail.load.$db" ]]; then rm -f "$T/fail.load.$db"; echo "ERROR 2013 lost connection" >&2; exit 1; fi
+while IFS= read -r line; do
+  case "$line" in
+    "DROP DATABASE IF EXISTS "*) n="${line#*\`}"; n="${n%%\`*}"; rm -rf "${F:?}/${n:?}"; echo "$user drop $n" >>"$T/sql.log" ;;
+    "CREATE DATABASE "*) n="${line#*\`}"; n="${n%%\`*}"; mkdir -p "$F/$n"; echo "$user create $n" >>"$T/sql.log" ;;
+    GRANT*|REVOKE*) echo "$user $line" >>"$T/grants.log" ;;
+    "CREATE TABLE "*) [[ -d "$F/$db" ]] || { echo "ERROR 1046 no database" >&2; exit 1; }; n="${line#*\`}"; n="${n%%\`*}"; : >"$F/$db/$n" ;;
+    "INSERT INTO "*) n="${line#*\`}"; n="${n%%\`*}"; [[ -f "$F/$db/$n" ]] || { echo "ERROR 1146" >&2; exit 1; }; echo "$line" >>"$F/$db/$n" ;;
+    BROKEN*) echo "ERROR 1064 (42000): syntax error" >&2; exit 1 ;;
+    "USE "*) if [[ "$user" != root ]]; then echo "ERROR 1044 access denied" >&2; exit 1; fi ;;
+  esac
+done <<<"$in"
+exit "${STUB_RC_mariadb:-0}"'
+  # il dump di un database finto: le sue tabelle con le righe; DUMP_EXTRA aggiunge una riga in coda
+  # shellcheck disable=SC2016
+  make_stub mariadb-dump 'T="$BATS_TEST_TMPDIR"; F="$T/fakedb"; db="${@: -1}"
+[[ "${STUB_RC_mariadb_dump:-0}" == 0 ]] || exit "$STUB_RC_mariadb_dump"
+echo "-- dump $db"
+for t in "$F/$db"/*; do
+  [[ -f "$t" ]] || continue
+  echo "CREATE TABLE \`$(basename "$t")\` (id int);"
+  cat "$t"
+done
+[[ -z "${DUMP_EXTRA:-}" ]] || echo "$DUMP_EXTRA"
+exit 0'
+  # shellcheck disable=SC2016
+  make_stub vps-cf-purge 'echo "vps-cf-purge $*" >>"$BATS_TEST_TMPDIR/cf.purge"; exit "${STUB_RC_cf_purge:-0}"'
+  # l'utente Redis del sito c'è nel file ACL
+  printf 'user default off\nuser site_a_it on #abc ~site_a_it:* +@all\n' >"$REDIS_ACL_FILE"
+}
+
+# fdb_set DB TABELLA [RIGA...] — crea la tabella nel finto server.
+fdb_set() {
+  local db="$1" t="$2"
+  shift 2
+  mkdir -p "$FAKEDB/$db"
+  : >"$FAKEDB/$db/$t"
+  local r
+  for r in "$@"; do printf 'INSERT INTO `%s` VALUES (%s);\n' "$t" "$r" >>"$FAKEDB/$db/$t"; done
+}
+
+# fdb_tables DB — tabelle del finto server, in una riga.
+fdb_tables() { ls "$FAKEDB/$1" 2>/dev/null | paste -sd' '; }
+
+# rs_site — sito a.it con database "buono", archiviato in backups/sites; poi
+# modificato: un file nuovo, uno tolto, wp-config cambiato, tabelle diverse.
+# Lascia il nome dell'archivio in $ARC_NAME (kind/file) e il percorso in $ARC.
+rs_site() {
+  local d=a.it slug root
+  mk_site "$d" yes
+  site_reg_update "$d" '.zone = "miosito.it"'
+  slug="$(site_reg_get "$d" .slug)"
+  root="$SITES_WWW/$d"
+  printf 'DB_HOST=localhost\nDB_NAME=%s\nDB_USER=%s\nDB_PASS=Password-di-prova-123\n' "$slug" "$slug" >"$root/db.env"
+  fdb_set "$slug" utenti "1,'ana'" "2,'bo'"
+  fdb_set "$slug" ordini "10"
+  mkdir -p "$BK_BACKUPS/sites"
+  ARC_NAME="sites/$d-20261001-0400.tar.gz"
+  ARC="$BK_BACKUPS/$ARC_NAME"
+  bk_archive "$d" "$ARC"
+  # dopo l'archivio il sito cambia
+  echo nuovo >"$root/public/nuovo.txt"
+  rm -f "$root/public/-x"
+  echo '<?php // wp-config cambiato' >"$root/wp-config.php"
+  rm -f "${FAKEDB:?}/${slug:?}/ordini"
+  fdb_set "$slug" extra "7"
+}
+
+# --- list-local, read-local, delete-local ------------------------------------
+
+@test "list-local: panel, sito nuovo, sito vecchio senza manifest, copia di sicurezza; restorable e scadenze" {
+  rs_env
+  mk_site a.it no
+  mkdir -p "$BK_BACKUPS"/{panel,sites,restore}
+  bk_archive a.it "$BK_BACKUPS/sites/a.it-20261001-0400.tar.gz"
+  bk_archive a.it "$BK_BACKUPS/restore/a.it-20261002-101500.tar.gz"
+  # formato vecchio: tar di tutta la cartella e dump a parte
+  tar -czf "$BK_BACKUPS/sites/b.it-20260901-120000.tar.gz" -C "$SITES_WWW" a.it
+  echo x | gzip >"$BK_BACKUPS/sites/b.it-20260901-120000.sql.gz"
+  echo y | gzip >"$BK_BACKUPS/panel/v1.6.1-20261003-030000-ab12.sql.gz"
+  echo z >"$BK_BACKUPS/sites/estraneo.txt"
+  touch -d '2026-10-01 04:00' "$BK_BACKUPS/sites/a.it-20261001-0400.tar.gz"
+  touch -d '2026-10-02 10:15' "$BK_BACKUPS/restore/a.it-20261002-101500.tar.gz"
+  touch -d '2026-09-01 12:00' "$BK_BACKUPS/sites/b.it-20260901-120000".*
+  touch -d '2026-10-03 03:00' "$BK_BACKUPS/panel/v1.6.1-20261003-030000-ab12.sql.gz"
+  bk_tool list-local
+  [ "$status" -eq 0 ]
+  jq -e '.ok == true and (.items | length) == 5' <<<"$output"
+  jq -e '.items[] | select(.name == "sites/a.it-20261001-0400.tar.gz")
+    | .kind == "site" and .domain == "a.it" and .restorable == true and (.size > 0) and (.expires | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}")) and (.date | test("^2026-10-01T04:00"))' <<<"$output"
+  jq -e '.items[] | select(.name == "restore/a.it-20261002-101500.tar.gz") | .kind == "restore" and .restorable == true and .domain == "a.it" and .expires == "2026-10-09"' <<<"$output"
+  jq -e '.items[] | select(.name == "sites/b.it-20260901-120000.tar.gz") | .restorable == false and .kind == "site" and .domain == "b.it" and .expires == "2026-10-01"' <<<"$output"
+  jq -e '.items[] | select(.name == "sites/b.it-20260901-120000.sql.gz") | .restorable == false' <<<"$output"
+  jq -e '.items[] | select(.kind == "panel") | .name == "panel/v1.6.1-20261003-030000-ab12.sql.gz" and .domain == null and .expires == null and .restorable == false' <<<"$output"
+  # ordinate dalla più recente
+  [ "$(jq -r '.items[0].kind' <<<"$output")" = panel ]
+}
+
+@test "list-local: cartelle vuote o mancanti = elenco vuoto" {
+  rs_env
+  bk_tool list-local
+  [ "$status" -eq 0 ]
+  [ "$(jq -c . <<<"$output")" = '{"ok":true,"items":[]}' ]
+}
+
+@test "read-local: la copia esce su stdout byte per byte; nomi non validi rifiutati" {
+  rs_env
+  mkdir -p "$BK_BACKUPS"/{panel,sites,restore}
+  head -c 3000 /dev/urandom >"$BK_BACKUPS/panel/p-20261003-030000-ab12.sql.gz"
+  bash "$T_TOOL" read-local panel/p-20261003-030000-ab12.sql.gz >"$BATS_TEST_TMPDIR/out.bin" 2>/dev/null
+  cmp "$BATS_TEST_TMPDIR/out.bin" "$BK_BACKUPS/panel/p-20261003-030000-ab12.sql.gz"
+  local n
+  for n in ../../etc/passwd panel/../../etc/passwd panel/a/b.sql.gz tmp/x.tar.gz sites/..%2f x.sql.gz "panel/a b.sql.gz" panel/ "" sites/a.it-20261001-0400.tar.gz; do
+    bk_tool read-local "$n"
+    [ "$status" -ne 0 ] || { echo "accettato: $n"; false; }
+    jq -e '.ok == false' <<<"$output"
+  done
+}
+
+@test "delete-local: elimina solo dentro panel, sites e restore; ../../etc/passwd rifiutato" {
+  rs_env
+  mkdir -p "$BK_BACKUPS"/{panel,sites,restore}
+  echo x >"$BK_BACKUPS/restore/a.it-20261002-101500.tar.gz"
+  echo x >"$BK_BACKUPS/sites/a.it-20261001-0400.tar.gz"
+  echo precious >"$BATS_TEST_TMPDIR/fuori"
+  ln -s "$BATS_TEST_TMPDIR/fuori" "$BK_BACKUPS/sites/l.it-20261001-0400.tar.gz"
+  local n
+  for n in ../../etc/passwd restore/../sites/a.it-20261001-0400.tar.gz restore/a.it-20261002-101500.tar.gz/../x tmp/x ../fuori restore/a.it-20261002-1015.tar.gz.sh; do
+    bk_tool delete-local "$n"
+    [ "$status" -ne 0 ] || { echo "accettato: $n"; false; }
+  done
+  # un collegamento simbolico non si segue e non si tocca
+  bk_tool delete-local sites/l.it-20261001-0400.tar.gz
+  [ "$status" -ne 0 ]
+  [ -f "$BATS_TEST_TMPDIR/fuori" ]
+  [ -f "$BK_BACKUPS/sites/a.it-20261001-0400.tar.gz" ]
+  bk_tool delete-local restore/a.it-20261002-101500.tar.gz
+  [ "$status" -eq 0 ]
+  jq -e '.ok == true' <<<"$output"
+  [ ! -e "$BK_BACKUPS/restore/a.it-20261002-101500.tar.gz" ]
+  [ -f "$BK_BACKUPS/sites/a.it-20261001-0400.tar.gz" ]
+  bk_tool delete-local restore/a.it-20261002-101500.tar.gz
+  [ "$status" -ne 0 ]
+}
+
+@test "delete-local: rifiutato mentre un giro o un ripristino tiene il lock globale" {
+  rs_env
+  mkdir -p "$BK_BACKUPS/restore"
+  echo x >"$BK_BACKUPS/restore/a.it-20261002-101500.tar.gz"
+  exec {gl}>>"$BK_LOCK_DIR/vps-backup.lock"
+  flock -n "$gl"
+  bk_tool delete-local restore/a.it-20261002-101500.tar.gz
+  exec {gl}>&-
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"backup in corso"* ]]
+  [ -f "$BK_BACKUPS/restore/a.it-20261002-101500.tar.gz" ]
+}
+
+# --- list-remote, read-remote -------------------------------------------------
+
+@test "list-remote: siti con copie (più recente prima), present dal registro, pannello" {
+  rs_env
+  mk_site a.it no
+  mkdir -p "$DRIVE/F/a.it" "$DRIVE/F/vecchio.it" "$DRIVE/F/_pannello"
+  echo aa >"$DRIVE/F/a.it/a.it-20261001-0400.tar.gz"
+  echo aaaa >"$DRIVE/F/a.it/a.it-20261002-0400.tar.gz"
+  echo "non mia" >"$DRIVE/F/a.it/appunti.txt"
+  echo v >"$DRIVE/F/vecchio.it/vecchio.it-20260901-0400.tar.gz"
+  echo pp >"$DRIVE/F/_pannello/pannello-20261002-0400.sql.gz"
+  bk_tool list-remote
+  [ "$status" -eq 0 ]
+  jq -e '.ok == true and (.sites | length) == 2' <<<"$output"
+  jq -e '.sites[] | select(.domain == "a.it") | .present == true and (.copies | map(.name)) == ["a.it/a.it-20261002-0400.tar.gz","a.it/a.it-20261001-0400.tar.gz"]
+    and .copies[0].size == 5 and (.copies[0].date | test("^2026-10-02T04:00"))' <<<"$output"
+  jq -e '.sites[] | select(.domain == "vecchio.it") | .present == false and (.copies | length) == 1' <<<"$output"
+  jq -e '.panel == [{"name":"_pannello/pannello-20261002-0400.sql.gz","date":"2026-10-02T04:00:00","size":3}]' <<<"$output"
+}
+
+@test "list-remote: cartella ancora inesistente = elenchi vuoti; Drive non collegato = errore" {
+  rs_env
+  bk_tool list-remote
+  [ "$status" -eq 0 ]
+  jq -e '.ok == true and .sites == [] and .panel == []' <<<"$output"
+  rm "$VPS_OPT/secrets/rclone.conf"
+  bk_tool list-remote
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"non collegato"* ]]
+}
+
+@test "list-remote: Drive che non risponde = errore leggibile" {
+  rs_env
+  mkdir -p "$DRIVE/F"
+  echo lsjson >"$BATS_TEST_TMPDIR/rclone.fail"
+  echo "token revocato" >"$BATS_TEST_TMPDIR/rclone.msg"
+  bk_tool list-remote
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"token revocato"* ]]
+}
+
+@test "read-remote: scarica da Drive e manda su stdout, niente resta in backups/tmp; nomi non validi rifiutati" {
+  rs_env
+  mkdir -p "$DRIVE/F/a.it" "$DRIVE/F/_pannello"
+  head -c 5000 /dev/urandom >"$DRIVE/F/a.it/a.it-20261001-0400.tar.gz"
+  head -c 700 /dev/urandom >"$DRIVE/F/_pannello/pannello-20261001-0400.sql.gz"
+  bash "$T_TOOL" read-remote a.it/a.it-20261001-0400.tar.gz >"$BATS_TEST_TMPDIR/o1" 2>/dev/null
+  cmp "$BATS_TEST_TMPDIR/o1" "$DRIVE/F/a.it/a.it-20261001-0400.tar.gz"
+  bash "$T_TOOL" read-remote _pannello/pannello-20261001-0400.sql.gz >"$BATS_TEST_TMPDIR/o2" 2>/dev/null
+  cmp "$BATS_TEST_TMPDIR/o2" "$DRIVE/F/_pannello/pannello-20261001-0400.sql.gz"
+  [ -z "$(ls -A "$BK_BACKUPS/tmp")" ]
+  local n
+  for n in ../x a.it/../b.it/b.it-20261001-0400.tar.gz a.it/b.it-20261001-0400.tar.gz a.it/a.it-20261001-0400.tar.gz/x \
+    /a.it/a.it-20261001-0400.tar.gz a.it/appunti.txt _pannello/../a.it/x "a.it/a.it-20261001-0400.tar.gz;ls" "" a.it _pannello/a.it-20261001-0400.tar.gz; do
+    bk_tool read-remote "$n"
+    [ "$status" -ne 0 ] || { echo "accettato: $n"; false; }
+    jq -e '.ok == false' <<<"$output"
+  done
+  bk_tool read-remote a.it/a.it-20261009-0400.tar.gz
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"non trovata"* ]]
+}
+
+# --- restore / restore-local: avvio -------------------------------------------
+
+@test "restore: parte come unità vps-backup-restore-<slug> con _restore remote, risposta started" {
+  rs_env
+  rs_site
+  mkdir -p "$DRIVE/F/a.it"
+  cp "$ARC" "$DRIVE/F/a.it/a.it-20261001-0400.tar.gz"
+  bk_tool restore a.it a.it/a.it-20261001-0400.tar.gz files
+  [ "$status" -eq 0 ]
+  [ "$(jq -c . <<<"$output")" = '{"ok":true,"started":true}' ]
+  grep -q 'systemd-run --unit vps-backup-restore-site_a_it --collect' "$CALLS"
+  grep -q 'BK_UNIT=vps-backup-restore-site_a_it' "$CALLS"
+  grep -q ' _restore remote a.it a.it/a.it-20261001-0400.tar.gz files$' "$CALLS"
+  # il sito non è stato toccato dal solo avvio
+  [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
+}
+
+@test "restore-local: parte con _restore local, il dominio viene dal nome del file" {
+  rs_env
+  rs_site
+  bk_tool restore-local "$ARC_NAME" all
+  [ "$status" -eq 0 ]
+  [ "$(jq -c . <<<"$output")" = '{"ok":true,"started":true}' ]
+  grep -q " _restore local a.it $ARC_NAME all\$" "$CALLS"
+}
+
+@test "restore: argomenti non validi, sito sconosciuto, Drive non collegato = errore e nessuna unità" {
+  rs_env
+  rs_site
+  local a
+  for a in "a.it a.it/a.it-20261001-0400.tar.gz tutto" "a.it a.it/a.it-20261001-0400.tar.gz" "a.it b.it/b.it-20261001-0400.tar.gz files" \
+    "a.it a.it/../a.it-20261001-0400.tar.gz files" "../a.it a.it/a.it-20261001-0400.tar.gz files" "z.it z.it/z.it-20261001-0400.tar.gz files" \
+    "a.it a.it/a.it-20261001-0400.tar.gz;x files"; do
+    # shellcheck disable=SC2086
+    bk_tool restore $a
+    [ "$status" -ne 0 ] || { echo "accettato: $a"; false; }
+  done
+  for a in "panel/p-20261003-030000-ab12.sql.gz all" "../x all" "sites/a.it-20261001-0400.tar.gz tutto" "sites/a.it-20261001-0400.sql.gz all" "sites/z.it-20261001-0400.tar.gz all"; do
+    # shellcheck disable=SC2086
+    bk_tool restore-local $a
+    [ "$status" -ne 0 ] || { echo "accettato: $a"; false; }
+  done
+  run ! grep -q 'systemd-run' "$CALLS"
+  rm "$VPS_OPT/secrets/rclone.conf"
+  bk_tool restore a.it a.it/a.it-20261001-0400.tar.gz files
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"non collegato"* ]]
+}
+
+@test "restore: rifiutato con 'backup in corso' (lock globale) e 'ripristino in corso' (lock del sito)" {
+  rs_env
+  rs_site
+  exec {gl}>>"$BK_LOCK_DIR/vps-backup.lock"
+  flock -n "$gl"
+  bk_tool restore-local "$ARC_NAME" files
+  exec {gl}>&-
+  [ "$status" -ne 0 ]
+  jq -e '.error == "backup in corso"' <<<"$output"
+  exec {sl}>>"$BK_LOCK_DIR/vps-site.site_a_it.lock"
+  flock -n "$sl"
+  bk_tool restore-local "$ARC_NAME" files
+  exec {sl}>&-
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"ripristino in corso"* ]]
+  run ! grep -q 'systemd-run' "$CALLS"
+}
+
+@test "restore: systemd-run che fallisce = errore" {
+  rs_env
+  rs_site
+  STUB_RC_systemd_run=1 bk_tool restore-local "$ARC_NAME" files
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false' <<<"$output"
+}
+
+@test "_restore: rifiutato attraverso sudo (resta interno)" {
+  rs_env
+  run env SUDO_USER=panel VPS_OPT="$VPS_OPT" bash "$T_TOOL" _restore local a.it x files
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"comando interno"* ]]
+}
+
+# --- _restore: i passi ----------------------------------------------------------
+
+# rs_run SRC DOM NAME MODE — lancia il ripristino vero e proprio (l'unità di systemd).
+rs_run() { bk_tool _restore "$@"; }
+
+@test "_restore db: tabelle del sito sostituite da quelle dell'archivio, file intatti, copia di sicurezza fatta, temporaneo tolto" {
+  rs_env
+  rs_site
+  local slug=site_a_it
+  rs_run local a.it "$ARC_NAME" db
+  [ "$status" -eq 0 ]
+  jq -e '.ok == true and .restore_ok == true' <<<"$output"
+  [ "$(fdb_tables $slug)" = "ordini utenti" ]
+  grep -q "'ana'" "$FAKEDB/$slug/utenti"
+  # il database temporaneo non c'è più e il suo permesso è stato tolto
+  [ ! -d "$FAKEDB/${slug}__ripristino" ]
+  grep -q 'REVOKE' "$BATS_TEST_TMPDIR/grants.log"
+  # file del sito intatti (anche quelli cambiati dopo l'archivio)
+  [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
+  grep -q 'wp-config cambiato' "$SITES_WWW/a.it/wp-config.php"
+  # copia di sicurezza: solo la parte toccata, nel formato nuovo
+  [ "$(ls "$BK_BACKUPS/restore" | wc -l)" -eq 1 ]
+  local s="$BK_BACKUPS/restore/$(ls "$BK_BACKUPS/restore")"
+  [[ "$s" =~ /a\.it-[0-9]{8}-[0-9]{6}\.tar\.gz$ ]]
+  [ "$(stat -c %a "$s")" = 600 ]
+  bk_verify "$s"
+  tar -xzOf "$s" db.sql.gz | gzip -dc | grep -q 'extra'
+  [ -z "$(ls -A "$BK_BACKUPS/tmp")" ]
+}
+
+@test "_restore db: il dump si carica con l'utente del sito (mai root), password solo in un file 600, mai negli argomenti" {
+  rs_env
+  rs_site
+  rs_run local a.it "$ARC_NAME" db
+  [ "$status" -eq 0 ]
+  grep -q '^user=site_a_it$' "$BATS_TEST_TMPDIR/cnf.seen"
+  grep -q 'Password-di-prova-123' "$BATS_TEST_TMPDIR/cnf.seen"
+  run ! grep -q 'Password-di-prova-123' "$BATS_TEST_TMPDIR/mariadb.calls"
+  run ! grep -q 'Password-di-prova-123' "$VPS_LOG"
+  # il permesso sul temporaneo c'è solo per il tempo del caricamento, con il _ protetto
+  grep -q 'GRANT ALL PRIVILEGES ON `site\\_a\\_it\\_\\_ripristino`' "$BATS_TEST_TMPDIR/grants.log"
+}
+
+@test "_restore db: DEFINER tolto dalle definizioni di oggetti (si caricano con l'utente del sito), righe di dati intatte" {
+  rs_env
+  rs_site
+  fdb_set site_a_it note "1,'DEFINER=\`x\`@\`y\`'"
+  DUMP_EXTRA='/*!50003 CREATE*/ /*!50017 DEFINER=`root`@`localhost`*/ /*!50003 TRIGGER tr BEFORE INSERT ON u FOR EACH ROW SET NEW.a = 1 */' bk_archive a.it "$BK_BACKUPS/$ARC_NAME"
+  rs_run local a.it "$ARC_NAME" db
+  [ "$status" -eq 0 ]
+  grep -q 'TRIGGER tr BEFORE INSERT' "$BATS_TEST_TMPDIR/load.stdin"
+  run ! grep -q 'DEFINER=`root`' "$BATS_TEST_TMPDIR/load.stdin"
+  grep -q "INSERT INTO \`note\` VALUES (1,'DEFINER=\`x\`@\`y\`')" "$BATS_TEST_TMPDIR/load.stdin"
+}
+
+@test "_restore files: public/ come nell'archivio, wp-config.php invariato, utente del sito, niente temporanei" {
+  rs_env
+  rs_site
+  local root="$SITES_WWW/a.it"
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -eq 0 ]
+  jq -e '.restore_ok == true' <<<"$output"
+  [ -f "$root/public/-x" ]
+  [ -f "$root/public/a b.php" ]
+  [ ! -e "$root/public/nuovo.txt" ]
+  grep -q 'wp-config cambiato' "$root/wp-config.php"
+  # il database non si tocca
+  [ "$(fdb_tables site_a_it)" = "extra utenti" ]
+  # tutto come utente del sito
+  grep -q '^runuser -u site_a_it' "$CALLS"
+  # nessun avanzo: né area di estrazione né il vecchio contenuto
+  [ -z "$(ls -A "$root/tmp" | grep -v '^sess$' || true)" ]
+  [ -d "$root/public" ]
+}
+
+@test "_restore files: la cartella public/ resta la stessa (permessi e ACL non si perdono), si sostituisce il contenuto" {
+  rs_env
+  rs_site
+  local root="$SITES_WWW/a.it" ino
+  ino="$(stat -c %i "$root/public")"
+  chmod 2770 "$root/public"
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -eq 0 ]
+  [ "$(stat -c %i "$root/public")" = "$ino" ]
+  [ "$(stat -c %a "$root/public")" = 2770 ]
+}
+
+@test "_restore files: l'estrazione avviene come utente del sito, in tmp/.vpsbackup-x.*, con --no-same-owner e --no-same-permissions" {
+  rs_env
+  rs_site
+  # shellcheck disable=SC2016
+  make_stub tar 'case " $* " in *" -x"*) echo "tar $* cwd=$PWD" >>"$BATS_TEST_TMPDIR/tar.x";; esac; exec /usr/bin/tar "$@"'
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -eq 0 ]
+  grep -q -- '--no-same-owner' "$BATS_TEST_TMPDIR/tar.x"
+  grep -q -- '--no-same-permissions' "$BATS_TEST_TMPDIR/tar.x"
+  grep -q -- "-C tmp/.vpsbackup-x\." "$BATS_TEST_TMPDIR/tar.x"
+  grep -q "cwd=$SITES_WWW/a.it" "$BATS_TEST_TMPDIR/tar.x"
+}
+
+@test "_restore all: file e database insieme" {
+  rs_env
+  rs_site
+  rs_run local a.it "$ARC_NAME" all
+  [ "$status" -eq 0 ]
+  [ "$(fdb_tables site_a_it)" = "ordini utenti" ]
+  [ -f "$SITES_WWW/a.it/public/-x" ]
+  [ ! -e "$SITES_WWW/a.it/public/nuovo.txt" ]
+  grep -q 'wp-config cambiato' "$SITES_WWW/a.it/wp-config.php"
+  local s="$BK_BACKUPS/restore/$(ls "$BK_BACKUPS/restore")"
+  tar -tzf "$s" | grep -qx db.sql.gz
+  tar -xzOf "$s" files.tar.gz | tar -tzf - | grep -q 'public/nuovo.txt'
+}
+
+@test "_restore: manifest di un altro dominio = rifiutato prima di toccare nulla, nessuna copia di sicurezza" {
+  rs_env
+  rs_site
+  mk_site b.it yes
+  fdb_set site_b_it t "1"
+  cp "$ARC" "$BK_BACKUPS/sites/b.it-20261001-0400.tar.gz"
+  rs_run local b.it sites/b.it-20261001-0400.tar.gz all
+  [ "$status" -ne 0 ]
+  [ "$(fdb_tables site_b_it)" = "t" ]
+  [ -f "$SITES_WWW/b.it/public/a b.php" ]
+  [ -z "$(ls -A "$BK_BACKUPS/restore" 2>/dev/null)" ]
+  [ -z "$(ls -A "$BK_BACKUPS/tmp")" ]
+  [[ "$(jq -r '.last_restore.error' "$BK_STATE")" == *"a.it"* ]]
+}
+
+@test "_restore: archivio con '../x' = rifiutato, sito intatto, niente copia di sicurezza né temporanei" {
+  rs_env
+  rs_site
+  local w="$BATS_TEST_TMPDIR/evil" sha
+  mkdir -p "$w/src/public"
+  echo e >"$w/src/public/ok"
+  tar -cf "$w/files.tar" -C "$w/src" public --transform 's,^public/ok$,public/../../x,'
+  gzip -n "$w/files.tar"
+  sha="$(sha256sum "$w/files.tar.gz" | cut -d' ' -f1)"
+  jq -n --arg s "$sha" '{domain:"a.it", sha256:{files:$s, db:null}}' >"$w/manifest.json"
+  tar -czf "$BK_BACKUPS/sites/a.it-20261005-0400.tar.gz" -C "$w" manifest.json files.tar.gz
+  rs_run local a.it sites/a.it-20261005-0400.tar.gz files
+  [ "$status" -ne 0 ]
+  jq -e '.last_restore.ok == false' "$BK_STATE"
+  [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
+  [ ! -e "$SITES_WWW/a.it/public/ok" ]
+  [ -z "$(ls -A "$BK_BACKUPS/restore" 2>/dev/null)" ]
+  [ -z "$(ls -A "$BK_BACKUPS/tmp")" ]
+  [ -z "$(ls -A "$SITES_WWW/a.it/tmp" | grep -v '^sess$' || true)" ]
+}
+
+@test "_restore: sha256 sbagliato = rifiutato, sito intatto, niente copia di sicurezza" {
+  rs_env
+  rs_site
+  local w="$BATS_TEST_TMPDIR/x"
+  mkdir -p "$w"
+  tar -xzf "$ARC" -C "$w"
+  jq '.sha256.files = ("0" * 64)' "$w/manifest.json" >"$w/m2" && mv "$w/m2" "$w/manifest.json"
+  tar -czf "$BK_BACKUPS/sites/a.it-20261005-0400.tar.gz" -C "$w" manifest.json files.tar.gz db.sql.gz
+  rs_run local a.it sites/a.it-20261005-0400.tar.gz all
+  [ "$status" -ne 0 ]
+  [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
+  [ "$(fdb_tables site_a_it)" = "extra utenti" ]
+  [ -z "$(ls -A "$BK_BACKUPS/restore" 2>/dev/null)" ]
+  jq -e '.last_restore.ok == false and (.last_restore.error | test("checksum"))' "$BK_STATE"
+}
+
+@test "_restore: archivio nel formato vecchio (senza manifest) = rifiutato" {
+  rs_env
+  rs_site
+  tar -czf "$BK_BACKUPS/sites/a.it-20260901-120000.tar.gz" -C "$SITES_WWW" a.it
+  rs_run local a.it sites/a.it-20260901-120000.tar.gz files
+  [ "$status" -ne 0 ]
+  [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
+  jq -e '.last_restore.ok == false' "$BK_STATE"
+}
+
+@test "_restore db: dump rotto a metà = il sito resta com'era (il caricamento di prova non lo tocca), esito con errore" {
+  rs_env
+  rs_site
+  # un archivio con checksum giusti ma SQL che si rompe dopo le prime tabelle
+  DUMP_EXTRA=BROKEN bk_archive a.it "$BK_BACKUPS/$ARC_NAME"
+  fdb_set site_a_it prima "5"
+  local before
+  before="$(fdb_tables site_a_it)"
+  rs_run local a.it "$ARC_NAME" db
+  [ "$status" -ne 0 ]
+  jq -e '.restore_ok == false' <<<"$output"
+  [ "$(fdb_tables site_a_it)" = "$before" ]
+  [ ! -d "$FAKEDB/site_a_it__ripristino" ]
+  jq -e '.last_restore.ok == false and .last_restore.mode == "db" and (.last_restore.error | length > 0)' "$BK_STATE"
+  # nessuna copia di sicurezza lasciata per un ripristino mai cominciato
+  [ -z "$(ls -A "$BK_BACKUPS/restore" 2>/dev/null)" ]
+  [ -z "$(ls -A "$BK_BACKUPS/tmp")" ]
+}
+
+@test "_restore all: dump rotto = anche i file restano com'erano" {
+  rs_env
+  rs_site
+  DUMP_EXTRA=BROKEN bk_archive a.it "$BK_BACKUPS/$ARC_NAME"
+  rs_run local a.it "$ARC_NAME" all
+  [ "$status" -ne 0 ]
+  [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
+  [ ! -e "$SITES_WWW/a.it/public/-x" ]
+  [ -z "$(ls -A "$SITES_WWW/a.it/tmp" | grep -v '^sess$' || true)" ]
+}
+
+@test "_restore db: caricamento vero che fallisce dopo la prova = si ricarica la copia di sicurezza" {
+  rs_env
+  rs_site
+  local before
+  before="$(fdb_tables site_a_it)"
+  # la prova (su <slug>__ripristino) passa, il caricamento nel database del sito no
+  touch "$BATS_TEST_TMPDIR/fail.load.site_a_it"
+  rs_run local a.it "$ARC_NAME" db
+  [ "$status" -ne 0 ]
+  jq -e '.last_restore.ok == false' "$BK_STATE"
+  [ "$(fdb_tables site_a_it)" = "$before" ]
+  grep -q '7' "$FAKEDB/site_a_it/extra"
+}
+
+@test "_restore all: database che fallisce dopo lo scambio dei file = anche i file tornano come prima" {
+  rs_env
+  rs_site
+  touch "$BATS_TEST_TMPDIR/fail.load.site_a_it"
+  rs_run local a.it "$ARC_NAME" all
+  [ "$status" -ne 0 ]
+  [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
+  [ ! -e "$SITES_WWW/a.it/public/-x" ]
+  [ "$(fdb_tables site_a_it)" = "extra utenti" ]
+  [ -z "$(ls -A "$SITES_WWW/a.it/tmp" | grep -v '^sess$' || true)" ]
+}
+
+@test "_restore files: scambio che fallisce a metà = il contenuto di prima torna in public/" {
+  rs_env
+  rs_site
+  local root="$SITES_WWW/a.it"
+  # lo spostamento del contenuto nuovo dentro public/ fallisce (quello di ritorno no)
+  # shellcheck disable=SC2016
+  make_stub mv 'if [[ "$*" == *"-t public"* && "$*" == *".vpsbackup-x."* ]]; then exit 1; fi; exec /usr/bin/mv "$@"'
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -ne 0 ]
+  [ -f "$root/public/nuovo.txt" ]
+  [ -f "$root/public/a b.php" ]
+  jq -e '.last_restore.ok == false' "$BK_STATE"
+}
+
+@test "_restore: archivio senza database ma sito con database = 'all' e 'db' rifiutati, 'files' accettato" {
+  rs_env
+  rs_site
+  mk_site c.it no
+  bk_archive c.it "$BK_BACKUPS/sites/c.it-20261001-0400.tar.gz"
+  site_reg_update c.it '.db = true'
+  rs_run local c.it sites/c.it-20261001-0400.tar.gz all
+  [ "$status" -ne 0 ]
+  rs_run local c.it sites/c.it-20261001-0400.tar.gz db
+  [ "$status" -ne 0 ]
+  jq -e '.last_restore.error | test("database")' "$BK_STATE"
+  rs_run local c.it sites/c.it-20261001-0400.tar.gz files
+  [ "$status" -eq 0 ]
+}
+
+@test "_restore: sito sconosciuto o non attivo, modo sbagliato, nome non valido = rifiutati" {
+  rs_env
+  rs_site
+  rs_run local z.it sites/z.it-20261001-0400.tar.gz files
+  [ "$status" -ne 0 ]
+  rs_run local a.it "$ARC_NAME" tutto
+  [ "$status" -ne 0 ]
+  rs_run local a.it ../../etc/passwd files
+  [ "$status" -ne 0 ]
+  rs_run local a.it panel/p-20261003-030000-ab12.sql.gz files
+  [ "$status" -ne 0 ]
+  site_reg_update a.it '.state = "creating"'
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -ne 0 ]
+  [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
+}
+
+@test "_restore: prende il lock globale e quello del sito per tutta la durata, li libera alla fine" {
+  rs_env
+  rs_site
+  : >"$BK_LOCK_DIR/vps-site.site_a_it.lock"
+  rs_run local a.it "$ARC_NAME" db
+  [ "$status" -eq 0 ]
+  grep -q 'preso vps-backup.lock' "$BATS_TEST_TMPDIR/lock.seen"
+  grep -q 'preso vps-site.site_a_it.lock' "$BATS_TEST_TMPDIR/lock.seen"
+  run ! grep -q 'libero vps-backup.lock' "$BATS_TEST_TMPDIR/lock.seen"
+  # finito: liberi
+  run bk_global_busy
+  [ "$status" -eq 1 ]
+  run bk_site_locked site_a_it
+  [ "$status" -eq 1 ]
+}
+
+@test "_restore: rifiutato se un giro (lock globale) o un altro processo sul sito è in corso" {
+  rs_env
+  rs_site
+  exec {gl}>>"$BK_LOCK_DIR/vps-backup.lock"
+  flock -n "$gl"
+  rs_run local a.it "$ARC_NAME" files
+  exec {gl}>&-
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"backup in corso"* ]]
+  exec {sl}>>"$BK_LOCK_DIR/vps-site.site_a_it.lock"
+  flock -n "$sl"
+  rs_run local a.it "$ARC_NAME" files
+  exec {sl}>&-
+  [ "$status" -ne 0 ]
+  [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
+}
+
+@test "_restore: lo stato in state.json durante il lavoro (op restore, dominio, passo), alla fine job null e last_restore; last_run e known restano" {
+  rs_env
+  rs_site
+  echo '{"job":null,"last_run":{"ok":true,"started":"s"},"known":["a.it"]}' >"$BK_STATE"
+  rs_run local a.it "$ARC_NAME" db
+  [ "$status" -eq 0 ]
+  local during
+  during="$(ls "$BATS_TEST_TMPDIR"/state.during.* | head -n1)"
+  jq -e '.job.op == "restore" and .job.domain == "a.it" and (.job.step | length > 0) and (.job.unit | length > 0) and (.job.started | length > 0)' "$during"
+  jq -e --arg n "$ARC_NAME" '.job == null and .last_run.ok == true and .known == ["a.it"]
+    and .last_restore.ok == true and .last_restore.domain == "a.it" and .last_restore.mode == "db"
+    and .last_restore.name == $n and .last_restore.error == null and (.last_restore.finished | length > 0)' "$BK_STATE"
+  [ "$(stat -c %a "$BK_STATE")" = 600 ]
+  # un giro dopo il ripristino non cancella last_restore
+  bk_tool _run
+  jq -e '.last_restore.ok == true' "$BK_STATE"
+  bk_tool status
+  jq -e '.last_restore.domain == "a.it"' <<<"$output"
+}
+
+@test "_restore: Telegram a ogni esito, con il nome della macchina" {
+  rs_env
+  rs_site
+  # la data è quella della copia (dal manifest), non quella del ripristino
+  local exp
+  exp="$(date -d "$(bk_manifest "$ARC" | jq -r .date)" '+%d/%m %H:%M')"
+  rs_run local a.it "$ARC_NAME" db
+  [ "$status" -eq 0 ]
+  grep -q "♻️ $(hostname): a.it ripristinato al $exp: database" "$BATS_TEST_TMPDIR/curl.args"
+  : >"$BATS_TEST_TMPDIR/curl.args"
+  rs_run local a.it "$ARC_NAME" all
+  grep -q "ripristinato al $exp: tutto" "$BATS_TEST_TMPDIR/curl.args"
+  : >"$BATS_TEST_TMPDIR/curl.args"
+  rs_run local a.it "$ARC_NAME" files
+  grep -q "ripristinato al $exp: file" "$BATS_TEST_TMPDIR/curl.args"
+}
+
+@test "_restore: un fallimento manda il messaggio di errore con il motivo e dice che il sito è com'era" {
+  rs_env
+  rs_site
+  local w="$BATS_TEST_TMPDIR/x"
+  mkdir -p "$w"
+  tar -xzf "$ARC" -C "$w"
+  jq '.sha256.files = ("0" * 64)' "$w/manifest.json" >"$w/m2" && mv "$w/m2" "$w/manifest.json"
+  tar -czf "$BK_BACKUPS/sites/a.it-20261005-0400.tar.gz" -C "$w" manifest.json files.tar.gz db.sql.gz
+  rs_run local a.it sites/a.it-20261005-0400.tar.gz files
+  [ "$status" -ne 0 ]
+  grep -q "$(hostname): ripristino di a.it NON riuscito" "$BATS_TEST_TMPDIR/curl.args"
+  grep -q 'checksum' "$BATS_TEST_TMPDIR/curl.args"
+  jq -e '.last_restore.alert == "sent"' "$BK_STATE"
+}
+
+@test "_restore: dopo il successo svuota la cache Redis del sito (EVAL con SCAN, mai KEYS) e Cloudflare; errori solo registrati" {
+  rs_env
+  rs_site
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -eq 0 ]
+  grep -q 'redis-cli --no-auth-warning --user vps-admin EVAL' "$CALLS"
+  grep -q 'SCAN' "$CALLS"
+  run ! grep -q 'KEYS' "$CALLS"
+  grep -q 'site_a_it:\*' "$CALLS"
+  grep -qx 'vps-cf-purge miosito.it --all' "$BATS_TEST_TMPDIR/cf.purge"
+  # entrambi falliscono: il ripristino riesce lo stesso
+  : >"$CALLS"
+  STUB_RC_redis_cli=1 STUB_RC_cf_purge=1 rs_run local a.it "$ARC_NAME" files
+  [ "$status" -eq 0 ]
+  jq -e '.last_restore.ok == true' "$BK_STATE"
+  grep -q 'cache' "$VPS_LOG"
+}
+
+@test "_restore: sito senza utente Redis e senza zona = nessuna chiamata alla cache" {
+  rs_env
+  rs_site
+  printf 'user default off\n' >"$REDIS_ACL_FILE"
+  site_reg_update a.it '.zone = null'
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -eq 0 ]
+  run ! grep -q 'redis-cli' "$CALLS"
+  [ ! -e "$BATS_TEST_TMPDIR/cf.purge" ]
+}
+
+@test "_restore remote: scarica da Drive in backups/tmp, verifica, ripristina, niente resta in tmp" {
+  rs_env
+  rs_site
+  mkdir -p "$DRIVE/F/a.it"
+  cp "$ARC" "$DRIVE/F/a.it/a.it-20261001-0400.tar.gz"
+  rs_run remote a.it a.it/a.it-20261001-0400.tar.gz files
+  [ "$status" -eq 0 ]
+  grep -q ' copyto gdrive:F/a.it/a.it-20261001-0400.tar.gz ' "$BATS_TEST_TMPDIR/rclone.calls"
+  [ -f "$SITES_WWW/a.it/public/-x" ]
+  [ ! -e "$SITES_WWW/a.it/public/nuovo.txt" ]
+  [ -z "$(ls -A "$BK_BACKUPS/tmp")" ]
+  jq -e '.last_restore.source == "remote"' "$BK_STATE"
+}
+
+@test "_restore remote: la copia di un altro sito o un nome strano = rifiutato" {
+  rs_env
+  rs_site
+  mkdir -p "$DRIVE/F/a.it" "$DRIVE/F/b.it"
+  cp "$ARC" "$DRIVE/F/b.it/b.it-20261001-0400.tar.gz"
+  rs_run remote a.it b.it/b.it-20261001-0400.tar.gz files
+  [ "$status" -ne 0 ]
+  rs_run remote a.it a.it/../b.it/b.it-20261001-0400.tar.gz files
+  [ "$status" -ne 0 ]
+  rs_run remote a.it a.it/a.it-20261001-0400.tar.gz files
+  [ "$status" -ne 0 ]
+  [[ "$(jq -r .last_restore.error "$BK_STATE")" == *"non trovata"* ]]
+  [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
+  [ -z "$(ls -A "$BK_BACKUPS/tmp")" ]
+}
+
+@test "_restore remote: archivio manomesso su Drive (sha256) = rifiutato prima di toccare il sito" {
+  rs_env
+  rs_site
+  mkdir -p "$DRIVE/F/a.it"
+  local w="$BATS_TEST_TMPDIR/x"
+  mkdir -p "$w"
+  tar -xzf "$ARC" -C "$w"
+  echo "iniettato" >>"$w/files.tar.gz"
+  tar -czf "$DRIVE/F/a.it/a.it-20261001-0400.tar.gz" -C "$w" manifest.json files.tar.gz db.sql.gz
+  rs_run remote a.it a.it/a.it-20261001-0400.tar.gz all
+  [ "$status" -ne 0 ]
+  [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
+  [ -z "$(ls -A "$BK_BACKUPS/restore" 2>/dev/null)" ]
+  [ -z "$(ls -A "$BK_BACKUPS/tmp")" ]
+}
+
+@test "_restore: una copia di sicurezza (kind restore) si può ripristinare, e riporta il sito a prima del ripristino" {
+  rs_env
+  rs_site
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -eq 0 ]
+  [ ! -e "$SITES_WWW/a.it/public/nuovo.txt" ]
+  local s
+  s="$(ls "$BK_BACKUPS/restore")"
+  rs_run local a.it "restore/$s" files
+  [ "$status" -eq 0 ]
+  [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
+  [ ! -e "$SITES_WWW/a.it/public/-x" ]
+}
+
+@test "_restore: spazio insufficiente per la copia di sicurezza = rifiutato, sito intatto" {
+  rs_env
+  rs_site
+  # shellcheck disable=SC2016
+  make_stub df 'printf "File system 1B-blocks Used Available Use%% Mounted on\n/dev/x 1000 0 1000 0%% /\n"'
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -ne 0 ]
+  jq -e '.last_restore.error | test("spazio")' "$BK_STATE"
+  [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
+}
+
+# --- la seconda linea di difesa: l'area di estrazione dopo tar -------------------
+
+@test "_restore files: se il controllo dell'area di estrazione trova un collegamento che esce, nulla cambia e l'area sparisce" {
+  rs_env
+  rs_site
+  # un archivio vero con un collegamento relativo innocuo; realpath finto lo fa risolvere fuori
+  local w="$BATS_TEST_TMPDIR/ln" sha
+  mkdir -p "$w/public"
+  echo ok >"$w/public/a"
+  ln -s a "$w/public/l"
+  tar -czf "$w/files.tar.gz" -C "$w" public
+  sha="$(sha256sum "$w/files.tar.gz" | cut -d' ' -f1)"
+  jq -n --arg s "$sha" '{domain:"a.it", sha256:{files:$s, db:null}}' >"$w/manifest.json"
+  tar -czf "$BK_BACKUPS/sites/a.it-20261005-0400.tar.gz" -C "$w" manifest.json files.tar.gz
+  # shellcheck disable=SC2016
+  make_stub realpath 'echo /etc/passwd'
+  rs_run local a.it sites/a.it-20261005-0400.tar.gz files
+  [ "$status" -ne 0 ]
+  jq -e '.last_restore.ok == false and (.last_restore.error | test("non sicuro"))' "$BK_STATE"
+  [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
+  [ ! -e "$SITES_WWW/a.it/public/l" ]
+  [ -z "$(ls -A "$SITES_WWW/a.it/tmp" | grep -v '^sess$' || true)" ]
+  [ -z "$(ls -A "$BK_BACKUPS/restore" 2>/dev/null)" ]
+}
+
+@test "_restore files: dopo lo scambio i permessi per Nginx (ACL di www-data) si riapplicano a public/, come utente del sito" {
+  rs_env
+  rs_site
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -eq 0 ]
+  grep -q 'setfacl -R -m u:www-data:rX -m d:u:www-data:rX public' "$CALLS"
+}
+
+# walk_env — un'area di estrazione finta dentro la radice del sito.
+walk_env() {
+  rs_env
+  mk_site a.it no
+  root="$SITES_WWW/a.it"
+  S="tmp/.vpsbackup-x.AbCdEf"
+  mkdir -p "$root/$S/public/sub"
+  echo ok >"$root/$S/public/sub/f"
+}
+
+@test "controllo dell'area di estrazione: collegamenti relativi e assoluti dentro il sito, passano" {
+  walk_env
+  ln -s sub/f "$root/$S/public/ok1"
+  ln -s ../public/sub "$root/$S/public/ok2"
+  ln -s "$root/public/sub/f" "$root/$S/public/ok3"
+  ln -s "$root/wp-config.php" "$root/$S/public/ok4"
+  run _bk_walk_staging site_a_it "$root" "$S"
+  [ "$status" -eq 0 ]
+}
+
+@test "controllo dell'area di estrazione: collegamento che esce (relativo, assoluto, a catena) = rifiutato" {
+  walk_env
+  ln -s ../../../../../../etc/shadow "$root/$S/public/sub/fuori"
+  run _bk_walk_staging site_a_it "$root" "$S"
+  [ "$status" -ne 0 ]
+  rm "$root/$S/public/sub/fuori"
+  ln -s /etc/shadow "$root/$S/public/abs"
+  run _bk_walk_staging site_a_it "$root" "$S"
+  [ "$status" -ne 0 ]
+  rm "$root/$S/public/abs"
+  ln -s "$SITES_WWW/altro.it/public/x" "$root/$S/public/altro"
+  run _bk_walk_staging site_a_it "$root" "$S"
+  [ "$status" -ne 0 ]
+  rm "$root/$S/public/altro"
+  # catena: il primo link sta dentro, il secondo porta fuori
+  ln -s ../../../../../../etc "$root/$S/x"
+  ln -s ../x "$root/$S/public/sub/uno"
+  ln -s uno "$root/$S/public/sub/due"
+  run _bk_walk_staging site_a_it "$root" "$S"
+  [ "$status" -ne 0 ]
+}
+
+@test "controllo dell'area di estrazione: fifo e file speciali = rifiutati" {
+  walk_env
+  mkfifo "$root/$S/public/sub/pipe"
+  run _bk_walk_staging site_a_it "$root" "$S"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"speciale"* ]]
+}
+
+@test "controllo dell'area di estrazione: collegamento fisico a un file fuori = rifiutato; fra file dell'area va bene" {
+  walk_env
+  ln "$root/$S/public/sub/f" "$root/$S/public/sub/gemello"
+  run _bk_walk_staging site_a_it "$root" "$S"
+  [ "$status" -eq 0 ]
+  echo fuori >"$root/fuori"
+  ln "$root/fuori" "$root/$S/public/sub/h"
+  run _bk_walk_staging site_a_it "$root" "$S"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"collegamento fisico"* ]]
+}
+
+@test "controllo dell'area di estrazione: gira come utente del sito (runuser)" {
+  walk_env
+  run _bk_walk_staging site_a_it "$root" "$S"
+  [ "$status" -eq 0 ]
+  grep -q '^runuser -u site_a_it' "$CALLS"
+}
+
+# --- pulizia delle copie di sicurezza -----------------------------------------------
+
+@test "_run: le copie di sicurezza di oltre 7 giorni si tolgono, le più recenti restano" {
+  rs_env
+  mkdir -p "$BK_BACKUPS/restore"
+  echo x >"$BK_BACKUPS/restore/a.it-20260901-101500.tar.gz"
+  echo x >"$BK_BACKUPS/restore/a.it-20261001-101500.tar.gz"
+  touch -d '8 days ago' "$BK_BACKUPS/restore/a.it-20260901-101500.tar.gz"
+  touch -d '6 days ago' "$BK_BACKUPS/restore/a.it-20261001-101500.tar.gz"
+  bk_tool _run
+  [ ! -e "$BK_BACKUPS/restore/a.it-20260901-101500.tar.gz" ]
+  [ -e "$BK_BACKUPS/restore/a.it-20261001-101500.tar.gz" ]
+}
+
+@test "vps-site _prune toglie anche le copie di sicurezza di oltre 7 giorni" {
+  rs_env
+  mkdir -p "$BK_BACKUPS/restore" "$SITES_BACKUPS"
+  echo x >"$BK_BACKUPS/restore/a.it-20260901-101500.tar.gz"
+  echo x >"$BK_BACKUPS/restore/a.it-20261001-101500.tar.gz"
+  touch -d '8 days ago' "$BK_BACKUPS/restore/a.it-20260901-101500.tar.gz"
+  touch -d '6 days ago' "$BK_BACKUPS/restore/a.it-20261001-101500.tar.gz"
+  run bash "$REPO_ROOT/tools/vps-site" _prune
+  [ "$status" -eq 0 ]
+  [ ! -e "$BK_BACKUPS/restore/a.it-20260901-101500.tar.gz" ]
+  [ -e "$BK_BACKUPS/restore/a.it-20261001-101500.tar.gz" ]
+}
+
+@test "vps-backup: l'ambiente del chiamante non entra (BK_CF_PURGE, REDIS_*)" {
+  grep -q 'BK_CF_PURGE' "$REPO_ROOT/tools/vps-backup"
+  grep -q 'REDIS_ACL_FILE' "$REPO_ROOT/tools/vps-backup"
+  grep -q 'REDIS_ADMIN_SECRET' "$REPO_ROOT/tools/vps-backup"
 }

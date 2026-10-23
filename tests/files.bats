@@ -1261,3 +1261,33 @@ zflag() {
   [ "$status" -eq 1 ]
   grep -q 'files mkdir blog.miosito.it public/a.txt totale=1 esito=errore .*esiste' "$VPS_LOG"
 }
+
+@test "vps-files: scritture rifiutate con 'ripristino in corso' mentre il lock del sito è preso; letture no" {
+  mk_fm_site
+  export BK_LOCK_DIR="$BATS_TEST_TMPDIR/locks"
+  mkdir -p "$BK_LOCK_DIR"
+  echo x >"$R/public/a.txt"
+  exec {lk}>>"$BK_LOCK_DIR/vps-site.site_blog_miosito_it.lock"
+  flock -n "$lk"
+  run vf write blog.miosito.it public/n.txt <<<"x"
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"ripristino in corso"* ]]
+  local c
+  for c in "mkdir blog.miosito.it public/d" "rename blog.miosito.it public/a.txt b.txt" "move blog.miosito.it public -- public/a.txt" \
+    "copy blog.miosito.it public -- public/a.txt" "delete blog.miosito.it -- public/a.txt" "zip blog.miosito.it public/z.zip -- public/a.txt" \
+    "unzip blog.miosito.it public/z.zip public"; do
+    # shellcheck disable=SC2086
+    run vf $c </dev/null
+    [ "$status" -eq 1 ] || { echo "accettato: $c"; false; }
+    [[ "$(jq -r .error <<<"$output")" == *"ripristino in corso"* ]] || { echo "messaggio: $c"; false; }
+  done
+  [ -f "$R/public/a.txt" ]
+  [ ! -e "$R/public/n.txt" ]
+  run vf list blog.miosito.it public
+  [ "$status" -eq 0 ]
+  run vf read blog.miosito.it public/a.txt
+  [ "$status" -eq 0 ]
+  exec {lk}>&-
+  run vf write blog.miosito.it public/n.txt <<<"x"
+  [ "$status" -eq 0 ]
+}

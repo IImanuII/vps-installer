@@ -375,3 +375,26 @@ wp_opts=(--title "Il blog" --admin-user gestore --admin-email io@miosito.it --lo
   [ "$status" -eq 1 ]
   [[ "$(jq -r .error <<<"$output")" == *"--tools-only"* ]]
 }
+
+@test "lavori su un sito rifiutati con 'ripristino in corso' mentre il suo lock è preso" {
+  export BK_LOCK_DIR="$BATS_TEST_TMPDIR/locks"
+  mkdir -p "$BK_LOCK_DIR"
+  vs create blog.miosito.it --type php
+  bash "$T" _run create blog.miosito.it
+  site_reg_update blog.miosito.it '.db = true'
+  exec {lk}>>"$BK_LOCK_DIR/vps-site.site_blog_miosito_it.lock"
+  flock -n "$lk"
+  local c
+  for c in db-password db-create wp-install delete disable enable; do
+    run --separate-stderr bash -c "printf 'Nuova-password-456789\n' | bash '$T' $c blog.miosito.it --title T --admin-user ana --admin-email a@b.it --login-path accesso"
+    [ "$status" -eq 1 ] || { echo "accettato: $c"; false; }
+    [[ "$output" == *"ripristino in corso"* ]] || { echo "messaggio $c: $output"; false; }
+  done
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  # un lavoro già in coda si ferma allo stesso modo, il sito non si tocca
+  site_reg_update blog.miosito.it '.state = "deleting" | .prev_state = "active"'
+  run bash "$T" _run delete blog.miosito.it
+  [ "$status" -ne 0 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  exec {lk}>&-
+}

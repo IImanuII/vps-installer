@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # vps-backup — copie dei siti e del pannello su Google Drive: status, connect,
-# disconnect, config (_run lo lancia solo il timer systemd, _restore è interno).
+# disconnect, config, run, copie locali e su Drive, ripristino (_run lo lancia solo il
+# timer systemd, _restore solo `restore`/`restore-local`: sono interni).
 # Lo esegue il pannello con sudo; _run e _restore si rifiutano attraverso sudo (o
 # il rilancio qui sotto) prima ancora di caricare le librerie. Questo controllo
 # deve restare il primo.
@@ -27,7 +28,7 @@ if [[ -n "${SUDO_USER:-}" || -n "${VPS_BACKUP_VIA_SYSTEMD:-}" ]]; then
   # RCLONE_*: rclone legge RCLONE_CONFIG e simili dall'ambiente; VPS_NO_CHOWN
   # spegnerebbe i chown dei file scritti da root.
   unset VPS_NO_CHOWN "${!RCLONE_@}" BK_DIR BK_BACKUPS BK_LOCK_DIR BK_CONFIG BK_STATE BK_RCLONE \
-    BK_RCLONE_CONF BK_TIME_DEFAULT BK_NOW BK_UNIT BK_PURGE_DAYS BK_RUN_DIR VPS_BACKUP_SELF BK_ERR BK_FOLDER BK_CONFIG_NEW SYSTEMD_DIR SITES_DIR SITES_WWW SITES_BACKUPS FM_RUNUSER
+    BK_RCLONE_CONF BK_TIME_DEFAULT BK_NOW BK_UNIT BK_PURGE_DAYS BK_RUN_DIR VPS_BACKUP_SELF BK_ERR BK_FOLDER BK_CONFIG_NEW SYSTEMD_DIR SITES_DIR SITES_WWW SITES_BACKUPS FM_RUNUSER BK_CF_PURGE REDIS_ACL_FILE REDIS_ADMIN_SECRET _BK_RC
   [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
   chmod 640 "$VPS_LOG"
 fi
@@ -76,6 +77,79 @@ case "${1:-}" in
     # Esito 1 = qualcosa non è stato salvato: l'unità risulta fallita, e `||` evita
     # il messaggio di "errore interno" della trappola ERR.
     bk_run_all || exit 1
+    ;;
+  list-local)
+    bk_list_local_json
+    ;;
+  read-local)
+    (($# == 2)) || json_err "uso: vps-backup read-local cartella/file"
+    p="$(bk_local_path "$2")" || json_err "copia non trovata o nome non valido"
+    # un file su stdout: il pannello lo gira al browser
+    cat -- "$p"
+    ;;
+  delete-local)
+    (($# == 2)) || json_err "uso: vps-backup delete-local cartella/file"
+    p="$(bk_local_path "$2")" || json_err "copia non trovata o nome non valido"
+    # un giro o un ripristino in corso può stare leggendo proprio quel file
+    _no_se_in_corso
+    rm -f -- "$p" || json_err "copia non eliminata"
+    log "vps-backup: copia locale eliminata ($2)"
+    json_ok
+    ;;
+  list-remote)
+    BK_ERR=""
+    bk_list_remote_json || json_err "${BK_ERR:-elenco delle copie su Drive non riuscito}"
+    ;;
+  read-remote)
+    (($# == 2)) || json_err "uso: vps-backup read-remote dominio/file"
+    # prima in una cartella di lavoro (se Drive si interrompe a metà non esce mezza copia),
+    # poi su stdout
+    w="$(bk_tmp_dir)" || json_err "cartella temporanea non disponibile"
+    # shellcheck disable=SC2064
+    trap "rm -rf -- '$w'" EXIT
+    # shellcheck disable=SC2034
+    BK_RUN_DIR="$w"
+    BK_ERR=""
+    bk_remote_fetch "$2" "$w/copia" || json_err "${BK_ERR:-scaricamento non riuscito}"
+    cat -- "$w/copia"
+    ;;
+  restore | restore-local)
+    if [[ "$1" == restore ]]; then
+      (($# == 4)) || json_err "uso: vps-backup restore DOMINIO dominio/file all|db|files"
+      dom="$2" nome="$3" modo="$4" sorgente=remote
+    else
+      (($# == 3)) || json_err "uso: vps-backup restore-local cartella/file all|db|files"
+      nome="$2" modo="$3" sorgente=local dom=""
+    fi
+    [[ "$modo" =~ ^(all|db|files)$ ]] || json_err "cosa ripristinare non è valido: all, db o files"
+    if [[ "$sorgente" == remote ]]; then
+      valid_domain "$dom" || json_err "dominio non valido"
+      if ! bk_remote_parse "$nome" || [[ "$_BK_RD" != "$dom" ]]; then json_err "nome della copia non valido per $dom"; fi
+      [[ -f "$BK_RCLONE_CONF" ]] || json_err "Google Drive non collegato: collegalo prima di ripristinare da lì"
+    else
+      if ! bk_local_parse "$nome" || [[ "$_BK_LK" == panel || "$_BK_LF" != *.tar.gz ]]; then
+        json_err "nome della copia non valido: si ripristinano archivi dei siti (sites/ o restore/)"
+      fi
+      dom="$_BK_LD"
+      p="$(bk_local_path "$nome")" || json_err "copia non trovata"
+      primo="$(tar -tzf "$p" 2>/dev/null | head -n1 || true)"
+      [[ "$primo" == manifest.json ]] || json_err "copia nel formato vecchio, senza manifest: si può solo scaricare o eliminare"
+    fi
+    info="$(fm_site_check "$dom" 2>&1)" || json_err "$info"
+    slug="${info%% *}"
+    # Solo un controllo veloce: il lavoro vero prende i lock dentro la sua unità.
+    if bk_global_busy || bk_unit_alive; then json_err "backup in corso"; fi
+    if bk_site_locked "$slug"; then json_err "ripristino in corso su questo sito"; fi
+    if ! systemd-run --unit "vps-backup-restore-$slug" --collect --quiet --setenv="BK_UNIT=vps-backup-restore-$slug" \
+      -p Nice=10 -p IOSchedulingClass=idle "${VPS_BACKUP_SELF:-/opt/vps/bin/vps-backup}" _restore "$sorgente" "$dom" "$nome" "$modo" >>"$VPS_LOG" 2>&1; then
+      json_err "impossibile avviare il ripristino (dettagli in $VPS_LOG)"
+    fi
+    log "vps-backup: ripristino di $dom avviato ($modo da $sorgente $nome)"
+    json_ok '{ok: true, started: true}'
+    ;;
+  _restore)
+    (($# == 5)) || json_err "comando interno"
+    bk_restore_run "$2" "$3" "$4" "$5" || exit 1
     ;;
   connect)
     _no_se_in_corso
@@ -147,6 +221,6 @@ case "${1:-}" in
     json_ok
     ;;
   *)
-    json_err "uso: vps-backup status | run | connect (token da stdin) | disconnect | config (JSON da stdin)"
+    json_err "uso: vps-backup status | run | connect (token da stdin) | disconnect | config (JSON da stdin) | list-local | read-local NOME | delete-local NOME | list-remote | read-remote NOME | restore DOMINIO NOME all|db|files | restore-local NOME all|db|files"
     ;;
 esac

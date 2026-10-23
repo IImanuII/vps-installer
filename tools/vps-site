@@ -29,7 +29,7 @@ if [[ -n "${SUDO_USER:-}" || -n "${VPS_SITE_VIA_SYSTEMD:-}" ]]; then
   # seconda linea di difesa, nel caso l'ambiente passasse comunque.
   unset CF_API SITES_DIR SITES_WWW SITES_BACKUPS SITES_LOCK SITES_LOCK_WAIT SITES_RUN NGINX_CONF_D \
     PHP_POOL_D LOGROTATE_D VPS_SITE_SELF VPS_NO_CHOWN SITE_ERROR_FILE \
-    WP_BIN REDIS_ACL_FILE REDIS_ADMIN_SECRET CRON_D
+    WP_BIN REDIS_ACL_FILE REDIS_ADMIN_SECRET CRON_D BK_LOCK_DIR BK_BACKUPS
   [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
   chmod 640 "$VPS_LOG"
 fi
@@ -71,6 +71,14 @@ existing() {
     json_err "sito non trovato: ${1:-}"
   fi
   site_refresh "$1"
+}
+
+# no_restore DOMINIO — un ripristino (o la copia del sito) tiene il lock del sito:
+# niente lavori né cambi di database finché non ha finito.
+no_restore() {
+  if bk_site_locked "$(site_reg_get "$1" .slug)"; then
+    json_err "ripristino in corso (o copia del sito in corso): riprova tra poco"
+  fi
 }
 
 # reg_lock — lucchetto breve sul registro, distinto da quello dei lavori: serializza
@@ -258,6 +266,7 @@ case "$cmd" in
     shift || true
     reg_lock
     existing "$d"
+    no_restore "$d"
     [[ "$(site_reg_get "$d" .type)" == php ]] || json_err "WordPress si installa solo su un sito PHP"
     [[ "$(site_reg_get "$d" .state)" == active ]] || json_err "il sito non è attivo"
     [[ "$(site_reg_get "$d" .db)" == true ]] || json_err "il sito non ha un database: aggiungilo prima"
@@ -276,6 +285,7 @@ case "$cmd" in
   disable | enable)
     d="${1:-}"
     existing "$d"
+    no_restore "$d"
     lock_now
     state="$(site_reg_get "$d" .state)"
     if [[ "$cmd" == disable ]]; then
@@ -299,6 +309,7 @@ case "$cmd" in
     d="${1:-}"
     reg_lock
     existing "$d"
+    no_restore "$d"
     state="$(site_reg_get "$d" .state)"
     [[ "$state" != creating && "$state" != deleting ]] || json_err "operazione in corso su $d, riprova più tardi"
     site_reg_update "$d" '.prev_state = .state | .state = "deleting"'
@@ -309,6 +320,7 @@ case "$cmd" in
   db-create | db-password)
     d="${1:-}"
     existing "$d"
+    no_restore "$d"
     lock_now
     state="$(site_reg_get "$d" .state)"
     [[ "$state" == active || "$state" == disabled ]] || json_err "il sito non è pronto"

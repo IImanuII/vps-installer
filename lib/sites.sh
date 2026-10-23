@@ -665,8 +665,11 @@ site_job_delete() {
 }
 
 site_prune() {
-  [[ -d "$SITES_BACKUPS" ]] || return 0
-  find "$SITES_BACKUPS" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.sql.gz' \) -mtime +30 -delete
+  if [[ -d "$SITES_BACKUPS" ]]; then
+    find "$SITES_BACKUPS" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.sql.gz' \) -mtime +30 -delete
+  fi
+  # le copie di sicurezza dei ripristini (lib/backup.sh) restano 7 giorni
+  bk_prune_restore
 }
 
 # site_abort DOMINIO OP MESSAGGIO — un lavoro che non può nemmeno partire.
@@ -716,6 +719,13 @@ site_run() {
   if ! flock -w "${SITES_LOCK_WAIT:-600}" 9; then
     exec 9>&-
     site_abort "$d" "$op" "la coda dei lavori è ferma da troppo tempo: riprova"
+    return 1
+  fi
+  # Un ripristino (o la copia del sito) tiene il lock del sito: l'eliminazione o
+  # l'installazione di WordPress in coda non devono partire a metà.
+  if [[ "$op" != create ]] && bk_site_locked "$(site_reg_get "$d" .slug)"; then
+    exec 9>&-
+    site_abort "$d" "$op" "ripristino in corso (o copia del sito in corso): riprova tra poco"
     return 1
   fi
   # Un doppione o un _run fuori posto non deve disfare un sito che funziona.
