@@ -94,6 +94,9 @@ fm_as_site() {
   shift 2
   (($#)) || return 2
   (
+    # Il processo dell'utente del sito non deve ereditare i lock di vps-backup (root).
+    if [[ -n "${BK_GLOBAL_FD:-}" ]]; then exec {BK_GLOBAL_FD}>&-; fi
+    if [[ -n "${BK_SITE_LOCK_FD:-}" ]]; then exec {BK_SITE_LOCK_FD}>&-; fi
     cd "$root" || exit 1
     exec "$FM_RUNUSER" -u "$slug" -- env -i PATH=/usr/bin:/bin "HOME=$root/tmp" LC_ALL=C \
       sh -c 'umask 002 && exec "$@"' sh "$@"

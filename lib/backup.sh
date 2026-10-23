@@ -59,6 +59,16 @@ bk_site_lock() {
   BK_SITE_LOCK_FD="$fd"
 }
 
+# _bk_nolock COMANDO... — esegue un programma esterno senza i descrittori dei lock
+# (globale e del sito): un figlio vivo non deve tenerli dopo la morte del giro.
+_bk_nolock() {
+  (
+    if [[ -n "${BK_GLOBAL_FD:-}" ]]; then exec {BK_GLOBAL_FD}>&-; fi
+    if [[ -n "${BK_SITE_LOCK_FD:-}" ]]; then exec {BK_SITE_LOCK_FD}>&-; fi
+    exec "$@"
+  )
+}
+
 # bk_site_unlock — rilascia il lock tenuto da questo processo.
 bk_site_unlock() {
   if [[ -n "$BK_SITE_LOCK_FD" ]]; then
@@ -211,7 +221,7 @@ _bk_archive_in() {
     return 1
   fi
   if [[ -f "$root/wp-config.php" ]]; then
-    LC_ALL=C.UTF-8 tar --append --file="$w/files.tar" -C "$root" wp-config.php 2>"$w/tar2.err" || {
+    LC_ALL=C.UTF-8 _bk_nolock tar --append --file="$w/files.tar" -C "$root" wp-config.php 2>"$w/tar2.err" || {
       _bk_log_file "$w/tar2.err" "wp-config.php di $d"
       echo "wp-config.php non aggiunto all'archivio" >"$w/err"
       return 1
@@ -225,7 +235,7 @@ _bk_archive_in() {
   local dbsha=""
   if [[ "$hasdb" == true ]]; then
     # dump su file, poi gzip: se il dump fallisce lo si sa dal suo codice di uscita
-    mariadb-dump --single-transaction --routines --events "$slug" >"$w/db.sql" 2>"$w/dump.err" || {
+    _bk_nolock mariadb-dump --single-transaction --routines --events "$slug" >"$w/db.sql" 2>"$w/dump.err" || {
       _bk_log_file "$w/dump.err" "dump di $d"
       echo "dump del database non riuscito" >"$w/err"
       return 1
@@ -549,7 +559,10 @@ bk_drive_json() {
 
 # bk_status_json — risposta di `vps-backup status`.
 bk_status_json() {
-  local cfg state='{}' drive=null conn=false interrupted
+  local cfg state='{}' drive=null conn=false interrupted running=0
+  # Prima si guarda se un giro è vivo (lock o unità systemd), poi si legge lo stato:
+  # un giro che parte o finisce nel frattempo non può essere dichiarato interrotto.
+  if bk_global_busy || bk_unit_alive; then running=1; fi
   cfg="$(bk_config_json)"
   if [[ -f "$BK_STATE" ]]; then state="$(jq -c 'if type == "object" then . else {} end' "$BK_STATE" 2>/dev/null)" || state='{}'; fi
   [[ -n "$state" ]] || state='{}'
@@ -558,9 +571,10 @@ bk_status_json() {
     drive="$(bk_drive_json)"
   fi
   # Un giro morto (kill, riavvio) lascia `job` in state.json: se il lock globale è
-  # libero nessuno sta più lavorando, quindi niente job e `interrupted` a true.
+  # libero e nessuna unità gira, nessuno sta più lavorando: niente job e
+  # `interrupted` a true.
   interrupted=false
-  if [[ "$(jq -c '.job // null' <<<"$state")" != null ]] && ! bk_global_busy; then
+  if [[ "$(jq -c '.job // null' <<<"$state")" != null ]] && ((!running)); then
     interrupted=true
     state="$(jq -c '.job = null' <<<"$state")"
   fi
@@ -728,6 +742,13 @@ bk_unlock_global() {
   fi
 }
 
+# bk_unit_alive — 0 se l'unità di un giro (a mano o del timer) sta girando o partendo.
+bk_unit_alive() {
+  local out
+  out="$(systemctl is-active vps-backup-run.service vps-backup.service 2>/dev/null || true)"
+  grep -qE '^(active|activating|reloading|deactivating)$' <<<"$out"
+}
+
 # bk_global_busy — 0 se un altro processo tiene il lock globale. Se il file non si
 # apre, nessuno può tenerlo: libero.
 bk_global_busy() {
@@ -753,21 +774,24 @@ _BK_PANEL='null'
 _BK_PURGED='[]'
 _BK_STARTED=""
 _BK_PREV_LAST='null'
+_BK_KNOWN='[]'
 
 # _bk_rcq ARGOMENTI... — rclone con stdout in _BK_OUT e messaggio d'errore ripulito
 # (una riga, senza token) in _BK_ERRMSG. Mai stdin dal terminale.
 _bk_rcq() {
   local rc=0 ef="$BK_RUN_DIR/rc.err"
-  _BK_OUT="$("${_BK_RC[@]}" "$@" 2>"$ef" </dev/null)" || rc=$?
+  _BK_OUT="$(_bk_nolock "${_BK_RC[@]}" "$@" 2>"$ef" </dev/null)" || rc=$?
   _BK_ERRMSG=""
   if ((rc != 0)); then _BK_ERRMSG="$(bk_clean_msg "$(cat "$ef" 2>/dev/null || true)")"; fi
   return "$rc"
 }
 
-# _bk_state_write JOB LAST — state.json (600) con sostituzione atomica.
+# _bk_state_write JOB LAST — state.json (600) con sostituzione atomica. `known` sono
+# i domini che questa installazione ha già salvato almeno una volta: solo quelli si
+# potranno eliminare da Drive (una VPS ricostruita non cancella le copie di altri).
 _bk_state_write() {
   install -d -m 700 "$BK_DIR" || return 1
-  jq -nc --argjson j "$1" --argjson l "$2" '{job: $j, last_run: $l}' | write_file "$BK_STATE" 600 root:root
+  jq -nc --argjson j "$1" --argjson l "$2" --argjson k "$_BK_KNOWN" '{job: $j, last_run: $l, known: $k}'     | write_file "$BK_STATE" 600 root:root
 }
 
 # _bk_progress PASSO [DOMINIO] — il pannello legge job.step e job.domain.
@@ -814,29 +838,35 @@ _bk_upload() {
   fi
   if ! _bk_ls_files "$dir"; then
     msg="controllo della copia su Drive non riuscito: $_BK_ERRMSG"
-    _bk_rcq deletefile "gdrive:$dir/$name" || true
+    _bk_rcq deletefile --drive-use-trash=false "gdrive:$dir/$name" || true
     _BK_ERRMSG="$msg"
     return 1
   fi
   got="$(awk -F'|' -v n="$name" '$2 == n {print $1; exit}' <<<"$_BK_LST")"
   if [[ "$got" != "$want" ]]; then
     msg="la copia su Drive ha dimensione diversa (attesa $want, trovata ${got:-nessuna})"
-    _bk_rcq deletefile "gdrive:$dir/$name" || true
+    _bk_rcq deletefile --drive-use-trash=false "gdrive:$dir/$name" || true
     _BK_ERRMSG="$msg"
     return 1
   fi
 }
 
-# _bk_retain CARTELLA NOME_APPENA_CARICATO ELENCO — tiene le ultime 3 copie; la copia
-# appena caricata e controllata non si cancella mai, qualunque sia la sua data.
+# _bk_retain CARTELLA NOME_APPENA_CARICATO ELENCO REGEX — tiene le ultime 3 copie fra i
+# soli nomi che corrispondono a REGEX (quelli che crea questo programma: altri file
+# nella cartella non si contano né si toccano mai); la copia appena caricata e
+# controllata non si cancella, qualunque sia la sua data.
 # Imposta _BK_DELETED (quante ne ha eliminate).
 _bk_retain() {
-  local dir="$1" keep="$2" lst="$3" n deleted=0
+  local dir="$1" keep="$2" lst="$3" re="$4" n deleted=0
   local -a names=()
-  mapfile -t names < <(cut -d'|' -f2 <<<"$lst")
+  while IFS= read -r n; do
+    if [[ -n "$n" && "$n" =~ $re ]]; then names+=("$n"); fi
+  done < <(cut -d'|' -f2 <<<"$lst")
   while IFS= read -r n; do
     [[ -n "$n" && "$n" != "$keep" ]] || continue
-    if _bk_rcq deletefile "gdrive:$dir/$n"; then
+    # --drive-use-trash=false: con lo scope drive.file il cestino non si può svuotare,
+    # quindi la copia si elimina davvero (senza cestino e senza `cleanup`).
+    if _bk_rcq deletefile --drive-use-trash=false "gdrive:$dir/$n"; then
       deleted=$((deleted + 1))
     else
       log "vps-backup: eliminazione di $dir/$n non riuscita ($_BK_ERRMSG)"
@@ -845,10 +875,48 @@ _bk_retain() {
   _BK_DELETED="$deleted"
 }
 
+# _bk_site_re DOMINIO — espressione dei nomi delle copie di un sito.
+_bk_site_re() {
+  printf '^%s-[0-9]{8}-[0-9]{4}\\.tar\\.gz$' "${1//./\\.}"
+}
+
+_BK_PANEL_RE='^pannello-[0-9]{8}-[0-9]{4}\.sql\.gz$'
+
+# _bk_known_add DOMINIO / _bk_known_del DOMINIO
+_bk_known_add() {
+  _BK_KNOWN="$(jq -c --arg d "$1" 'if index($d) then . else . + [$d] end' <<<"$_BK_KNOWN")"
+}
+_bk_known_del() {
+  _BK_KNOWN="$(jq -c --arg d "$1" 'map(select(. != $d))' <<<"$_BK_KNOWN")"
+}
+
+# _bk_site_size DOMINIO — stima in byte di quanto pesa l'archivio: public/ (du -P non
+# segue i link), wp-config.php e, se c'è, il database. Stampa il numero; 1 se
+# public/ non si legge.
+_bk_site_size() {
+  local d="$1" root pub=0 wp=0 db=0 slug v
+  root="$(site_root "$d")"
+  if [[ -d "$root/public" ]]; then
+    pub="$(du -sbP -- "$root/public" 2>/dev/null | cut -f1 || true)"
+    [[ "$pub" =~ ^[0-9]{1,16}$ ]] || return 1
+  fi
+  if [[ -f "$root/wp-config.php" && ! -L "$root/wp-config.php" ]]; then
+    wp="$(stat -c %s "$root/wp-config.php" 2>/dev/null || echo 0)"
+  fi
+  if [[ "$(site_reg_get "$d" .db 2>/dev/null || true)" == true ]]; then
+    slug="$(site_reg_get "$d" .slug 2>/dev/null || true)"
+    if [[ "$slug" =~ ^site_[a-z0-9_]{1,27}$ ]]; then
+      v="$(_bk_nolock mariadb -N -B -e "SELECT COALESCE(SUM(data_length + index_length), 0) FROM information_schema.tables WHERE table_schema = '$slug'" 2>/dev/null </dev/null | head -n1 || true)"
+      [[ "$v" =~ ^[0-9]{1,16}$ ]] && db="$v"
+    fi
+  fi
+  printf '%s' "$((10#$pub + 10#$wp + 10#$db))"
+}
+
 # _bk_one_site DOMINIO CARTELLA — salva un sito; aggiunge l'esito a _BK_SITES.
 # Restituisce 0 se salvato, 1 altrimenti (il giro prosegue).
 _bk_one_site() {
-  local d="$1" folder="$2" slug lrc=0 root size name arc ok_size
+  local d="$1" folder="$2" slug lrc=0 size name arc ok_size
   _bk_progress site "$d"
   slug="$(site_reg_get "$d" .slug 2>/dev/null || true)"
   bk_site_lock "$slug" || lrc=$?
@@ -859,9 +927,12 @@ _bk_one_site() {
     _bk_add_site "$d" false "registro del sito non valido"
     return 1
   fi
-  root="$(site_root "$d")"
-  size="$(du -sb -- "$root" 2>/dev/null | cut -f1 || true)"
-  if ! bk_space_ok "$BK_BACKUPS/tmp" "${size:-x}"; then
+  if ! size="$(_bk_site_size "$d")"; then
+    bk_site_unlock
+    _bk_add_site "$d" false "dimensione del sito non leggibile"
+    return 1
+  fi
+  if ! bk_space_ok "$BK_BACKUPS/tmp" "$size"; then
     bk_site_unlock
     _bk_add_site "$d" false "spazio insufficiente"
     return 1
@@ -883,8 +954,9 @@ _bk_one_site() {
     return 1
   fi
   rm -f -- "$arc"
+  _bk_known_add "$d"
   _bk_progress retention "$d"
-  _bk_retain "$folder/$d" "$name" "$_BK_LST"
+  _bk_retain "$folder/$d" "$name" "$_BK_LST" "$(_bk_site_re "$d")"
   _bk_add_site "$d" true "" "$name" "$ok_size" "$_BK_DELETED"
 }
 
@@ -907,7 +979,7 @@ _bk_panel() {
   if ! (
     set -o pipefail
     umask 077
-    mariadb-dump --single-transaction --routines --events "$db" | gzip >"$f"
+    _bk_nolock mariadb-dump --single-transaction --routines --events "$db" | _bk_nolock gzip >"$f"
   ) 2>/dev/null; then
     rm -f -- "$f"
     _BK_PANEL="$(jq -nc '{ok: false, error: "dump del database del pannello non riuscito", file: null}')"
@@ -920,17 +992,17 @@ _bk_panel() {
     return 1
   fi
   rm -f -- "$f"
-  _bk_retain "$folder/_pannello" "$name" "$_BK_LST"
+  _bk_retain "$folder/_pannello" "$name" "$_BK_LST" "$_BK_PANEL_RE"
   _BK_PANEL="$(jq -nc --arg f "$name" --arg s "$size" --arg n "$_BK_DELETED" \
     '{ok: true, error: null, file: $f, size: ($s | tonumber), deleted: ($n | tonumber)}')"
 }
 
-# _bk_purge_gone FOLDER — le cartelle su Drive di siti che non sono più nel registro
-# si eliminano quando l'ultima copia ha più di BK_PURGE_DAYS giorni. Una cartella
-# senza copie riconoscibili non si tocca. Senza la cartella del registro (illeggibile)
-# non si elimina niente.
+# _bk_purge_gone FOLDER — elimina da Drive la cartella di un sito solo se: questa
+# installazione l'ha salvato in passato (known), non è più nel registro e la sua
+# copia più recente ha più di BK_PURGE_DAYS giorni. Una VPS appena ricostruita (stato
+# vuoto) non elimina quindi mai niente; un sito senza copie riconoscibili non si tocca.
 _bk_purge_gone() {
-  local folder="$1" dirs d lst newest cutoff key
+  local folder="$1" dirs d newest cutoff n re
   local -a names=()
   [[ -d "$SITES_DIR" ]] || return 0
   _bk_rcq lsjson --dirs-only "gdrive:$folder" || return 0
@@ -939,19 +1011,23 @@ _bk_purge_gone() {
   while IFS= read -r d; do
     [[ -n "$d" && "$d" != _pannello ]] || continue
     valid_domain "$d" || continue
-    site_reg_exists "$d" && continue
+    if [[ "$(jq --arg d "$d" 'index($d) != null' <<<"$_BK_KNOWN")" != true ]]; then continue; fi
+    if site_reg_exists "$d"; then continue; fi
     _bk_ls_files "$folder/$d" || continue
+    re="$(_bk_site_re "$d")"
     newest=""
     mapfile -t names < <(cut -d'|' -f2 <<<"$_BK_LST")
-    for key in "${names[@]}"; do
-      if [[ "$key" =~ ^.*-([0-9]{8})-[0-9]{4}([0-9]{2})?\.[^/]*$ ]]; then
-        [[ -z "$newest" || "${BASH_REMATCH[1]}" > "$newest" ]] && newest="${BASH_REMATCH[1]}"
+    for n in "${names[@]}"; do
+      if [[ "$n" =~ $re ]]; then
+        [[ "$n" =~ -([0-9]{8})-[0-9]{4}\.tar\.gz$ ]] || continue
+        if [[ -z "$newest" || "${BASH_REMATCH[1]}" > "$newest" ]]; then newest="${BASH_REMATCH[1]}"; fi
       fi
     done
     [[ -n "$newest" ]] || continue
     if [[ "$newest" < "$cutoff" ]]; then
-      if _bk_rcq purge "gdrive:$folder/$d"; then
+      if _bk_rcq purge --drive-use-trash=false "gdrive:$folder/$d"; then
         _BK_PURGED="$(jq -c --arg d "$d" '. + [$d]' <<<"$_BK_PURGED")"
+        _bk_known_del "$d"
       else
         log "vps-backup: eliminazione della cartella $d su Drive non riuscita ($_BK_ERRMSG)"
       fi
@@ -959,17 +1035,24 @@ _bk_purge_gone() {
   done <<<"$dirs"
 }
 
-# _bk_alert — un solo messaggio per giro, solo se qualche sito è fallito. mon_send
-# funziona anche a sorveglianza spenta; niente coda. Stampa l'esito per last_run.alert.
+# _bk_alert — un solo messaggio per giro, se un sito o il pannello sono falliti.
+# mon_send funziona anche a sorveglianza spenta; niente coda. Stampa l'esito per
+# last_run.alert.
 _bk_alert() {
-  local n text rc=0
-  n="$(jq '[.[] | select(.ok | not)] | length' <<<"$_BK_SITES")"
-  if ((n == 0)); then
+  local text rc=0
+  text="$(jq -r --arg h "$(hostname)" --argjson p "$_BK_PANEL" '
+    [.[] | select(.ok | not)] as $f
+    | if ($f | length) == 0 and ($p.ok // false) then ""
+      else
+        (if ($f | length) > 0 then "💾 \($h): Backup: \($f | length) siti non salvati"
+         else "💾 \($h): Backup: pannello non salvato" end)
+        + ([$f[] | "\n\(.domain): \(.reason)"] | join(""))
+        + (if ($p.ok // false) then "" else "\npannello: \($p.error // "dump non riuscito")" end)
+      end' <<<"$_BK_SITES")"
+  if [[ -z "$text" ]]; then
     printf 'null'
     return 0
   fi
-  text="$(jq -r '"💾 Backup: \([.[] | select(.ok | not)] | length) siti non salvati\n" +
-    ([.[] | select(.ok | not) | "\(.domain): \(.reason)"] | join("\n"))' <<<"$_BK_SITES")"
   mon_send "$text" || rc=$?
   if ((rc == 0)); then
     printf '"sent"'
@@ -980,10 +1063,20 @@ _bk_alert() {
   fi
 }
 
-# bk_run_all — il giro. Stampa il riepilogo JSON; 0 anche con siti falliti (l'esito
-# è in state.json), 1 se il giro non è potuto partire.
+# _bk_last_json ALERT — l'oggetto last_run.
+_bk_last_json() {
+  local ok
+  ok="$(jq -n --argjson s "$_BK_SITES" --argjson p "$_BK_PANEL" '(([$s[] | select(.ok | not)] | length) == 0) and ($p.ok // false)')"
+  jq -nc --arg st "$_BK_STARTED" --arg fin "$(date -Iseconds)" --argjson ok "$ok" --argjson s "$_BK_SITES" \
+    --argjson p "$_BK_PANEL" --argjson pu "$_BK_PURGED" --argjson al "$1" \
+    '{started: $st, finished: $fin, ok: $ok, sites: $s, panel: $p, purged: $pu, alert: $al}'
+}
+
+# bk_run_all — il giro. Stampa il riepilogo JSON; 0 se tutto è stato salvato, 1 se un
+# sito o il pannello sono falliti (stato scritto e avviso inviato comunque) o se il
+# giro non è potuto partire.
 bk_run_all() {
-  local folder d f alert last ok st rc=0
+  local folder d f alert last st rc=0 drive_ok=0
   local -a doms=()
   if ! bk_lock_global; then
     printf '{"ok":false,"error":"backup in corso"}\n'
@@ -996,16 +1089,21 @@ bk_run_all() {
   read -ra _BK_RC <<<"$BK_RCLONE"
   folder="$(jq -r .folder <<<"$(bk_config_json)")"
   install -d -m 700 "$BK_BACKUPS" "$BK_BACKUPS/tmp"
-  # Avanzi di giri uccisi a metà (la sicurezza è il lock: qui nessun altro lavora).
+  # Col lock globale in mano nessun altro lavora: le cartelle di un giro morto
+  # (bk.run.*) si tolgono a qualunque età; gli altri avanzi bk.* dopo un giorno.
+  find "$BK_BACKUPS/tmp" -mindepth 1 -maxdepth 1 -name 'bk.run.*' -exec rm -rf -- {} + 2>/dev/null || true
   find "$BK_BACKUPS/tmp" -mindepth 1 -maxdepth 1 -name 'bk.*' -mmin +1440 -exec rm -rf -- {} + 2>/dev/null || true
   BK_RUN_DIR="$(mktemp -d "$BK_BACKUPS/tmp/bk.run.XXXXXX")"
   # shellcheck disable=SC2064
   trap "rm -rf -- '$BK_RUN_DIR'" EXIT
   _BK_STARTED="$(date -Iseconds)"
-  _BK_SITES='[]' _BK_PANEL='null' _BK_PURGED='[]'
-  _BK_PREV_LAST='null'
-  if [[ -f "$BK_STATE" ]]; then _BK_PREV_LAST="$(jq -c '.last_run // null' "$BK_STATE" 2>/dev/null)" || _BK_PREV_LAST='null'; fi
+  _BK_SITES='[]' _BK_PANEL='null' _BK_PURGED='[]' _BK_PREV_LAST='null' _BK_KNOWN='[]'
+  if [[ -f "$BK_STATE" ]]; then
+    _BK_PREV_LAST="$(jq -c '.last_run // null' "$BK_STATE" 2>/dev/null)" || _BK_PREV_LAST='null'
+    _BK_KNOWN="$(jq -c '(.known // []) | if type == "array" then map(select(type == "string")) else [] end' "$BK_STATE" 2>/dev/null)" || _BK_KNOWN='[]'
+  fi
   [[ -n "$_BK_PREV_LAST" ]] || _BK_PREV_LAST='null'
+  [[ -n "$_BK_KNOWN" ]] || _BK_KNOWN='[]'
   _bk_progress start
 
   # Registro: i siti attivi o disattivati, in ordine.
@@ -1025,27 +1123,26 @@ bk_run_all() {
     done
     _BK_PANEL="$(jq -nc --arg e "Google Drive non risponde: $_BK_ERRMSG" '{ok: false, error: $e, file: null}')"
   else
+    drive_ok=1
     for d in "${doms[@]}"; do
       _bk_one_site "$d" "$folder" || true
     done
     _bk_panel "$folder" || true
-    # Il cestino si svuota una volta sola; con lo scope drive.file può non essere
-    # permesso: solo registro.
-    if [[ "$(jq '[.[].deleted] | add // 0' <<<"$_BK_SITES")" != 0 || "$(jq '.deleted // 0' <<<"$_BK_PANEL")" != 0 ]]; then
-      _bk_rcq cleanup "gdrive:$folder" || log "vps-backup: cleanup non riuscito ($_BK_ERRMSG)"
-    fi
-    _bk_progress purge
-    _bk_purge_gone "$folder"
   fi
 
+  # Esito e avviso prima della pulizia: un guasto lì non deve toglierli.
   alert="$(_bk_alert)"
-  ok="$(jq -n --argjson s "$_BK_SITES" --argjson p "$_BK_PANEL" '(([$s[] | select(.ok | not)] | length) == 0) and ($p.ok // false)')"
-  last="$(jq -nc --arg st "$_BK_STARTED" --arg fin "$(date -Iseconds)" --argjson ok "$ok" --argjson s "$_BK_SITES" \
-    --argjson p "$_BK_PANEL" --argjson pu "$_BK_PURGED" --argjson al "$alert" \
-    '{started: $st, finished: $fin, ok: $ok, sites: $s, panel: $p, purged: $pu, alert: $al}')"
+  last="$(_bk_last_json "$alert")"
+  if ((drive_ok)); then
+    _bk_state_write "$(jq -nc --arg u "${BK_UNIT:-vps-backup.service}" --arg s "$_BK_STARTED" \
+      '{unit: $u, started: $s, step: "purge", domain: null}')" "$last" || log "vps-backup: state.json non scritto"
+    _bk_purge_gone "$folder" || log "vps-backup: pulizia delle cartelle di Drive non riuscita"
+    last="$(_bk_last_json "$alert")"
+  fi
   _bk_state_write null "$last" || { log "vps-backup: state.json non scritto"; rc=1; }
-  log "vps-backup: giro finito (ok: $ok)"
   st="$(jq -c '{ok: true, finished: true, all_ok: .ok}' <<<"$last")"
+  log "vps-backup: giro finito ($st)"
   printf '%s\n' "$st"
+  if [[ "$(jq -r .ok <<<"$last")" != true ]]; then rc=1; fi
   return "$rc"
 }

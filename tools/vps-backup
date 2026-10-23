@@ -64,6 +64,8 @@ case "${1:-}" in
     [[ -f "$BK_RCLONE_CONF" ]] || json_err "Google Drive non collegato: collegalo prima di avviare un backup"
     bk_lock_global || json_err "backup in corso"
     bk_unlock_global
+    # Un secondo `run` subito dopo il primo: l'unità c'è già ma il lock non ancora.
+    if bk_unit_alive; then json_err "backup in corso"; fi
     if ! systemd-run --unit vps-backup-run --collect --quiet --setenv=BK_UNIT=vps-backup-run       -p Nice=10 -p IOSchedulingClass=idle "${VPS_BACKUP_SELF:-/opt/vps/bin/vps-backup}" _run >>"$VPS_LOG" 2>&1; then
       json_err "impossibile avviare il backup (dettagli in $VPS_LOG)"
     fi
@@ -71,7 +73,9 @@ case "${1:-}" in
     json_ok '{ok: true, started: true}'
     ;;
   _run)
-    bk_run_all
+    # Esito 1 = qualcosa non è stato salvato: l'unità risulta fallita, e `||` evita
+    # il messaggio di "errore interno" della trappola ERR.
+    bk_run_all || exit 1
     ;;
   connect)
     _no_se_in_corso
@@ -125,6 +129,8 @@ case "${1:-}" in
       fi
       json_err "configurazione non salvata (dettagli in $VPS_LOG)"
     fi
+    # Scritto tutto, il lock globale non serve più: systemctl non deve tenerlo.
+    bk_unlock_global
     if ! systemctl daemon-reload >>"$VPS_LOG" 2>&1; then
       _salvata_ma "configurazione salvata, ma systemd non l'ha ricaricata (dettagli in $VPS_LOG)"
     fi

@@ -527,6 +527,11 @@ exit 0'
   # shellcheck disable=SC2016
   make_stub systemctl 'T="$BATS_TEST_TMPDIR"
 echo "$*" >>"$T/systemctl.calls"
+if [[ "$1" == is-active ]]; then
+  if [[ -f "$T/unit.active" ]]; then echo active; exit 0; fi
+  echo inactive; echo inactive; exit 3
+fi
+if [[ -n "${LOCKCHECK:-}" ]]; then if flock -n "$LOCKCHECK" -c true; then echo free >>"$T/lock.at.systemctl"; else echo held >>"$T/lock.at.systemctl"; fi; fi
 if [[ -f "$T/fail.$1" ]]; then exit 1; fi
 exit 0'
 }
@@ -873,9 +878,15 @@ bk_run_env() {
   mv "$VPS_OPT/m.tmp" "$VPS_OPT/manifest.json"
   echo x >"$VPS_OPT/secrets/rclone.conf"
   echo '{"enabled":true,"time":"04:00","folder":"F"}' >"$BK_CONFIG"
+  # il dump non deve ereditare i lock di vps-backup
+  # shellcheck disable=SC2016
+  make_stub mariadb-dump 'n=0; for f in /proc/self/fd/*; do case "$(readlink "$f" 2>/dev/null)" in *vps-*.lock) n=$((n+1));; esac; done
+echo $n >>"$BATS_TEST_TMPDIR/lockfds"; echo "-- dump $*"; exit "${STUB_RC_mariadb_dump:-0}"'
   # shellcheck disable=SC2016
   make_stub rclone 'T="$BATS_TEST_TMPDIR"; D="$T/drive"
 echo "$*" >>"$T/rclone.calls"
+jq -c ".job | {step, domain}" "$BK_STATE" >>"$T/steps.log" 2>/dev/null || echo null >>"$T/steps.log"
+n=0; for f in /proc/self/fd/*; do case "$(readlink "$f" 2>/dev/null)" in *vps-*.lock) n=$((n+1));; esac; done; echo $n >>"$T/lockfds"
 [[ "$1" == --config ]] && shift 2
 sub="$1"; shift
 if [[ " $(cat "$T/rclone.fail" 2>/dev/null) " == *" $sub "* ]]; then cat "$T/rclone.msg" >&2; exit 1; fi
@@ -894,8 +905,8 @@ case "$sub" in
       if [[ "$mode" == --dirs-only && -d "$f" ]]; then jq -nc --arg n "$(basename "$f")" "{Name:\$n,IsDir:true}"; fi
       if [[ "$mode" == --files-only && -f "$f" ]]; then jq -nc --arg n "$(basename "$f")" --argjson s "$(stat -c %s "$f")" "{Name:\$n,Size:\$s,IsDir:false}"; fi
     done | jq -s . ;;
-  deletefile) rm -f "$(rem "$1")" ;;
-  purge) rm -rf "$(rem "$1")" ;;
+  deletefile) rm -f "$(rem "${@: -1}")" ;;
+  purge) rm -rf "$(rem "${@: -1}")" ;;
   cleanup) ;;
 esac
 exit 0'
@@ -954,8 +965,10 @@ drive_files() { ls "$DRIVE/F/$1" 2>/dev/null || true; }
   [ "$(drive_files a.it | head -1)" = a.it-20261002-0400.tar.gz ]
   [ "$(drive_files _pannello | wc -l)" -eq 3 ]
   [ "$(drive_files _pannello | tail -1)" = pannello-20261004-0400.sql.gz ]
-  # una sola pulizia del cestino per giro che ha cancellato qualcosa
-  [ "$(grep -c ' cleanup ' "$BATS_TEST_TMPDIR/rclone.calls")" -eq 1 ]
+  # senza cestino e senza cleanup (lo scope drive.file non permette di svuotarlo)
+  run ! grep -q ' cleanup' "$BATS_TEST_TMPDIR/rclone.calls"
+  grep -q 'deletefile --drive-use-trash=false gdrive:F/a.it/a.it-20261001-0400.tar.gz' "$BATS_TEST_TMPDIR/rclone.calls"
+  [ -z "$(grep ' deletefile ' "$BATS_TEST_TMPDIR/rclone.calls" | grep -v -- '--drive-use-trash=false' || true)" ]
   jq -e '.last_run.sites[0].deleted == 1' "$BK_STATE"
 }
 
@@ -968,15 +981,16 @@ drive_files() { ls "$DRIVE/F/$1" 2>/dev/null || true; }
   echo copyto >"$BATS_TEST_TMPDIR/rclone.fail"
   echo "Failed to copy: invalid_grant: Token has been expired or revoked." >"$BATS_TEST_TMPDIR/rclone.msg"
   bk_tool _run
-  [ "$status" -eq 0 ]
-  run ! grep -q ' deletefile \| purge \| cleanup ' "$BATS_TEST_TMPDIR/rclone.calls"
+  [ "$status" -eq 1 ]
+  run ! grep -q ' deletefile \| purge \| cleanup' "$BATS_TEST_TMPDIR/rclone.calls"
   [ "$(drive_files a.it | wc -l)" -eq 3 ]
   jq -e '.last_run.ok == false and (.last_run.sites | all(.ok == false and (.reason | test("revoked"))))
     and .last_run.alert == "sent" and .job == null' "$BK_STATE"
   [ -z "$(ls -A "$BK_BACKUPS/tmp")" ]
   # un solo messaggio, con N, dominio e motivo; il token del bot solo in stdin
   [ "$(grep -c '^text=' "$BATS_TEST_TMPDIR/curl.args")" -eq 1 ]
-  grep -qx 'text=💾 Backup: 2 siti non salvati' "$BATS_TEST_TMPDIR/curl.args"
+  grep -qx "text=💾 $(hostname): Backup: 2 siti non salvati" "$BATS_TEST_TMPDIR/curl.args"
+  grep -q '^pannello: ' "$BATS_TEST_TMPDIR/curl.args"
   grep -q '^a.it: caricamento su Drive non riuscito' "$BATS_TEST_TMPDIR/curl.args"
   grep -q '^b.it: caricamento su Drive non riuscito' "$BATS_TEST_TMPDIR/curl.args"
   run ! grep -q '123456:ABC' "$BATS_TEST_TMPDIR/curl.args"
@@ -988,7 +1002,7 @@ drive_files() { ls "$DRIVE/F/$1" 2>/dev/null || true; }
   echo mkdir >"$BATS_TEST_TMPDIR/rclone.fail"
   echo "couldn't login" >"$BATS_TEST_TMPDIR/rclone.msg"
   bk_tool _run
-  [ "$status" -eq 0 ]
+  [ "$status" -eq 1 ]
   jq -e '.last_run.sites[0].ok == false and (.last_run.sites[0].reason | test("non risponde")) and .last_run.panel.ok == false' "$BK_STATE"
   [ "$(grep -c '^text=' "$BATS_TEST_TMPDIR/curl.args")" -eq 1 ]
 }
@@ -1000,7 +1014,7 @@ drive_files() { ls "$DRIVE/F/$1" 2>/dev/null || true; }
   for n in 1 2 3; do echo vecchia >"$DRIVE/F/a.it/a.it-2026090${n}-0400.tar.gz"; done
   : >"$BATS_TEST_TMPDIR/rclone.trunc"
   bk_tool _run
-  [ "$status" -eq 0 ]
+  [ "$status" -eq 1 ]
   jq -e '.last_run.sites[0].ok == false and (.last_run.sites[0].reason | test("dimensione diversa"))' "$BK_STATE"
   [ "$(drive_files a.it | wc -l)" -eq 3 ]
   [ ! -e "$DRIVE/F/a.it/a.it-20261001-0400.tar.gz" ]
@@ -1013,7 +1027,7 @@ drive_files() { ls "$DRIVE/F/$1" 2>/dev/null || true; }
   # shellcheck disable=SC2016
   make_stub du 'case "$*" in *big.it*) printf "99999999999999\t%s\n" "${@: -1}";; *) exec /usr/bin/du "$@";; esac'
   bk_tool _run
-  [ "$status" -eq 0 ]
+  [ "$status" -eq 1 ]
   jq -e '(.last_run.sites[] | select(.domain == "big.it") | .ok == false and .reason == "spazio insufficiente")
     and (.last_run.sites[] | select(.domain == "ok.it") | .ok == true)' "$BK_STATE"
   [ -z "$(drive_files big.it)" ]
@@ -1030,7 +1044,7 @@ drive_files() { ls "$DRIVE/F/$1" 2>/dev/null || true; }
   flock -n "$lk"
   bk_tool _run
   exec {lk}>&-
-  [ "$status" -eq 0 ]
+  [ "$status" -eq 1 ]
   jq -e '(.last_run.sites[] | select(.domain == "busy.it") | .reason == "sito occupato")
     and (.last_run.sites[] | select(.domain == "free.it") | .ok == true)' "$BK_STATE"
   [ -z "$(drive_files busy.it)" ]
@@ -1060,9 +1074,11 @@ drive_files() { ls "$DRIVE/F/$1" 2>/dev/null || true; }
   echo x >"$DRIVE/F/recente.it/recente.it-$(date -d '29 days ago' +%Y%m%d)-0400.tar.gz"
   echo x >"$DRIVE/F/_pannello/pannello-$(date -d '90 days ago' +%Y%m%d)-0400.sql.gz"
   echo x >"$DRIVE/F/senzadata.it/qualcosa.bin"
+  echo '{"job":null,"last_run":null,"known":["vecchio.it","recente.it","senzadata.it"]}' >"$BK_STATE"
   bk_tool _run
   [ "$status" -eq 0 ]
   [ ! -e "$DRIVE/F/vecchio.it" ]
+  jq -e '.known | index("vecchio.it") == null and index("a.it") != null and index("recente.it") != null' "$BK_STATE"
   [ -d "$DRIVE/F/recente.it" ]
   [ -d "$DRIVE/F/senzadata.it" ]
   [ -d "$DRIVE/F/a.it" ]
@@ -1104,15 +1120,17 @@ drive_files() { ls "$DRIVE/F/$1" 2>/dev/null || true; }
   zcat "$DRIVE/F/_pannello/pannello-20261001-0400.sql.gz" | grep -q -- '--single-transaction --routines --events vpspanel'
 }
 
-@test "_run: dump che fallisce = pannello ko nello stato, siti salvati, niente avviso (solo siti)" {
+@test "_run: dump che fallisce = pannello ko, siti salvati, avviso con la riga pannello" {
   bk_run_env
   mk_site a.it no
   # il dump del sito non ha db; quello del pannello fallisce
   STUB_RC_mariadb_dump=1 bk_tool _run
-  [ "$status" -eq 0 ]
+  [ "$status" -eq 1 ]
   jq -e '.last_run.ok == false and .last_run.panel.ok == false and .last_run.sites[0].ok == true' "$BK_STATE"
   [ -z "$(drive_files _pannello)" ]
-  [ ! -e "$BATS_TEST_TMPDIR/curl.args" ]
+  jq -e '.last_run.alert == "sent"' "$BK_STATE"
+  grep -qx "text=💾 $(hostname): Backup: pannello non salvato" "$BATS_TEST_TMPDIR/curl.args"
+  grep -q '^pannello: dump del database del pannello non riuscito' "$BATS_TEST_TMPDIR/curl.args"
 }
 
 @test "_run: avanzi bk.* vecchi di oltre un giorno in tmp si tolgono, quelli freschi no" {
@@ -1212,4 +1230,175 @@ exec /usr/bin/mv "$@"'
   [ "$status" -ne 0 ]
   jq -e '.error | test("non è stato ripristinato")' <<<"$output"
   [ "$(cat "$VPS_OPT"/secrets/.rclone-prev.*)" = vecchio ]
+}
+
+# ---------------------------------------------------------------------------
+# Task 3, fix round 1
+# ---------------------------------------------------------------------------
+
+@test "_run: Drive irraggiungibile con zero siti = avviso con la riga pannello" {
+  bk_run_env
+  echo mkdir >"$BATS_TEST_TMPDIR/rclone.fail"
+  echo "couldn't login" >"$BATS_TEST_TMPDIR/rclone.msg"
+  bk_tool _run
+  [ "$status" -eq 1 ]
+  jq -e '.last_run.ok == false and .last_run.alert == "sent" and .job == null' "$BK_STATE"
+  grep -qx "text=💾 $(hostname): Backup: pannello non salvato" "$BATS_TEST_TMPDIR/curl.args"
+  grep -q '^pannello: Google Drive non risponde' "$BATS_TEST_TMPDIR/curl.args"
+}
+
+@test "_run: esce con 1 se un sito è fallito, con stato scritto e avviso inviato; 0 se tutto salvato" {
+  bk_run_env
+  mk_site a.it no
+  bk_tool _run
+  [ "$status" -eq 0 ]
+  echo copyto >"$BATS_TEST_TMPDIR/rclone.fail"
+  echo "Drive pieno" >"$BATS_TEST_TMPDIR/rclone.msg"
+  bk_tool _run
+  [ "$status" -eq 1 ]
+  jq -e '.last_run.alert == "sent" and .job == null' "$BK_STATE"
+}
+
+@test "_run: VPS ricostruita (stato vuoto) = cartelle vecchie su Drive mai eliminate" {
+  bk_run_env
+  mk_site a.it no
+  mkdir -p "$DRIVE/F/altro.it"
+  echo x >"$DRIVE/F/altro.it/altro.it-$(date -d '60 days ago' +%Y%m%d)-0400.tar.gz"
+  bk_tool _run
+  [ "$status" -eq 0 ]
+  [ -d "$DRIVE/F/altro.it" ]
+  run ! grep -q ' purge' "$BATS_TEST_TMPDIR/rclone.calls"
+  # il sito salvato entra in known
+  jq -e '.known == ["a.it"]' "$BK_STATE"
+}
+
+@test "_run: known sopravvive ai giri e un sito eliminato esce da known dopo la pulizia" {
+  bk_run_env
+  mk_site a.it no
+  mk_site b.it no
+  bk_tool _run
+  jq -e '.known | sort == ["a.it","b.it"]' "$BK_STATE"
+  rm "$SITES_DIR/b.it.json"
+  bk_tool _run
+  jq -e '.known | sort == ["a.it","b.it"]' "$BK_STATE"
+  # b.it ha ancora una copia recente: resta
+  [ -d "$DRIVE/F/b.it" ]
+}
+
+@test "_run: conservazione e pulizia guardano solo i nomi che crea il programma" {
+  bk_run_env
+  mk_site a.it no
+  mkdir -p "$DRIVE/F/a.it" "$DRIVE/F/_pannello" "$DRIVE/F/gone.it"
+  for n in 1 2 3; do echo v >"$DRIVE/F/a.it/a.it-2026090${n}-0400.tar.gz"; done
+  echo n >"$DRIVE/F/a.it/note-20200101-1200.txt"
+  echo f >"$DRIVE/F/a.it/other.it-29990101-0400.tar.gz"
+  echo f >"$DRIVE/F/a.it/a.it-29990101-0400.tar.gz.bak"
+  echo p >"$DRIVE/F/_pannello/note-20200101-1200.txt"
+  echo p >"$DRIVE/F/_pannello/pannello-29990101-0400.sql.gz.old"
+  # una cartella eliminata con dentro solo un file estraneo e futuro/vecchio
+  echo x >"$DRIVE/F/gone.it/other-20200101-0400.tar.gz"
+  echo '{"job":null,"last_run":null,"known":["gone.it"]}' >"$BK_STATE"
+  bk_tool _run
+  [ "$status" -eq 0 ]
+  # le tre copie vecchie: ne restano 2 + la nuova, gli estranei intatti
+  [ ! -e "$DRIVE/F/a.it/a.it-20260901-0400.tar.gz" ]
+  [ -e "$DRIVE/F/a.it/a.it-20261001-0400.tar.gz" ]
+  [ -e "$DRIVE/F/a.it/note-20200101-1200.txt" ]
+  [ -e "$DRIVE/F/a.it/other.it-29990101-0400.tar.gz" ]
+  [ -e "$DRIVE/F/a.it/a.it-29990101-0400.tar.gz.bak" ]
+  [ -e "$DRIVE/F/_pannello/note-20200101-1200.txt" ]
+  [ -e "$DRIVE/F/_pannello/pannello-29990101-0400.sql.gz.old" ]
+  # nessuna copia riconoscibile del sito: la cartella non si elimina
+  [ -d "$DRIVE/F/gone.it" ]
+}
+
+@test "_run: purge senza cestino (--drive-use-trash=false)" {
+  bk_run_env
+  mk_site a.it no
+  mkdir -p "$DRIVE/F/vecchio.it"
+  echo x >"$DRIVE/F/vecchio.it/vecchio.it-$(date -d '40 days ago' +%Y%m%d)-0400.tar.gz"
+  echo '{"job":null,"last_run":null,"known":["vecchio.it"]}' >"$BK_STATE"
+  bk_tool _run
+  grep -q 'purge --drive-use-trash=false gdrive:F/vecchio.it' "$BATS_TEST_TMPDIR/rclone.calls"
+}
+
+@test "_run: i lock non arrivano ai figli (rclone e dump)" {
+  bk_run_env
+  mk_site a.it yes
+  bk_tool _run
+  [ "$status" -eq 0 ]
+  [ -s "$BATS_TEST_TMPDIR/lockfds" ]
+  [ "$(sort -u "$BATS_TEST_TMPDIR/lockfds")" = 0 ]
+}
+
+@test "_run: cartella bk.run.* di un giro morto si toglie a qualunque età" {
+  bk_run_env
+  mkdir -p "$BK_BACKUPS/tmp/bk.run.MORTO1" "$BK_BACKUPS/tmp/bk.altro"
+  mk_site a.it no
+  bk_tool _run
+  [ ! -e "$BK_BACKUPS/tmp/bk.run.MORTO1" ]
+  [ -d "$BK_BACKUPS/tmp/bk.altro" ]
+}
+
+@test "_run: du che fallisce = dimensione del sito non leggibile, non spazio insufficiente" {
+  bk_run_env
+  mk_site rotto.it no
+  mk_site ok.it no
+  # shellcheck disable=SC2016
+  make_stub du 'case "$*" in *rotto.it*) exit 1;; *) exec /usr/bin/du "$@";; esac'
+  bk_tool _run
+  [ "$status" -eq 1 ]
+  jq -e '(.last_run.sites[] | select(.domain == "rotto.it") | .reason == "dimensione del sito non leggibile")
+    and (.last_run.sites[] | select(.domain == "ok.it") | .ok)' "$BK_STATE"
+}
+
+@test "_run: la stima del peso conta solo public/ (du -sbP) più wp-config e database" {
+  bk_run_env
+  mk_site a.it no
+  # shellcheck disable=SC2016
+  make_stub du 'echo "$*" >>"$BATS_TEST_TMPDIR/du.calls"; exec /usr/bin/du "$@"'
+  bk_tool _run
+  grep -q -- "-sbP -- $SITES_WWW/a.it/public" "$BATS_TEST_TMPDIR/du.calls"
+}
+
+@test "_run: i passi in state.json durante il giro, nell'ordine" {
+  bk_run_env
+  mk_site a.it no
+  mkdir -p "$DRIVE/F/a.it"
+  for n in 1 2 3; do echo v >"$DRIVE/F/a.it/a.it-2026090${n}-0400.tar.gz"; done
+  bk_tool _run
+  [ "$status" -eq 0 ]
+  seq="$(jq -r '"\(.step):\(.domain)"' "$BATS_TEST_TMPDIR/steps.log" | uniq | paste -sd' ')"
+  [ "$seq" = "start:null upload:a.it retention:a.it panel:null purge:null" ]
+}
+
+@test "status: job con unità systemd ancora attiva = job mostrato, non interrotto" {
+  bk_run_env
+  echo '{"job":{"unit":"vps-backup-run","started":"s","step":"site","domain":"a.it"},"last_run":null}' >"$BK_STATE"
+  echo active >"$BATS_TEST_TMPDIR/unit.active"
+  bk_tool status
+  jq -e '.job.step == "site" and .interrupted == false' <<<"$output"
+  rm "$BATS_TEST_TMPDIR/unit.active"
+  bk_tool status
+  jq -e '.job == null and .interrupted == true' <<<"$output"
+  grep -q 'is-active vps-backup-run.service vps-backup.service' "$BATS_TEST_TMPDIR/systemctl.calls"
+}
+
+@test "run: un secondo run con l'unità già partita (lock non ancora preso) = backup in corso" {
+  bk_run_env
+  echo active >"$BATS_TEST_TMPDIR/unit.active"
+  bk_tool run
+  [ "$status" -ne 0 ]
+  jq -e '.error == "backup in corso"' <<<"$output"
+  run ! grep -q 'systemd-run' "$CALLS"
+}
+
+@test "config: il lock globale è libero quando partono daemon-reload e enable" {
+  bk_run_env
+  export LOCKCHECK="$BK_LOCK_DIR/vps-backup.lock"
+  # il lock del test stesso non c'è: systemctl prova a prenderlo e riesce solo se _no_se_in_corso l'ha lasciato
+  bk_tool config <<<'{"enabled":true,"time":"05:00"}'
+  [ "$status" -eq 0 ]
+  [ -s "$BATS_TEST_TMPDIR/lock.at.systemctl" ]
+  [ "$(sort -u "$BATS_TEST_TMPDIR/lock.at.systemctl")" = free ]
 }
