@@ -1,0 +1,9 @@
+[Unit]
+Description=Copie su Google Drive (vps-backup)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/vps/bin/vps-backup _run
+TimeoutStartSec=12h
+Nice=10
+IOSchedulingClass=idle

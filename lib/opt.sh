@@ -118,8 +118,9 @@ opt_system_files() {
   if ! dpkg -s acl >/dev/null 2>&1; then
     apt_install acl || die "Pacchetto acl non installato"
   fi
-  # zip e unzip: li usa il file manager (vps-files zip, unzip, download-zip)
-  for pkg in zip unzip; do
+  # zip e unzip: li usa il file manager (vps-files zip, unzip, download-zip);
+  # rclone: le copie su Google Drive (vps-backup)
+  for pkg in zip unzip rclone; do
     if ! dpkg -s "$pkg" >/dev/null 2>&1; then
       apt_install "$pkg" || die "Pacchetto $pkg non installato"
     fi
@@ -129,6 +130,7 @@ opt_system_files() {
     redis_acl_setup || log "ATTENZIONE: Redis con utenti ACL non configurato: WordPress non sarà disponibile (dettagli in $VPS_LOG)"
   fi
   opt_monitor_files
+  opt_backup_files
   opt_panel_pool
   opt_panel_vhost
   # Aggiornamenti automatici: anche Nginx di nginx.org (dalla 1.5.3). Solo sulle
@@ -151,5 +153,29 @@ opt_monitor_files() {
   systemctl daemon-reload >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: systemctl daemon-reload non riuscito"
   if [[ -f "$MON_CONFIG" && "$(jq -r '.enabled == true' "$MON_CONFIG" 2>/dev/null)" == true ]]; then
     systemctl enable --now vps-monitor.timer >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: timer di vps-monitor non abilitato"
+  fi
+}
+
+# opt_backup_files — unità systemd, cartelle e configurazione iniziale di vps-backup.
+# Il timer resta spento finché `vps-backup config` non riceve enabled:true; in un
+# aggiornamento (--tools-only) con il backup già attivo lo si riabilita (il drop-in
+# con l'orario scelto sta già in .timer.d e non si tocca). La configurazione
+# esistente non si sovrascrive mai.
+opt_backup_files() {
+  local u d
+  for u in vps-backup.service vps-backup.timer; do
+    install -m 644 "$VPS_TEMPLATES/$u" "$SYSTEMD_DIR/$u"
+    own root:root "$SYSTEMD_DIR/$u"
+  done
+  install -d -m 700 "$BK_DIR" "$BK_BACKUPS"
+  for d in panel sites restore tmp; do
+    install -d -m 700 "$BK_BACKUPS/$d"
+  done
+  if [[ ! -f "$BK_CONFIG" ]]; then
+    bk_config_json | write_file "$BK_CONFIG" 600 root:root
+  fi
+  systemctl daemon-reload >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: systemctl daemon-reload non riuscito"
+  if [[ "$(jq -r '.enabled == true' "$BK_CONFIG" 2>/dev/null)" == true && -f "${BK_RCLONE_CONF:-$VPS_OPT/secrets/rclone.conf}" ]]; then
+    systemctl enable --now vps-backup.timer >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: timer di vps-backup non abilitato"
   fi
 }

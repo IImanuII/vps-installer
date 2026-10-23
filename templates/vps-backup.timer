@@ -1,0 +1,10 @@
+[Unit]
+Description=Copie su Google Drive ogni notte (vps-backup)
+
+[Timer]
+# L'orario vero sta nel drop-in ora.conf, scritto da `vps-backup config`.
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -501,3 +501,287 @@ exec "$@"'
   run bk_space_ok "$BATS_TEST_TMPDIR" 99999999999999999999999
   [ "$status" -eq 1 ]
 }
+
+# ---------------------------------------------------------------------------
+# tools/vps-backup: collegamento a Drive, stato, configurazione, timer (Task 2)
+# ---------------------------------------------------------------------------
+
+# bk_tool_env — ambiente del tool: tutto nel tmp del test, rclone e systemctl finti.
+# Stub di rclone: annota gli argomenti in rclone.calls e lo stdin di rcat in rcat.stdin;
+# se esiste rclone.fail (contiene un sottocomando) quel sottocomando fallisce con
+# il testo di rclone.msg su stderr; `about` stampa about.json se esiste, altrimenti fallisce.
+bk_tool_env() {
+  export SYSTEMD_DIR="$BATS_TEST_TMPDIR/systemd"
+  export BK_CONFIG="$BK_DIR/config.json" BK_STATE="$BK_DIR/state.json"
+  mkdir -p "$SYSTEMD_DIR" "$BK_DIR" "$VPS_OPT/secrets"
+  T_TOOL="$REPO_ROOT/tools/vps-backup"
+  # shellcheck disable=SC2016
+  make_stub rclone 'T="$BATS_TEST_TMPDIR"
+echo "$*" >>"$T/rclone.calls"
+sub=""
+for a in "$@"; do case "$a" in mkdir|rcat|deletefile|about) sub="$a";; esac; done
+if [[ "$sub" == rcat ]]; then cat >"$T/rcat.stdin"; fi
+if [[ -f "$T/rclone.fail" && "$(cat "$T/rclone.fail")" == "$sub" ]]; then cat "$T/rclone.msg" >&2; exit 1; fi
+if [[ "$sub" == about ]]; then [[ -f "$T/about.json" ]] || exit 1; cat "$T/about.json"; fi
+exit 0'
+  # shellcheck disable=SC2016
+  make_stub systemctl 'T="$BATS_TEST_TMPDIR"
+echo "$*" >>"$T/systemctl.calls"
+if [[ -f "$T/fail.$1" ]]; then exit 1; fi
+exit 0'
+}
+
+TOKEN_OK='{"access_token":"ya29.SEGRETO-ACCESSO","token_type":"Bearer","refresh_token":"1//SEGRETO-RINNOVO","expiry":"2026-10-23T12:00:00.123456789+02:00"}'
+
+# bk_tool ARGS... — lancia il tool (stdin passa); l'uscita è in $output / $status.
+bk_tool() {
+  run --separate-stderr env VPS_OPT="$VPS_OPT" VPS_LIB="$REPO_ROOT/lib" VPS_LOG="$VPS_LOG" VPS_NO_CHOWN=1 \
+    SYSTEMD_DIR="$SYSTEMD_DIR" BK_DIR="$BK_DIR" PATH="$PATH" BATS_TEST_TMPDIR="$BATS_TEST_TMPDIR" \
+    bash "$T_TOOL" "$@"
+}
+
+@test "vps-backup connect: rclone.conf 600 con scope drive.file, cartella creata, file di prova scritto e cancellato" {
+  bk_tool_env
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -eq 0 ]
+  jq -e --arg f "Plancia-$(hostname -s)" '.ok == true and .folder == $f' <<<"$output"
+  c="$VPS_OPT/secrets/rclone.conf"
+  [ "$(stat -c %a "$c")" = 600 ]
+  grep -qxF '[gdrive]' "$c"
+  grep -qxF 'type = drive' "$c"
+  grep -qxF 'scope = drive.file' "$c"
+  grep -q '^token = {.*"refresh_token":"1//SEGRETO-RINNOVO"' "$c"
+  ! grep -q client_id "$c"
+  grep -q -- "--config $c mkdir gdrive:Plancia-" "$BATS_TEST_TMPDIR/rclone.calls"
+  grep -q 'rcat gdrive:Plancia-.*/.plancia-test' "$BATS_TEST_TMPDIR/rclone.calls"
+  grep -q 'deletefile gdrive:Plancia-.*/.plancia-test' "$BATS_TEST_TMPDIR/rclone.calls"
+  [ -s "$BATS_TEST_TMPDIR/rcat.stdin" ]
+  [ "$(ls -A "$VPS_OPT/secrets" | grep rclone)" = rclone.conf ]
+}
+
+@test "vps-backup connect: il token non compare né nell'output né nel log né negli argomenti" {
+  bk_tool_env
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -eq 0 ]
+  ! grep -q 'SEGRETO' <<<"$output$stderr"
+  ! grep -q 'SEGRETO' "$VPS_LOG"
+  ! grep -q 'SEGRETO' "$BATS_TEST_TMPDIR/rclone.calls"
+}
+
+@test "vps-backup connect: client id e secret propri finiscono nel file" {
+  bk_tool_env
+  bk_tool connect < <(printf '%s\nmio-id.apps.googleusercontent.com\nGOCSPX-abc_DEF-123\n' "$TOKEN_OK")
+  [ "$status" -eq 0 ]
+  c="$VPS_OPT/secrets/rclone.conf"
+  grep -qxF 'client_id = mio-id.apps.googleusercontent.com' "$c"
+  grep -qxF 'client_secret = GOCSPX-abc_DEF-123' "$c"
+  ! grep -q 'GOCSPX' <<<"$output$stderr"
+}
+
+@test "vps-backup connect: client id senza secret, o con caratteri strani, è rifiutato" {
+  bk_tool_env
+  bk_tool connect < <(printf '%s\nsolo-id\n' "$TOKEN_OK")
+  [ "$status" -ne 0 ]
+  bk_tool connect < <(printf '%s\nid\nsec ret\n' "$TOKEN_OK")
+  [ "$status" -ne 0 ]
+  [ ! -e "$VPS_OPT/secrets/rclone.conf" ]
+}
+
+@test "vps-backup connect: token vuoto, non JSON o senza refresh_token = errore, nessun file" {
+  bk_tool_env
+  for t in '' 'non json' '[1,2]' '{"access_token":"a"}' '{"access_token":"","refresh_token":"r"}' '{"access_token":"a","refresh_token":5}' "$TOKEN_OK $TOKEN_OK"; do
+    bk_tool connect <<<"$t"
+    [ "$status" -ne 0 ]
+    jq -e '.ok == false and (.error | length > 0)' <<<"$output"
+    [ -z "$(ls -A "$VPS_OPT/secrets" | grep rclone || true)" ]
+  done
+  [ ! -e "$BATS_TEST_TMPDIR/rclone.calls" ]
+}
+
+@test "vps-backup connect: Drive rifiuta = errore leggibile senza token, nessun file" {
+  bk_tool_env
+  echo mkdir >"$BATS_TEST_TMPDIR/rclone.fail"
+  echo "ERROR : login: Invalid token ya29.SEGRETO-ACCESSO 1//SEGRETO-RINNOVO" >"$BATS_TEST_TMPDIR/rclone.msg"
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | test("Invalid token"))' <<<"$output"
+  ! grep -q 'SEGRETO' <<<"$output$stderr"
+  ! grep -q 'SEGRETO' "$VPS_LOG"
+  [ -z "$(ls -A "$VPS_OPT/secrets" | grep rclone || true)" ]
+}
+
+@test "vps-backup connect: se il file di prova non si scrive, torna il rclone.conf di prima" {
+  bk_tool_env
+  echo vecchio >"$VPS_OPT/secrets/rclone.conf"
+  chmod 600 "$VPS_OPT/secrets/rclone.conf"
+  echo rcat >"$BATS_TEST_TMPDIR/rclone.fail"
+  echo "Drive pieno" >"$BATS_TEST_TMPDIR/rclone.msg"
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -ne 0 ]
+  [ "$(cat "$VPS_OPT/secrets/rclone.conf")" = vecchio ]
+  [ "$(ls -A "$VPS_OPT/secrets" | grep rclone)" = rclone.conf ]
+}
+
+@test "vps-backup connect: usa la cartella già configurata" {
+  bk_tool_env
+  echo '{"enabled":false,"time":"04:00","folder":"MieiBackup"}' >"$BK_CONFIG"
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -eq 0 ]
+  jq -e '.folder == "MieiBackup"' <<<"$output"
+  grep -q 'mkdir gdrive:MieiBackup$' "$BATS_TEST_TMPDIR/rclone.calls"
+}
+
+@test "vps-backup disconnect: toglie rclone.conf, spegne il timer, la configurazione resta ma disattivata" {
+  bk_tool_env
+  echo x >"$VPS_OPT/secrets/rclone.conf"
+  echo '{"enabled":true,"time":"03:30","folder":"F"}' >"$BK_CONFIG"
+  bk_tool disconnect
+  [ "$status" -eq 0 ]
+  jq -e '.ok == true' <<<"$output"
+  [ ! -e "$VPS_OPT/secrets/rclone.conf" ]
+  grep -qxF 'disable --now vps-backup.timer' "$BATS_TEST_TMPDIR/systemctl.calls"
+  jq -e '.enabled == false and .time == "03:30" and .folder == "F"' "$BK_CONFIG"
+  # già scollegato: non è un errore
+  bk_tool disconnect
+  [ "$status" -eq 0 ]
+}
+
+@test "vps-backup config: scrive config.json 600, drop-in del timer, abilita il timer" {
+  bk_tool_env
+  echo x >"$VPS_OPT/secrets/rclone.conf"
+  bk_tool config <<<'{"enabled":true,"time":"02:15","folder":"Backup-vps_1.x"}'
+  [ "$status" -eq 0 ]
+  jq -e '.ok == true' <<<"$output"
+  [ "$(stat -c %a "$BK_CONFIG")" = 600 ]
+  jq -e '. == {enabled:true,time:"02:15",folder:"Backup-vps_1.x"}' "$BK_CONFIG"
+  d="$SYSTEMD_DIR/vps-backup.timer.d/ora.conf"
+  [ "$(cat "$d")" = "$(printf '[Timer]\nOnCalendar=\nOnCalendar=*-*-* 02:15:00')" ]
+  grep -qxF 'daemon-reload' "$BATS_TEST_TMPDIR/systemctl.calls"
+  grep -qxF 'enable --now vps-backup.timer' "$BATS_TEST_TMPDIR/systemctl.calls"
+}
+
+@test "vps-backup config: enabled false spegne il timer; folder omesso = quello attuale" {
+  bk_tool_env
+  echo '{"enabled":true,"time":"04:00","folder":"Cart"}' >"$BK_CONFIG"
+  bk_tool config <<<'{"enabled":false,"time":"05:00"}'
+  [ "$status" -eq 0 ]
+  jq -e '.enabled == false and .time == "05:00" and .folder == "Cart"' "$BK_CONFIG"
+  grep -qxF 'disable --now vps-backup.timer' "$BATS_TEST_TMPDIR/systemctl.calls"
+  grep -q 'OnCalendar=\*-\*-\* 05:00:00' "$SYSTEMD_DIR/vps-backup.timer.d/ora.conf"
+}
+
+@test "vps-backup config: ora o cartella non valide, o Drive non collegato = errore, nulla scritto" {
+  bk_tool_env
+  echo x >"$VPS_OPT/secrets/rclone.conf"
+  for j in '{"enabled":true,"time":"25:00","folder":"a"}' '{"enabled":true,"time":"4:00","folder":"a"}' \
+    '{"enabled":true,"time":"12:60","folder":"a"}' '{"enabled":true,"time":"04:00","folder":"../x"}' \
+    '{"enabled":true,"time":"04:00","folder":"a/b"}' '{"enabled":true,"time":"04:00","folder":".."}' \
+    '{"enabled":true,"time":"04:00","folder":""}' '{"enabled":true,"time":"04:00","folder":5}' \
+    '{"enabled":"si","time":"04:00","folder":"a"}' '{"time":"04:00"}' 'non json' '[]'; do
+    bk_tool config <<<"$j"
+    [ "$status" -ne 0 ]
+    jq -e '.ok == false' <<<"$output"
+  done
+  [ ! -e "$BK_CONFIG" ]
+  [ ! -e "$SYSTEMD_DIR/vps-backup.timer.d" ]
+  rm "$VPS_OPT/secrets/rclone.conf"
+  bk_tool config <<<'{"enabled":true,"time":"04:00","folder":"a"}'
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"non collegato"* ]]
+  [ ! -e "$BK_CONFIG" ]
+}
+
+@test "vps-backup config: timer che non parte = errore con saved true" {
+  bk_tool_env
+  echo x >"$VPS_OPT/secrets/rclone.conf"
+  touch "$BATS_TEST_TMPDIR/fail.enable"
+  bk_tool config <<<'{"enabled":true,"time":"04:00","folder":"a"}'
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and .saved == true' <<<"$output"
+  [ -f "$BK_CONFIG" ]
+}
+
+@test "vps-backup status: prima del primo giro, non collegato, valori predefiniti" {
+  bk_tool_env
+  bk_tool status
+  [ "$status" -eq 0 ]
+  jq -e --arg f "Plancia-$(hostname -s)" '. == {ok:true,connected:false,folder:$f,enabled:false,time:"04:00",job:null,last_run:null,drive:null}' <<<"$output"
+  [ ! -e "$BATS_TEST_TMPDIR/rclone.calls" ]
+}
+
+@test "vps-backup status: collegato, spazio di Drive, ultimo giro e lavoro dallo stato" {
+  bk_tool_env
+  echo x >"$VPS_OPT/secrets/rclone.conf"
+  echo '{"enabled":true,"time":"03:00","folder":"Cart"}' >"$BK_CONFIG"
+  echo '{"used":1234,"total":16106127360,"free":5}' >"$BATS_TEST_TMPDIR/about.json"
+  cat >"$BK_STATE" <<'J'
+{"job":{"op":"run","step":"archivio","domain":"a.it","started_at":"2026-10-23T04:00:01+02:00"},
+ "last_run":{"started_at":"s","finished_at":"f","ok":false,"sites":[{"domain":"a.it","ok":false,"error":"x","size":0}]}}
+J
+  bk_tool status
+  [ "$status" -eq 0 ]
+  jq -e '.connected == true and .enabled == true and .time == "03:00" and .folder == "Cart"
+    and .drive == {used:1234,total:16106127360} and .job.op == "run" and .job.domain == "a.it"
+    and .last_run.ok == false and .last_run.sites[0].domain == "a.it"' <<<"$output"
+}
+
+@test "vps-backup status: Drive che non risponde = drive null, non un errore" {
+  bk_tool_env
+  echo x >"$VPS_OPT/secrets/rclone.conf"
+  bk_tool status
+  [ "$status" -eq 0 ]
+  jq -e '.ok == true and .connected == true and .drive == null' <<<"$output"
+}
+
+@test "vps-backup status: config.json o state.json rovinati = predefiniti" {
+  bk_tool_env
+  echo 'garbage' >"$BK_CONFIG"
+  echo '[1]' >"$BK_STATE"
+  bk_tool status
+  [ "$status" -eq 0 ]
+  jq -e '.time == "04:00" and .enabled == false and .job == null and .last_run == null' <<<"$output"
+}
+
+@test "vps-backup: comando sconosciuto o assente = errore d'uso" {
+  bk_tool_env
+  bk_tool
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | startswith("uso:"))' <<<"$output"
+  bk_tool run
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false' <<<"$output"
+}
+
+@test "vps-backup _run con SUDO_USER (o via systemd) è rifiutato prima di caricare le librerie" {
+  run env SUDO_USER=panel bash "$REPO_ROOT/tools/vps-backup" _run
+  [ "$status" -eq 1 ]
+  [ "$output" = '{"ok":false,"error":"comando interno"}' ]
+  run env VPS_BACKUP_VIA_SYSTEMD=1 bash "$REPO_ROOT/tools/vps-backup" _run
+  [ "$status" -eq 1 ]
+  [ "$output" = '{"ok":false,"error":"comando interno"}' ]
+  run env SUDO_USER=panel bash "$REPO_ROOT/tools/vps-backup" _restore x
+  [ "$status" -eq 1 ]
+  [ "$output" = '{"ok":false,"error":"comando interno"}' ]
+}
+
+@test "vps-backup sotto sudo si rilancia con systemd-run, stdin e codice d'uscita compresi" {
+  # shellcheck disable=SC2016
+  make_stub systemd-run 'echo "systemd-run $*" >>"$BATS_TEST_TMPDIR/calls"; cat >"$BATS_TEST_TMPDIR/stdin"; echo "{\"ok\":true,\"interno\":true}"; exit 7'
+  run bash -c "printf 'dati-segreti\n' | SUDO_USER=panel bash '$REPO_ROOT/tools/vps-backup' connect"
+  [ "$status" -eq 7 ]
+  [ "$output" = '{"ok":true,"interno":true}' ]
+  grep -qx 'systemd-run --wait --pipe --collect --quiet --service-type=exec --setenv=VPS_BACKUP_VIA_SYSTEMD=1 /opt/vps/bin/vps-backup connect' "$BATS_TEST_TMPDIR/calls"
+  [ "$(cat "$BATS_TEST_TMPDIR/stdin")" = dati-segreti ]
+}
+
+@test "sudoers del pannello elenca vps-backup" {
+  grep -q '/opt/vps/bin/vps-backup' "$REPO_ROOT/templates/sudoers-vps-panel"
+}
+
+@test "unità systemd di vps-backup: service oneshot con _run, timer Persistent alle 04:00" {
+  grep -qxF 'Type=oneshot' "$REPO_ROOT/templates/vps-backup.service"
+  grep -qxF 'ExecStart=/opt/vps/bin/vps-backup _run' "$REPO_ROOT/templates/vps-backup.service"
+  grep -qxF 'OnCalendar=*-*-* 04:00:00' "$REPO_ROOT/templates/vps-backup.timer"
+  grep -qxF 'Persistent=true' "$REPO_ROOT/templates/vps-backup.timer"
+  grep -qxF 'WantedBy=timers.target' "$REPO_ROOT/templates/vps-backup.timer"
+}

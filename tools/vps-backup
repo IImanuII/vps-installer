@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# vps-backup — copie dei siti e del pannello su Google Drive: status, connect,
+# disconnect, config (_run lo lancia solo il timer systemd, _restore è interno).
+# Lo esegue il pannello con sudo; _run e _restore si rifiutano attraverso sudo (o
+# il rilancio qui sotto) prima ancora di caricare le librerie. Questo controllo
+# deve restare il primo.
+if [[ ("${1:-}" == _run || "${1:-}" == _restore) && (-n "${SUDO_USER:-}" || -n "${VPS_BACKUP_VIA_SYSTEMD:-}") ]]; then
+  printf '{"ok":false,"error":"comando interno"}\n'
+  exit 1
+fi
+# PHP-FPM gira con ProtectSystem=full: sudo lanciato dal pannello eredita il suo
+# spazio dei mount, dove /etc (il drop-in del timer) è in sola lettura. Ci si
+# rilancia allora in un'unità systemd nuova: stdin (il token di Drive), stdout e
+# codice d'uscita passano intatti. Il percorso è assoluto e fisso.
+if [[ -n "${SUDO_USER:-}" && -z "${VPS_BACKUP_VIA_SYSTEMD:-}" ]]; then
+  exec systemd-run --wait --pipe --collect --quiet --service-type=exec \
+    --setenv=VPS_BACKUP_VIA_SYSTEMD=1 /opt/vps/bin/vps-backup "$@"
+fi
+# Chiamata del pannello: l'ambiente del chiamante non deve influenzare lo script.
+# La vera difesa è `Defaults:panel env_reset` in sudoers; questo elenco è una
+# seconda linea di difesa.
+if [[ -n "${SUDO_USER:-}" || -n "${VPS_BACKUP_VIA_SYSTEMD:-}" ]]; then
+  VPS_OPT=/opt/vps
+  VPS_LIB=$VPS_OPT/lib
+  VPS_TEMPLATES=$VPS_OPT/templates
+  VPS_LOG=/var/log/vps-tools.log
+  unset BK_DIR BK_BACKUPS BK_LOCK_DIR BK_CONFIG BK_STATE BK_RCLONE BK_RCLONE_CONF BK_TIME_DEFAULT \
+    SYSTEMD_DIR SITES_DIR SITES_WWW SITES_BACKUPS FM_RUNUSER
+  [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
+  chmod 640 "$VPS_LOG"
+fi
+: "${VPS_OPT:=/opt/vps}" "${VPS_LOG:=/var/log/vps-tools.log}"
+: "${VPS_TEMPLATES:=$VPS_OPT/templates}"
+export LC_ALL=C
+for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
+  # shellcheck source=/dev/null
+  source "$_lib"
+done
+
+tool_init
+
+# _salvata_ma MESSAGGIO — la configurazione è su disco ma il timer non è come doveva:
+# errore con "saved":true, perché il pannello la registri comunque.
+_salvata_ma() {
+  jq -nc --arg e "$1" '{ok: false, saved: true, error: $e}'
+  exit 1
+}
+
+case "${1:-}" in
+  status)
+    bk_status_json
+    ;;
+  connect)
+    # Token + client id/secret facoltativi: poche righe, mai oltre 8 KiB.
+    dati="$(read_stdin_limited 8193)"
+    ((${#dati} <= 8192)) || json_err "dati troppo lunghi"
+    bk_connect "$dati" || json_err "$BK_ERR"
+    folder="$BK_FOLDER"
+    log "vps-backup: Google Drive collegato (cartella $folder)"
+    json_ok --arg f "$folder" '{ok: true, folder: $f}'
+    ;;
+  disconnect)
+    rm -f "$BK_RCLONE_CONF"
+    # Senza collegamento un timer acceso fallirebbe ogni notte: si spegne e la
+    # configurazione resta (orario e cartella) ma disattivata.
+    if [[ -f "$BK_CONFIG" ]]; then
+      bk_config_json | jq -c '.enabled = false' | write_file "$BK_CONFIG" 600 root:root
+    fi
+    if ! systemctl disable --now vps-backup.timer >>"$VPS_LOG" 2>&1; then
+      _salvata_ma "Drive scollegato, ma il timer di vps-backup non si è fermato (dettagli in $VPS_LOG)"
+    fi
+    log "vps-backup: Google Drive scollegato"
+    json_ok
+    ;;
+  config)
+    dati="$(read_stdin_limited 4097)"
+    ((${#dati} <= 4096)) || json_err "configurazione troppo lunga"
+    bk_config_apply "$dati" || json_err "$BK_ERR"
+    nuova="$BK_CONFIG_NEW"
+    if [[ "$(jq -r '.enabled' <<<"$nuova")" == true && ! -f "$BK_RCLONE_CONF" ]]; then
+      json_err "Google Drive non collegato: collegalo prima di attivare il backup"
+    fi
+    install -d -m 700 "$BK_DIR"
+    printf '%s\n' "$nuova" | write_file "$BK_CONFIG" 600 root:root
+    ora="$(jq -r '.time' <<<"$nuova")"
+    install -d -m 755 "$SYSTEMD_DIR/vps-backup.timer.d"
+    printf '[Timer]\nOnCalendar=\nOnCalendar=*-*-* %s:00\n' "$ora" | write_file "$SYSTEMD_DIR/vps-backup.timer.d/ora.conf" 644 root:root
+    if ! systemctl daemon-reload >>"$VPS_LOG" 2>&1; then
+      _salvata_ma "configurazione salvata, ma systemd non l'ha ricaricata (dettagli in $VPS_LOG)"
+    fi
+    if [[ "$(jq -r '.enabled' <<<"$nuova")" == true ]]; then
+      if ! systemctl enable --now vps-backup.timer >>"$VPS_LOG" 2>&1; then
+        _salvata_ma "configurazione salvata, ma il timer di vps-backup non si è avviato (dettagli in $VPS_LOG)"
+      fi
+    else
+      if ! systemctl disable --now vps-backup.timer >>"$VPS_LOG" 2>&1; then
+        _salvata_ma "configurazione salvata, ma il timer di vps-backup non si è fermato (dettagli in $VPS_LOG)"
+      fi
+    fi
+    log "vps-backup: configurazione aggiornata (attivo: $(jq -r '.enabled' <<<"$nuova"), ore $ora)"
+    json_ok
+    ;;
+  *)
+    json_err "uso: vps-backup status | connect (token da stdin) | disconnect | config (JSON da stdin)"
+    ;;
+esac

@@ -13,6 +13,8 @@
 
 # Messaggio dell'ultimo errore di bk_archive / bk_verify (leggibile dal chiamante).
 export BK_ERR=""
+# Risultati di bk_connect (cartella) e bk_config_apply (configurazione da scrivere).
+export BK_FOLDER="" BK_CONFIG_NEW=""
 # Descrittore del lock di sito tenuto da questo processo (vuoto se nessuno).
 export BK_SITE_LOCK_FD=""
 
@@ -472,4 +474,190 @@ _bk_verify_in() {
   }
   bk_verify_names "$w/files.lst" "$(site_root "$dom")" >"$w/err" || return 1
   rm -f "$w/err"
+}
+
+# --- configurazione, collegamento a Google Drive, stato (tools/vps-backup) -----
+
+: "${BK_CONFIG:=$BK_DIR/config.json}"
+: "${BK_STATE:=$BK_DIR/state.json}"
+: "${BK_RCLONE_CONF:=$VPS_OPT/secrets/rclone.conf}"
+# Comando rclone (sostituibile nei test). Il file di configurazione è sempre esplicito.
+: "${BK_RCLONE:=rclone --config $BK_RCLONE_CONF}"
+: "${BK_TIME_DEFAULT:=04:00}"
+
+# bk_valid_time HH:MM — 00:00-23:59.
+bk_valid_time() {
+  [[ "${1-}" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]
+}
+
+# bk_valid_folder NOME — un solo nome di cartella, mai un percorso.
+bk_valid_folder() {
+  [[ "${1-}" =~ ^[A-Za-z0-9._-]{1,64}$ && "${1-}" != . && "${1-}" != .. ]]
+}
+
+# bk_default_folder — Plancia-<nome macchina>, ripulito dai caratteri non ammessi.
+bk_default_folder() {
+  local h
+  h="$(hostname -s 2>/dev/null || true)"
+  h="$(printf '%s' "$h" | tr -c 'A-Za-z0-9._-' '-' | head -c 50)"
+  [[ -n "$h" ]] || h=vps
+  printf 'Plancia-%s' "$h"
+}
+
+# bk_config_json — configurazione valida: ogni campo mancante o sbagliato torna
+# al predefinito (un config.json rovinato a mano non deve bloccare lo stato).
+bk_config_json() {
+  local raw='{}' df
+  df="$(bk_default_folder)"
+  if [[ -f "$BK_CONFIG" ]]; then raw="$(jq -c 'if type == "object" then . else {} end' "$BK_CONFIG" 2>/dev/null)" || raw='{}'; fi
+  [[ -n "$raw" ]] || raw='{}'
+  jq -c --arg t "$BK_TIME_DEFAULT" --arg f "$df" '{
+    enabled: (if .enabled == true then true else false end),
+    time: (if (.time | type) == "string" and (.time | test("^([01][0-9]|2[0-3]):[0-5][0-9]$")) then .time else $t end),
+    folder: (if (.folder | type) == "string" and (.folder | test("^[A-Za-z0-9._-]{1,64}$")) and .folder != "." and .folder != ".." then .folder else $f end)
+  }' <<<"$raw"
+}
+
+# bk_clean_msg TESTO [SEGRETO...] — una riga leggibile da un messaggio di rclone:
+# ultima riga non vuota, segreti noti e token in forma riconoscibile tolti,
+# caratteri non stampabili sostituiti, al massimo 200 caratteri.
+bk_clean_msg() {
+  local m s
+  m="$(printf '%s\n' "$1" | grep -v '^[[:space:]]*$' | tail -n1 || true)"
+  shift
+  for s in "$@"; do
+    if [[ -n "$s" ]]; then m="${m//"$s"/***}"; fi
+  done
+  m="$(printf '%s' "$m" | sed -E 's/ya29\.[A-Za-z0-9._-]+/***/g; s#1//[A-Za-z0-9._-]+#***#g; s/("?(access_token|refresh_token|client_secret)"?[ =:]+)"?[^" ,}]+/\1***/g' | tr -c '[:print:]' '?' | head -c 200)"
+  [[ -n "$m" ]] || m="errore sconosciuto"
+  printf '%s' "$m"
+}
+
+# bk_drive_json — {used,total} da `rclone about`, "null" se Drive non risponde.
+# total 0 = spazio illimitato (rclone non lo riporta).
+bk_drive_json() {
+  local out
+  local -a cmd
+  read -ra cmd <<<"$BK_RCLONE"
+  if ! out="$(timeout 20 "${cmd[@]}" about gdrive: --json 2>/dev/null </dev/null)"; then
+    printf 'null'
+    return 0
+  fi
+  jq -c 'if type == "object" and (.used | type) == "number" then {used: (.used | floor), total: ((.total // 0) | floor)} else null end' <<<"$out" 2>/dev/null || printf 'null'
+}
+
+# bk_status_json — risposta di `vps-backup status`.
+bk_status_json() {
+  local cfg state='{}' drive=null conn=false
+  cfg="$(bk_config_json)"
+  if [[ -f "$BK_STATE" ]]; then state="$(jq -c 'if type == "object" then . else {} end' "$BK_STATE" 2>/dev/null)" || state='{}'; fi
+  [[ -n "$state" ]] || state='{}'
+  if [[ -f "$BK_RCLONE_CONF" ]]; then
+    conn=true
+    drive="$(bk_drive_json)"
+  fi
+  jq -nc --argjson c "$cfg" --argjson s "$state" --argjson d "$drive" --argjson conn "$conn" \
+    '{ok: true, connected: $conn, folder: $c.folder, enabled: $c.enabled, time: $c.time,
+      job: ($s.job // null), last_run: ($s.last_run // null), drive: $d}'
+}
+
+# bk_connect DATI_STDIN — riga 1: token JSON di `rclone authorize`; righe 2-3
+# (facoltative, insieme): client id e secret propri. Il token arriva solo da stdin
+# e finisce solo in rclone.conf (600, scritto qui, mai passato come argomento).
+# Imposta BK_FOLDER (nome della cartella); in caso di errore BK_ERR e 1, senza file
+# lasciati. Va chiamata senza $(...): le variabili andrebbero perse nella subshell.
+bk_connect() {
+  local -a righe cmd
+  local tok id sec folder tmp prev="" out rc=0 conf at rt
+  mapfile -t righe < <(printf '%s' "$1")
+  tok="${righe[0]:-}"
+  id="${righe[1]:-}"
+  sec="${righe[2]:-}"
+  tok="${tok%$'\r'}" id="${id%$'\r'}" sec="${sec%$'\r'}"
+  if [[ -z "$tok" ]]; then
+    BK_ERR="token mancante"
+    return 1
+  fi
+  if ! jq -e -s 'length == 1 and (.[0] | type == "object"
+      and (.access_token | type == "string" and length > 0)
+      and (.refresh_token | type == "string" and length > 0))' <<<"$tok" >/dev/null 2>&1; then
+    BK_ERR="token non valido: serve il testo stampato da \"rclone authorize\" (access_token e refresh_token)"
+    return 1
+  fi
+  if [[ -n "$id$sec" ]]; then
+    if [[ ! "$id" =~ ^[A-Za-z0-9._~-]{1,256}$ || ! "$sec" =~ ^[A-Za-z0-9._~-]{1,256}$ ]]; then
+      BK_ERR="client id e secret vanno indicati insieme e con caratteri validi"
+      return 1
+    fi
+  fi
+  at="$(jq -r '.access_token' <<<"$tok")"
+  rt="$(jq -r '.refresh_token' <<<"$tok")"
+  tok="$(jq -c '{access_token, token_type: (.token_type // "Bearer"), refresh_token, expiry}
+    | with_entries(select(.value != null))' <<<"$tok")"
+  folder="$(jq -r .folder <<<"$(bk_config_json)")"
+
+  install -d -m 700 "$(dirname "$BK_RCLONE_CONF")"
+  conf="$BK_RCLONE_CONF"
+  if [[ -f "$conf" ]]; then
+    prev="$(umask 077; mktemp "$(dirname "$conf")/.rclone-prev.XXXXXX")"
+    cp -p "$conf" "$prev"
+  fi
+  tmp="$(umask 077; mktemp "$(dirname "$conf")/.rclone-new.XXXXXX")"
+  {
+    printf '[gdrive]\ntype = drive\nscope = drive.file\n'
+    if [[ -n "$id" ]]; then printf 'client_id = %s\nclient_secret = %s\n' "$id" "$sec"; fi
+    printf 'token = %s\n' "$tok"
+  } >"$tmp"
+  chmod 600 "$tmp"
+  own root:root "$tmp"
+  mv -f "$tmp" "$conf"
+
+  read -ra cmd <<<"$BK_RCLONE"
+  out="$("${cmd[@]}" mkdir "gdrive:$folder" 2>&1 </dev/null)" || rc=$?
+  if ((rc == 0)); then
+    out="$(printf 'plancia' | "${cmd[@]}" rcat "gdrive:$folder/.plancia-test" 2>&1)" || rc=$?
+  fi
+  if ((rc == 0)); then
+    out="$("${cmd[@]}" deletefile "gdrive:$folder/.plancia-test" 2>&1 </dev/null)" || rc=$?
+  fi
+  if ((rc != 0)); then
+    # Il collegamento non è valido: torna il file di prima, o nessun file.
+    if [[ -n "$prev" ]]; then mv -f "$prev" "$conf"; else rm -f "$conf"; fi
+    BK_ERR="Google Drive non ha accettato il collegamento: $(bk_clean_msg "$out" "$tok" "$at" "$rt" "$sec")"
+    log "vps-backup: collegamento non riuscito ($BK_ERR)"
+    return 1
+  fi
+  if [[ -n "$prev" ]]; then rm -f "$prev"; fi
+  BK_FOLDER="$folder"
+}
+
+# bk_config_apply DATI_JSON — valida {enabled,time,folder} e imposta la configurazione
+# da scrivere in BK_CONFIG_NEW; BK_ERR e 1 se non valida (anche questa senza $(...)).
+# folder omesso = quello attuale.
+bk_config_apply() {
+  local d="$1" en t f
+  if ! jq -e 'type == "object"' <<<"$d" >/dev/null 2>&1; then
+    BK_ERR="configurazione non valida"
+    return 1
+  fi
+  en="$(jq -r '.enabled | if type == "boolean" then tostring else "x" end' <<<"$d")"
+  if [[ "$en" != true && "$en" != false ]]; then
+    BK_ERR="enabled deve essere true o false"
+    return 1
+  fi
+  t="$(jq -r '.time | if type == "string" then . else "" end' <<<"$d")"
+  if ! bk_valid_time "$t"; then
+    BK_ERR="orario non valido (HH:MM, da 00:00 a 23:59)"
+    return 1
+  fi
+  if [[ "$(jq 'has("folder")' <<<"$d")" == true ]]; then
+    f="$(jq -r '.folder | if type == "string" then . else "" end' <<<"$d")"
+  else
+    f="$(jq -r .folder <<<"$(bk_config_json)")"
+  fi
+  if ! bk_valid_folder "$f"; then
+    BK_ERR="nome cartella non valido (lettere, numeri, punto, trattino, al massimo 64 caratteri)"
+    return 1
+  fi
+  BK_CONFIG_NEW="$(jq -nc --argjson e "$en" --arg t "$t" --arg f "$f" '{enabled: $e, time: $t, folder: $f}')"
 }

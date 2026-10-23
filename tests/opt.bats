@@ -258,3 +258,43 @@ sys_setup() {
 @test "opt_system_files chiama opt_panel_vhost" {
   declare -f opt_system_files | grep -q opt_panel_vhost
 }
+
+@test "opt_system_files: vps-backup, unità systemd, cartelle 700 e configurazione iniziale spenta" {
+  sys_setup
+  export BK_DIR="$BATS_TEST_TMPDIR/bk" BK_BACKUPS="$BATS_TEST_TMPDIR/bkdirs"
+  BK_CONFIG="$BK_DIR/config.json"
+  opt_system_files
+  [ "$(stat -c %a "$SYSTEMD_DIR/vps-backup.service")" = 644 ]
+  [ "$(stat -c %a "$SYSTEMD_DIR/vps-backup.timer")" = 644 ]
+  grep -qxF 'ExecStart=/opt/vps/bin/vps-backup _run' "$SYSTEMD_DIR/vps-backup.service"
+  grep -qxF 'Persistent=true' "$SYSTEMD_DIR/vps-backup.timer"
+  [ "$(stat -c %a "$BK_DIR")" = 700 ]
+  for d in panel sites restore tmp; do [ "$(stat -c %a "$BK_BACKUPS/$d")" = 700 ]; done
+  [ "$(stat -c %a "$BK_CONFIG")" = 600 ]
+  jq -e '.enabled == false and .time == "04:00" and (.folder | startswith("Plancia-"))' "$BK_CONFIG"
+  ! grep -q 'enable' "$BATS_TEST_TMPDIR/systemctl.calls"
+}
+
+@test "opt_system_files: la configurazione di backup esistente non si tocca; se attiva il timer si riabilita" {
+  sys_setup
+  export BK_DIR="$BATS_TEST_TMPDIR/bk" BK_BACKUPS="$BATS_TEST_TMPDIR/bkdirs"
+  BK_CONFIG="$BK_DIR/config.json"
+  mkdir -p "$BK_DIR"
+  echo '{"enabled":true,"time":"01:30","folder":"Mia"}' >"$BK_CONFIG"
+  mkdir -p "$VPS_OPT/secrets"; echo x >"$VPS_OPT/secrets/rclone.conf"
+  opt_system_files
+  jq -e '.time == "01:30" and .folder == "Mia"' "$BK_CONFIG"
+  grep -qxF 'enable --now vps-backup.timer' "$BATS_TEST_TMPDIR/systemctl.calls"
+}
+
+@test "opt_system_files installa rclone se manca" {
+  sys_setup
+  make_stub dpkg 'exit 1'
+  make_stub apt-get 'echo "apt-get $*" >>"$BATS_TEST_TMPDIR/apt.calls"'
+  opt_system_files
+  grep -q 'install .* rclone' "$BATS_TEST_TMPDIR/apt.calls"
+}
+
+@test "il passo Sistema installa rclone per le macchine nuove" {
+  grep -q 'apt_install .*rclone' "$REPO_ROOT/steps/10-system.sh" || grep -A2 'apt_install sudo' "$REPO_ROOT/steps/10-system.sh" | grep -q rclone
+}
