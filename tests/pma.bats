@@ -424,15 +424,44 @@ dbadmin_setup() {
 }
 
 
-@test "backup del pannello: .env che è un link non viene seguito" {
+# _bk_panel_env — pannello finto + stub di mariadb-dump che registra gli argomenti
+_bk_panel_env() {
   dbadmin_setup
-  mv "$PROOT/config/.env" "$BATS_TEST_TMPDIR/altro.env"
-  printf 'DB_NAME=panel\n' >"$BATS_TEST_TMPDIR/altro.env"
-  ln -s "$BATS_TEST_TMPDIR/altro.env" "$PROOT/config/.env"
   BK_RUN_DIR="$BATS_TEST_TMPDIR"
   _bk_progress() { :; }
-  make_stub mariadb-dump 'echo chiamato >>"$BATS_TEST_TMPDIR/dump.called"'
-  run _bk_panel x
-  [ "$status" -ne 0 ]
-  [ ! -e "$BATS_TEST_TMPDIR/dump.called" ]
+  make_stub mariadb-dump 'echo "$*" >>"$BATS_TEST_TMPDIR/dump.args"; echo "-- dump"'
+}
+
+@test "backup del pannello: il database viene dal manifest, mai dal .env di panel" {
+  _bk_panel_env
+  printf 'DB_NAME=mysql\n' >"$PROOT/config/.env"
+  _bk_panel x || true
+  [ -f "$BATS_TEST_TMPDIR/dump.args" ]
+  grep -qw panel "$BATS_TEST_TMPDIR/dump.args"
+  run ! grep -qw mysql "$BATS_TEST_TMPDIR/dump.args"
+}
+
+@test "backup del pannello: panel.db del manifest usato, nomi di sistema o site_ rifiutati" {
+  _bk_panel_env
+  jq '.panel.db = "vpspanel"' "$VPS_OPT/manifest.json" >"$VPS_OPT/m.tmp" && mv "$VPS_OPT/m.tmp" "$VPS_OPT/manifest.json"
+  _bk_panel x || true
+  grep -qw vpspanel "$BATS_TEST_TMPDIR/dump.args"
+  rm "$BATS_TEST_TMPDIR/dump.args"
+  local n
+  for n in mysql information_schema performance_schema sys site_blog 'pan;el'; do
+    jq --arg n "$n" '.panel.db = $n' "$VPS_OPT/manifest.json" >"$VPS_OPT/m.tmp" && mv "$VPS_OPT/m.tmp" "$VPS_OPT/manifest.json"
+    run _bk_panel x
+    [ "$status" -ne 0 ]
+    [ ! -e "$BATS_TEST_TMPDIR/dump.args" ]
+  done
+}
+
+@test "vps-pma-pass dbadmin: ai processi di panel non arrivano fd del lock né del log" {
+  dbadmin_setup
+  unset PD_AS_PANEL
+  make_stub runuser 'ls -l /proc/$$/fd | awk "{print \$NF}" >>"$BATS_TEST_TMPDIR/fd.list"; shift 3; exec "$@"'
+  run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  [ "$status" -eq 0 ]
+  [ -s "$BATS_TEST_TMPDIR/fd.list" ]
+  run ! grep -e panel.lock -e test.log "$BATS_TEST_TMPDIR/fd.list"
 }

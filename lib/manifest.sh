@@ -5,6 +5,20 @@ manifest_path() {
   printf '%s/manifest.json' "$VPS_OPT"
 }
 
+# panel_db_name — database di Plancia, dal manifest (di root), mai dal .env, che è di
+# panel: con DB_NAME=mysql un dump di root porterebbe fuori gli hash degli utenti.
+# Senza panel.db (installazioni precedenti) è "panel", il nome che l'installer ha sempre usato.
+panel_db_name() {
+  local db
+  db="$(jq -r '.panel.db // "panel"' "$(manifest_path)" 2>/dev/null)" || return 1
+  sql_ident_ok "$db" || return 1
+  case "$db" in
+    mysql | information_schema | performance_schema | sys | site_*) return 1 ;;
+  esac
+  printf '%s
+' "$db"
+}
+
 manifest_group() {
   if getent group panel >/dev/null 2>&1; then
     echo panel
@@ -54,6 +68,7 @@ manifest_build() {
       panel: (if $panel == "yes" then {
         domain: $pdomain,
         path: $proot,
+        db: "panel",
         php_socket: ("/run/php/php" + $phpv + "-fpm-panel.sock"),
         pma_path: "/pma/"
       } else null end),

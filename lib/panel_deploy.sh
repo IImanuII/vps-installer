@@ -134,10 +134,8 @@ pd_env_merge() {
 }
 
 pd_db_name() {
-  local db
-  db="$(env_get "$PD_ENV" DB_NAME)"
-  sql_ident_ok "$db" || return 1
-  printf '%s\n' "$db"
+  # Dal manifest, non dal .env di panel (vedi panel_db_name).
+  panel_db_name
 }
 
 # pd_as_panel CMD... — come utente panel (PD_AS_PANEL=0 solo nei test).

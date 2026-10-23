@@ -23,6 +23,7 @@ setup() {
   [ "$(jq -r .cloudflare.origin_locked <<<"$output")" = true ]
   [ "$(jq -r .mail.configured <<<"$output")" = false ]
   [ "$(jq -r .panel.php_socket <<<"$output")" = "/run/php/php8.4-fpm-panel.sock" ]
+  [ "$(jq -r .panel.db <<<"$output")" = panel ]
   [ "$(jq -r .conventions.site_db_prefix <<<"$output")" = site_ ]
 }
 

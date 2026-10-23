@@ -127,7 +127,12 @@ dev_release() {
 @test "pd_db_name rifiuta nomi non validi" {
   pd_load
   [ "$(pd_db_name)" = panel ]
-  printf 'DB_NAME=pan;el\n' >"$PD_ENV"
+  printf 'DB_NAME=mysql\n' >"$PD_ENV"
+  [ "$(pd_db_name)" = panel ]
+  jq '.panel.db = "pan;el"' "$VPS_OPT/manifest.json" >"$VPS_OPT/m.tmp" && mv "$VPS_OPT/m.tmp" "$VPS_OPT/manifest.json"
+  run pd_db_name
+  [ "$status" -eq 1 ]
+  jq '.panel.db = "mysql"' "$VPS_OPT/manifest.json" >"$VPS_OPT/m.tmp" && mv "$VPS_OPT/m.tmp" "$VPS_OPT/manifest.json"
   run pd_db_name
   [ "$status" -eq 1 ]
 }

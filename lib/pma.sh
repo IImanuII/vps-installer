@@ -124,9 +124,10 @@ _pma_dbadmin_alter() {
 _pma_as_panel() {
   local path="${PMA_AS_PANEL_PATH:-/usr/bin:/bin}"
   if [[ "${PD_AS_PANEL:-1}" == 0 ]]; then
-    env -i "PATH=$path" LC_ALL=C "$@"
+    env -i "PATH=$path" LC_ALL=C "$@" 9>&-
   else
-    runuser -u panel -- env -i "PATH=$path" LC_ALL=C "$@"
+    # fd 9 (lock) chiuso: un processo di panel non deve ereditare descrittori di root
+    runuser -u panel -- env -i "PATH=$path" LC_ALL=C "$@" 9>&-
   fi
 }
 
@@ -143,7 +144,7 @@ _pma_env_check() {
 # come lo scrive l'installer; la riga viene aggiunta se manca. Il pannello non legge
 # DBADMIN_* (Config::CHIAVI): nessun reload di PHP-FPM necessario.
 pma_dbadmin_set() {
-  local new="$1" m root dir env old
+  local new="$1" m root dir env old err
   m="$(manifest_path)"
   [[ -f "$m" ]] || die "Manifest $m mancante: la VPS non è stata preparata da vps-installer"
   root="$(jq -r '.panel.path // empty' "$m")"
@@ -160,7 +161,7 @@ pma_dbadmin_set() {
   _pma_dbadmin_alter "$new" || die "password di panel_dbadmin non cambiata (dettagli in $VPS_LOG)"
   # Tutto il resto (lettura, file temporaneo, mv) è di panel. La nuova password
   # arriva su stdin; il temporaneo, che contiene tutti i segreti, si toglie sempre.
-  if ! printf '%s\n' "$new" | _pma_as_panel sh -c '
+  if ! err="$(printf '%s\n' "$new" | _pma_as_panel sh -c '
       umask 077
       IFS= read -r nuova || exit 1
       d=$1; f=$2
@@ -172,7 +173,10 @@ pma_dbadmin_set() {
         END { if (!fatto) print "DBADMIN_PASS=" ENVIRON["NUOVA"] }
       '\'' "$f" >"$t" || exit 1
       chmod --reference="$f" "$t" || exit 1
-      mv -f "$t" "$f" || exit 1' sh "$dir" "$env" 2>>"$VPS_LOG"; then
+      mv -f "$t" "$f" || exit 1' sh "$dir" "$env" 2>&1 >/dev/null)"; then
+    # lo stderr dei processi di panel non è mai l'fd del log di root: si registra qui
+    err="${err//"$new"/***}"
+    log "scrittura di $env non riuscita: ${err:0:300}"
     # .env invariato: MariaDB torna alla password che il .env ancora contiene
     if [[ -n "$old" ]] && _pma_dbadmin_alter "$old"; then
       die "$env non scrivibile: password di panel_dbadmin rimasta quella di prima"

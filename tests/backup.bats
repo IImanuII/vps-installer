@@ -873,8 +873,8 @@ bk_run_env() {
   export MON_CONFIG="$BATS_TEST_TMPDIR/mon.json" BK_NOW=20261001-0400
   DRIVE="$BATS_TEST_TMPDIR/drive"
   mkdir -p "$DRIVE" "$BATS_TEST_TMPDIR/panel/config"
-  echo 'DB_NAME=vpspanel' >"$BATS_TEST_TMPDIR/panel/config/.env"
-  jq --arg p "$BATS_TEST_TMPDIR/panel" '.panel.path = $p' "$VPS_OPT/manifest.json" >"$VPS_OPT/m.tmp"
+  echo 'DB_NAME=mysql' >"$BATS_TEST_TMPDIR/panel/config/.env"
+  jq --arg p "$BATS_TEST_TMPDIR/panel" '.panel.path = $p | .panel.db = "vpspanel"' "$VPS_OPT/manifest.json" >"$VPS_OPT/m.tmp"
   mv "$VPS_OPT/m.tmp" "$VPS_OPT/manifest.json"
   echo x >"$VPS_OPT/secrets/rclone.conf"
   echo '{"enabled":true,"time":"04:00","folder":"F"}' >"$BK_CONFIG"
@@ -1115,7 +1115,7 @@ drive_files() { ls "$DRIVE/F/$1" 2>/dev/null || true; }
   jq -e '.last_run.alert == "not_configured"' "$BK_STATE"
 }
 
-@test "_run: dump del pannello con root dal socket, database dal .env del pannello" {
+@test "_run: dump del pannello con root dal socket, database dal manifest, non dal .env del pannello" {
   bk_run_env
   mk_site a.it no
   bk_tool _run

@@ -27,7 +27,7 @@ mode="${1:-}"
 # messa in MariaDB sarebbe diversa da quella digitata.
 hex="$(read_stdin_limited 257 | od -An -v -tx1 | tr -d ' \n')"
 if printf '%s' "$hex" | fold -w2 | grep -qx 00; then json_err "password non valida: minimo 12 caratteri, una riga"; fi
-# shellcheck disable=SC2059  # il formato contiene solo escape hex generati qui generati qui
+# shellcheck disable=SC2059  # il formato contiene solo escape hex generati qui
 pass="$(printf "$(printf '%s' "$hex" | sed 's/../\\x&/g')")"
 pass="${pass%$'\n'}"
 (($(printf '%s' "$pass" | wc -c) <= 72)) || json_err "password troppo lunga: massimo 72 caratteri"
