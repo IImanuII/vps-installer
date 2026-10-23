@@ -710,7 +710,7 @@ bk_tool() {
   bk_tool_env
   bk_tool status
   [ "$status" -eq 0 ]
-  jq -e --arg f "Plancia-$(hostname -s)" '. == {ok:true,connected:false,folder:$f,enabled:false,time:"04:00",job:null,interrupted:false,last_run:null,last_restore:null,drive:null}' <<<"$output"
+  jq -e --arg f "Plancia-$(hostname -s)" '. == {ok:true,connected:false,folder:$f,enabled:false,time:"04:00",job:null,interrupted:false,interrupted_job:null,last_run:null,last_restore:null,drive:null}' <<<"$output"
   [ ! -e "$BATS_TEST_TMPDIR/rclone.calls" ]
 }
 
@@ -913,6 +913,7 @@ esac
 exit 0'
   # shellcheck disable=SC2016
   make_stub curl 'T="$BATS_TEST_TMPDIR"
+n=0; for f in /proc/self/fd/*; do case "$(readlink "$f" 2>/dev/null)" in *vps-*.lock) n=$((n+1));; esac; done; echo $n >>"$T/curl.lockfds"
 printf "%s\n" "$@" >>"$T/curl.args"
 cat >>"$T/curl.stdin"
 printf "%s" "${CURL_REPLY:-{\"ok\":true\}}"'
@@ -1419,6 +1420,7 @@ rs_env() {
   # shellcheck disable=SC2016
   make_stub mariadb 'T="$BATS_TEST_TMPDIR"; F="$T/fakedb"
 echo "mariadb $*" >>"$T/mariadb.calls"
+allargs=" $* "
 cp "$BK_STATE" "$T/state.during.$(date +%s%N)" 2>/dev/null || true
 for l in "$BK_LOCK_DIR"/vps-site.*.lock "$BK_LOCK_DIR"/vps-backup.lock; do
   [[ -e "$l" ]] || continue
@@ -1427,7 +1429,7 @@ done
 user=root; db=""; q=""
 while (($#)); do
   case "$1" in
-    --defaults-file=*) cnf="${1#*=}"; user="$(sed -n "s/^user=//p" "$cnf")"; cp "$cnf" "$T/cnf.seen" ;;
+    --defaults-file=*) cnf="${1#*=}"; user="$(sed -n "s/^user=//p" "$cnf")"; cp "$cnf" "$T/cnf.seen"; cat "$cnf" >>"$T/cnf.all" ;;
     -e) q="$2"; shift ;;
     -*) ;;
     *) db="$1" ;;
@@ -1436,17 +1438,28 @@ while (($#)); do
 done
 if [[ -n "$q" ]]; then in="$q"; else in="$(cat)"; fi
 [[ "$user" == root ]] || printf '%s\n' "$in" >>"$T/load.stdin"
-if [[ "$user" != root && -n "$db" && "$db" != "$user" && "$db" != "${user}__ripristino" ]]; then echo "ERROR 1044 access denied" >&2; exit 1; fi
+ok_db() { [[ "$1" == "$user" || "$1" == "${user}__ripristino" || ( "$user" == *_r && "$1" == "${user%_r}__ripristino" ) ]]; }
+if [[ "$user" != root && -n "$db" ]] && ! ok_db "$db"; then echo "ERROR 1044 access denied" >&2; exit 1; fi
+sandbox=no; [[ "$allargs" == *" --sandbox "* ]] && sandbox=si
 if [[ "$user" != root && -f "$T/fail.load.$db" ]]; then rm -f "$T/fail.load.$db"; echo "ERROR 2013 lost connection" >&2; exit 1; fi
 while IFS= read -r line; do
   case "$line" in
     "DROP DATABASE IF EXISTS "*) n="${line#*\`}"; n="${n%%\`*}"; rm -rf "${F:?}/${n:?}"; echo "$user drop $n" >>"$T/sql.log" ;;
     "CREATE DATABASE "*) n="${line#*\`}"; n="${n%%\`*}"; mkdir -p "$F/$n"; echo "$user create $n" >>"$T/sql.log" ;;
-    GRANT*|REVOKE*) echo "$user $line" >>"$T/grants.log" ;;
+    GRANT*|REVOKE*|"CREATE USER"*|"DROP USER"*) echo "$user $line" >>"$T/grants.log" ;;
+    "DROP TABLE "*) n="${line#DROP TABLE }"; n="${n%;}"; n="${n//\`/}"; rm -f "$F/$db/$n" ;;
+    \\!*|system\ *|tee\ *|source\ *)
+      if [[ "$sandbox" == si ]]; then echo "ERROR: command not allowed in sandbox mode" >&2; exit 1; fi
+      case "$line" in
+        \\!*) eval "${line#* }" ;;
+        system\ *) eval "${line#* }" ;;
+        tee\ *) : >"${line#* }" ;;
+        source\ *) echo "ERROR 1064 (42000): You have an error in your SQL syntax near $(cat "${line#* }")" >&2; exit 1 ;;
+      esac ;;
     "CREATE TABLE "*) [[ -d "$F/$db" ]] || { echo "ERROR 1046 no database" >&2; exit 1; }; n="${line#*\`}"; n="${n%%\`*}"; : >"$F/$db/$n" ;;
     "INSERT INTO "*) n="${line#*\`}"; n="${n%%\`*}"; [[ -f "$F/$db/$n" ]] || { echo "ERROR 1146" >&2; exit 1; }; echo "$line" >>"$F/$db/$n" ;;
     BROKEN*) echo "ERROR 1064 (42000): syntax error" >&2; exit 1 ;;
-    "USE "*) if [[ "$user" != root ]]; then echo "ERROR 1044 access denied" >&2; exit 1; fi ;;
+    "USE "*) n="${line#USE }"; n="${n%;}"; if [[ "$user" != root ]] && ! ok_db "$n"; then echo "ERROR 1044 access denied" >&2; exit 1; fi; db="$n" ;;
   esac
 done <<<"$in"
 exit "${STUB_RC_mariadb:-0}"'
@@ -1464,6 +1477,10 @@ done
 exit 0'
   # shellcheck disable=SC2016
   make_stub vps-cf-purge 'echo "vps-cf-purge $*" >>"$BATS_TEST_TMPDIR/cf.purge"; exit "${STUB_RC_cf_purge:-0}"'
+  # redis-cli come in sites_helper, ma conta anche i lock ereditati
+  # shellcheck disable=SC2016
+  make_stub redis-cli 'n=0; for f in /proc/self/fd/*; do case "$(readlink "$f" 2>/dev/null)" in *vps-*.lock) n=$((n+1));; esac; done; echo $n >>"$BATS_TEST_TMPDIR/redis.lockfds"
+echo "redis-cli $* auth=${REDISCLI_AUTH:+si}" >>"$CALLS"; exit "${STUB_RC_redis_cli:-0}"'
   # l'utente Redis del sito c'è nel file ACL
   printf 'user default off\nuser site_a_it on #abc ~site_a_it:* +@all\n' >"$REDIS_ACL_FILE"
 }
@@ -1756,7 +1773,7 @@ rs_run() { bk_tool _restore "$@"; }
   grep -q "'ana'" "$FAKEDB/$slug/utenti"
   # il database temporaneo non c'è più e il suo permesso è stato tolto
   [ ! -d "$FAKEDB/${slug}__ripristino" ]
-  grep -q 'REVOKE' "$BATS_TEST_TMPDIR/grants.log"
+  grep -q "DROP USER IF EXISTS 'site_a_it_r'" "$BATS_TEST_TMPDIR/grants.log"
   # file del sito intatti (anche quelli cambiati dopo l'archivio)
   [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
   grep -q 'wp-config cambiato' "$SITES_WWW/a.it/wp-config.php"
@@ -1776,11 +1793,12 @@ rs_run() { bk_tool _restore "$@"; }
   rs_run local a.it "$ARC_NAME" db
   [ "$status" -eq 0 ]
   grep -q '^user=site_a_it$' "$BATS_TEST_TMPDIR/cnf.seen"
+  grep -q '^user=site_a_it_r$' "$BATS_TEST_TMPDIR/cnf.all"
   grep -q 'Password-di-prova-123' "$BATS_TEST_TMPDIR/cnf.seen"
   run ! grep -q 'Password-di-prova-123' "$BATS_TEST_TMPDIR/mariadb.calls"
   run ! grep -q 'Password-di-prova-123' "$VPS_LOG"
   # il permesso sul temporaneo c'è solo per il tempo del caricamento, con il _ protetto
-  grep -q 'GRANT ALL PRIVILEGES ON `site\\_a\\_it\\_\\_ripristino`' "$BATS_TEST_TMPDIR/grants.log"
+  grep -q 'GRANT ALL PRIVILEGES ON `site\\_a\\_it\\_\\_ripristino`.\* TO .site_a_it_r.' "$BATS_TEST_TMPDIR/grants.log"
 }
 
 @test "_restore db: DEFINER tolto dalle definizioni di oggetti (si caricano con l'utente del sito), righe di dati intatte" {
@@ -2336,4 +2354,170 @@ walk_env() {
   grep -q 'BK_CF_PURGE' "$REPO_ROOT/tools/vps-backup"
   grep -q 'REDIS_ACL_FILE' "$REPO_ROOT/tools/vps-backup"
   grep -q 'REDIS_ADMIN_SECRET' "$REPO_ROOT/tools/vps-backup"
+}
+
+# ---------------------------------------------------------------------------
+# Fix round 1 (Task 4)
+# ---------------------------------------------------------------------------
+
+# Il client SQL non è mai root e non esegue nulla di ciò che sta nel dump.
+@test "_restore db: dump con \\!, system, tee, source = rifiutato, nessun file creato, nessun testo segreto, database intatto" {
+  rs_env
+  rs_site
+  printf 'root:SEGRETOSHADOW:\n' >"$BATS_TEST_TMPDIR/shadow"
+  local p
+  for p in "\\! touch $BATS_TEST_TMPDIR/pwned" "system touch $BATS_TEST_TMPDIR/pwned" "tee $BATS_TEST_TMPDIR/pwned" "source $BATS_TEST_TMPDIR/shadow"; do
+    DUMP_EXTRA="$p" bk_archive a.it "$BK_BACKUPS/$ARC_NAME"
+    rs_run local a.it "$ARC_NAME" db
+    [ "$status" -ne 0 ] || { echo "accettato: $p"; false; }
+    [ ! -e "$BATS_TEST_TMPDIR/pwned" ] || { echo "eseguito: $p"; false; }
+    run ! grep -r SEGRETOSHADOW "$BK_STATE" "$VPS_LOG"
+    [[ "$output" != *SEGRETOSHADOW* ]]
+    [ "$(fdb_tables site_a_it)" = "extra utenti" ]
+  done
+}
+
+@test "_restore db: il client SQL ha --sandbox --binary-mode --local-infile=0 e gira attraverso il runner dell'utente del sito" {
+  rs_env
+  rs_site
+  cat >"$BATS_TEST_TMPDIR/runuser-log" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >>"$BATS_TEST_TMPDIR/runner.log"
+shift 3
+if [[ "$1" == env ]]; then shift; while [[ "$1" == -i || "$1" == *=* ]]; do shift; done; fi
+exec "$@"
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/runuser-log"
+  FM_RUNUSER="$BATS_TEST_TMPDIR/runuser-log" rs_run local a.it "$ARC_NAME" db
+  [ "$status" -eq 0 ]
+  grep -q -- '--sandbox --binary-mode --local-infile=0' "$BATS_TEST_TMPDIR/mariadb.calls"
+  [ "$(grep -c -- '--defaults-file=' "$BATS_TEST_TMPDIR/mariadb.calls")" -ge 2 ]
+  # ogni chiamata col file delle credenziali è passata dal runner (utente del sito)
+  [ "$(grep -c 'site_a_it -- .*mariadb --defaults-file=' "$BATS_TEST_TMPDIR/runner.log" || true)" -ge 2 ]
+  # le credenziali non restano in tmp/ del sito
+  [ -z "$(ls -A "$SITES_WWW/a.it/tmp" | grep -v '^sess$' || true)" ]
+}
+
+@test "_restore db: la prova usa un utente usa-e-getta <slug>_r che non può toccare il database del sito" {
+  rs_env
+  rs_site
+  DUMP_EXTRA='USE site_a_it;
+DROP TABLE utenti;' bk_archive a.it "$BK_BACKUPS/$ARC_NAME"
+  rs_run local a.it "$ARC_NAME" db
+  [ "$status" -ne 0 ]
+  # il database vero è com'era e la copia di sicurezza non è nemmeno stata fatta
+  [ "$(fdb_tables site_a_it)" = "extra utenti" ]
+  [ -z "$(ls -A "$BK_BACKUPS/restore" 2>/dev/null)" ]
+  # utente creato dopo la pulizia iniziale e tolto alla fine, anche se la prova è fallita
+  local first create last
+  first="$(grep -n "DROP USER IF EXISTS 'site_a_it_r'" "$BATS_TEST_TMPDIR/grants.log" | head -n1 | cut -d: -f1)"
+  create="$(grep -n "CREATE USER 'site_a_it_r'" "$BATS_TEST_TMPDIR/grants.log" | head -n1 | cut -d: -f1)"
+  last="$(grep -n "DROP USER IF EXISTS 'site_a_it_r'" "$BATS_TEST_TMPDIR/grants.log" | tail -n1 | cut -d: -f1)"
+  [ "$first" -lt "$create" ]
+  [ "$create" -lt "$last" ]
+  grep -q "GRANT ALL PRIVILEGES ON \`site\\\\_a\\\\_it\\\\_\\\\_ripristino\`.\* TO 'site_a_it_r'" "$BATS_TEST_TMPDIR/grants.log"
+  [ ! -d "$FAKEDB/site_a_it__ripristino" ]
+  # nessun permesso per l'utente del sito sul temporaneo
+  run ! grep -q "TO 'site_a_it'@" "$BATS_TEST_TMPDIR/grants.log"
+}
+
+@test "_restore files: se lo spostamento del vecchio contenuto fallisce a metà, niente si cancella e tutto torna in public/" {
+  rs_env
+  rs_site
+  local root="$SITES_WWW/a.it"
+  echo extra >"$root/public/zzz"
+  # il primo mv verso la cartella del vecchio sposta una sola voce e poi fallisce
+  # shellcheck disable=SC2016
+  make_stub mv 'if [[ "$*" == *"-t tmp/.vpsbackup-old."* ]]; then
+  args=("$@"); i=0; for a in "${args[@]}"; do i=$((i+1)); [[ "$a" == -- ]] && break; done
+  /usr/bin/mv -t "${args[1]}" -- "${args[$i]}"
+  exit 1
+fi
+exec /usr/bin/mv "$@"'
+  make_stub rm 'echo "rm $*" >>"$BATS_TEST_TMPDIR/rm.calls"; exec /usr/bin/rm "$@"'
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -ne 0 ]
+  [ -f "$root/public/nuovo.txt" ]
+  [ -f "$root/public/a b.php" ]
+  [ -f "$root/public/zzz" ]
+  [ ! -e "$root/public/-x" ]
+  jq -e '.last_restore.ok == false and (.last_restore.error | test("tornato"))' "$BK_STATE"
+  # nessun rm sul contenuto di public/
+  run ! grep -E 'rm .* public(/| |$)' "$BATS_TEST_TMPDIR/rm.calls"
+}
+
+@test "_restore: il job dice la copia di sicurezza dal passo safety in poi; status la mostra con interrupted" {
+  rs_env
+  rs_site
+  rs_run local a.it "$ARC_NAME" db
+  [ "$status" -eq 0 ]
+  local last
+  last="$(ls "$BATS_TEST_TMPDIR"/state.during.* | sort | tail -n1)"
+  jq -e '.job.safety | test("^a\\.it-[0-9]{8}-[0-9]{6}\\.tar\\.gz$")' "$last"
+  jq -e '.job.safety' "$last" >/dev/null
+  echo '{"job":{"unit":"u","op":"restore","started":"s","step":"files","domain":"a.it","safety":"a.it-20261001-101500.tar.gz"},"last_run":null}' >"$BK_STATE"
+  bk_tool status
+  jq -e '.job == null and .interrupted == true and .interrupted_job.safety == "a.it-20261001-101500.tar.gz"' <<<"$output"
+}
+
+@test "_restore e _run: avanzi di oltre un giorno in tmp/ del sito (.vpsbackup-old/x/c) si tolgono, quelli recenti no" {
+  rs_env
+  rs_site
+  local t="$SITES_WWW/a.it/tmp" d
+  for d in .vpsbackup-old.20200101000000 .vpsbackup-x.AbCdEf .vpsbackup-c.XyZ123; do
+    mkdir -p "$t/$d/sub"
+    touch -d '2 days ago' "$t/$d"
+  done
+  mkdir -p "$t/.vpsbackup-old.20261022000000"
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -eq 0 ]
+  [ ! -e "$t/.vpsbackup-old.20200101000000" ]
+  [ ! -e "$t/.vpsbackup-x.AbCdEf" ]
+  [ ! -e "$t/.vpsbackup-c.XyZ123" ]
+  [ -d "$t/.vpsbackup-old.20261022000000" ]
+  mkdir -p "$t/.vpsbackup-old.20200202000000"
+  touch -d '3 days ago' "$t/.vpsbackup-old.20200202000000"
+  bk_tool _run
+  [ ! -e "$t/.vpsbackup-old.20200202000000" ]
+  [ -d "$t/.vpsbackup-old.20261022000000" ]
+  [ -f "$t/sess" ]
+}
+
+@test "_restore files: lo spazio per l'estrazione si calcola sul peso non compresso della copia" {
+  rs_env
+  mk_site a.it no
+  truncate -s 800M "$SITES_WWW/a.it/public/grande.bin"
+  bk_archive a.it "$BK_BACKUPS/sites/a.it-20261001-0400.tar.gz" 2>/dev/null || { mkdir -p "$BK_BACKUPS/sites"; bk_archive a.it "$BK_BACKUPS/sites/a.it-20261001-0400.tar.gz"; }
+  # compresso pesa poco, estratto 800 MB: con 1 GB liberi non basta (serve il peso + margine)
+  # shellcheck disable=SC2016
+  make_stub df 'printf "File system 1B-blocks Used Available Use%% Mounted on\n/dev/x 9999999999 0 1073741824 0%% /\n"'
+  rs_run local a.it sites/a.it-20261001-0400.tar.gz files
+  [ "$status" -ne 0 ]
+  jq -e '.last_restore.error | test("spazio")' "$BK_STATE"
+  [ -e "$SITES_WWW/a.it/public/grande.bin" ]
+}
+
+@test "restore: mentre una scrittura di vps-files tiene il lock condiviso del sito, ripristino e avvio sono rifiutati" {
+  rs_env
+  rs_site
+  exec {sh}>>"$BK_LOCK_DIR/vps-site.site_a_it.lock"
+  flock -s -n "$sh"
+  bk_tool restore-local "$ARC_NAME" files
+  [ "$status" -ne 0 ]
+  rs_run local a.it "$ARC_NAME" files
+  exec {sh}>&-
+  [ "$status" -ne 0 ]
+  [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
+}
+
+@test "_restore: curl (Telegram), redis-cli e vps-cf-purge non ereditano i descrittori dei lock" {
+  rs_env
+  rs_site
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -eq 0 ]
+  [ -s "$BATS_TEST_TMPDIR/curl.lockfds" ]
+  [ "$(sort -u "$BATS_TEST_TMPDIR/curl.lockfds")" = 0 ]
+  [ -s "$BATS_TEST_TMPDIR/redis.lockfds" ]
+  [ "$(sort -u "$BATS_TEST_TMPDIR/redis.lockfds")" = 0 ]
+  jq -e '.last_restore.alert == "sent"' "$BK_STATE"
 }

@@ -425,7 +425,9 @@ root="${info#* }"
 # aspettano, altrimenti si perderebbero o rovinerebbero il contenuto che sta arrivando.
 case "$cmd" in
   write | mkdir | rename | move | copy | delete | zip | unzip)
-    if bk_site_locked "$slug"; then json_err "ripristino in corso (o copia del sito in corso): riprova tra poco"; fi
+    # lock condiviso per tutta la durata del comando: il ripristino (esclusivo) non parte
+    # finché una scrittura è in corso, e viceversa
+    if ! bk_site_lock_shared "$slug"; then json_err "ripristino in corso (o copia del sito in corso): riprova tra poco"; fi
     ;;
 esac
 

@@ -59,6 +59,34 @@ bk_site_lock() {
   BK_SITE_LOCK_FD="$fd"
 }
 
+# bk_site_lock_shared SLUG — lock condiviso del sito, per chi scrive nel sito mentre
+# non c'è un ripristino (vps-files, vps-site): più scrittori insieme vanno bene, ma il
+# ripristino (lock esclusivo, flock -n) non parte finché ce n'è uno, e viceversa. Si tiene
+# fino alla fine del processo; fm_as_site lo chiude per i figli. 0 preso; 1 occupato
+# (ripristino o giro in corso); 2 slug non valido.
+bk_site_lock_shared() {
+  local f fd old
+  _bk_slug_ok "${1-}" || return 2
+  f="$(bk_lock_file "$1")"
+  old="$(umask)"
+  umask 077
+  # shellcheck disable=SC2261
+  { exec {fd}>>"$f"; } 2>/dev/null || {
+    umask "$old"
+    return 1
+  }
+  umask "$old"
+  chmod 600 "$f" 2>/dev/null || true
+  if ! flock -s -n "$fd"; then
+    exec {fd}>&-
+    return 1
+  fi
+  if [[ -n "$BK_SITE_LOCK_FD" ]]; then
+    exec {BK_SITE_LOCK_FD}>&-
+  fi
+  BK_SITE_LOCK_FD="$fd"
+}
+
 # _bk_nolock COMANDO... — esegue un programma esterno senza i descrittori dei lock
 # (globale e del sito): un figlio vivo non deve tenerli dopo la morte del giro.
 _bk_nolock() {
@@ -566,7 +594,7 @@ bk_drive_json() {
 
 # bk_status_json — risposta di `vps-backup status`.
 bk_status_json() {
-  local cfg state='{}' drive=null conn=false interrupted running=0
+  local cfg state='{}' drive=null conn=false interrupted running=0 ijob
   # Prima si guarda se un giro è vivo (lock o unità systemd), poi si legge lo stato:
   # un giro che parte o finisce nel frattempo non può essere dichiarato interrotto.
   if bk_global_busy || bk_unit_alive; then running=1; fi
@@ -581,13 +609,15 @@ bk_status_json() {
   # libero e nessuna unità gira, nessuno sta più lavorando: niente job e
   # `interrupted` a true.
   interrupted=false
+  ijob=null
   if [[ "$(jq -c '.job // null' <<<"$state")" != null ]] && ((!running)); then
     interrupted=true
+    ijob="$(jq -c '.job' <<<"$state")"
     state="$(jq -c '.job = null' <<<"$state")"
   fi
-  jq -nc --argjson c "$cfg" --argjson s "$state" --argjson d "$drive" --argjson conn "$conn" --argjson i "$interrupted" \
+  jq -nc --argjson c "$cfg" --argjson s "$state" --argjson d "$drive" --argjson conn "$conn" --argjson i "$interrupted" --argjson ij "$ijob" \
     '{ok: true, connected: $conn, folder: $c.folder, enabled: $c.enabled, time: $c.time,
-      job: ($s.job // null), interrupted: $i, last_run: ($s.last_run // null),
+      job: ($s.job // null), interrupted: $i, interrupted_job: $ij, last_run: ($s.last_run // null),
       last_restore: ($s.last_restore // null), drive: $d}'
 }
 
@@ -951,6 +981,7 @@ _bk_one_site() {
     _bk_add_site "$d" false "registro del sito non valido"
     return 1
   fi
+  bk_prune_site_tmp "$slug" "$(site_root "$d")"
   if ! size="$(_bk_site_size "$d")"; then
     bk_site_unlock
     _bk_add_site "$d" false "dimensione del sito non leggibile"
@@ -1077,7 +1108,7 @@ _bk_alert() {
     printf 'null'
     return 0
   fi
-  mon_send "$text" || rc=$?
+  _bk_mon_send "$text" || rc=$?
   if ((rc == 0)); then
     printf '"sent"'
   elif [[ "${MON_SEND_ERR:-}" == "Telegram non configurato" ]]; then
@@ -1441,24 +1472,30 @@ EOS
 # Scambio del contenuto di public/: il vecchio va in una cartella di tmp/ (stesso
 # filesystem, quindi solo rinomine), il nuovo ci entra dall'area di estrazione. La
 # cartella public/ non si sostituisce: è di root nella radice (che il sito non può
-# modificare) e porta permessi e ACL che servono a Nginx. Uscite: 0 fatto; 3 non
-# riuscito ma il vecchio contenuto è tornato; 4 non riuscito e il vecchio contenuto
-# non è tornato (resta nella cartella); 65/66/1 niente è stato spostato.
+# modificare) e porta permessi e ACL che servono a Nginx. Mai un rm su public/: se un
+# passo fallisce le voci si rimettono dove stavano. Dopo la fase 1 public/ è vuota, quindi
+# se la fase 2 fallisce tutto ciò che c'è in public/ viene dall'area e ci torna.
+# Uscite: 0 fatto; 3 non riuscito ma il vecchio contenuto è tornato; 4 non riuscito e
+# qualcosa non è tornato (il vecchio resta nella cartella old, il nuovo nell'area);
+# 65/66/1 niente è stato spostato.
 read -r -d '' BK_SH_SWAP <<'EOS' || true
 s="$1"; old="$2"
 { [ -d "$s/public" ] && [ ! -L "$s/public" ]; } || exit 65
 { [ -d public ] && [ ! -L public ]; } || exit 66
 mkdir "$old" || exit 1
-if find public -mindepth 1 -maxdepth 1 -exec mv -t "$old" -- {} + \
-  && find "$s/public" -mindepth 1 -maxdepth 1 -exec mv -t public -- {} +; then
+back_old() { find "$old" -mindepth 1 -maxdepth 1 -exec mv -t public -- {} + && rmdir "$old"; }
+if ! find public -mindepth 1 -maxdepth 1 -exec mv -t "$old" -- {} +; then
+  if back_old; then rm -rf -- "$s"; exit 3; fi
+  exit 4
+fi
+if find "$s/public" -mindepth 1 -maxdepth 1 -exec mv -t public -- {} +; then
   rm -rf -- "$s"
   # Nginx (www-data) legge public/ grazie alle ACL: i file arrivati dall'archivio non
   # le hanno, e uno a 640 o 600 darebbe 403. Come per i file creati dal sito.
   setfacl -R -m u:www-data:rX -m d:u:www-data:rX public >/dev/null 2>&1 || true
   exit 0
 fi
-find public -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null
-if find "$old" -mindepth 1 -maxdepth 1 -exec mv -t public -- {} + && rmdir "$old"; then
+if find public -mindepth 1 -maxdepth 1 -exec mv -t "$s/public" -- {} + && back_old; then
   rm -rf -- "$s"
   exit 3
 fi
@@ -1466,11 +1503,14 @@ exit 4
 EOS
 
 # Rimette il contenuto di prima (dopo uno scambio riuscito ma un passo successivo fallito).
+# Il contenuto nuovo non si cancella finché il vecchio non è tornato.
 read -r -d '' BK_SH_UNDO <<'EOS' || true
-old="$1"
-find public -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null
+old="$1"; nuovo="$old.new"
+mkdir "$nuovo" || exit 1
+find public -mindepth 1 -maxdepth 1 -exec mv -t "$nuovo" -- {} + || exit 1
 find "$old" -mindepth 1 -maxdepth 1 -exec mv -t public -- {} + || exit 1
 rmdir "$old" || exit 1
+rm -rf -- "$nuovo"
 EOS
 
 # _bk_walk_staging SLUG RADICE AREA — esegue BK_SH_WALK come utente del sito. 0 se
@@ -1489,24 +1529,66 @@ _bk_walk_staging() {
 
 _BK_STAGE="" _BK_OLD="" _BK_SAFETY="" _BK_R_DOM="" _BK_R_NOTE="" _BK_R_BDATE=""
 
+# bk_space_free_ok DIR BYTES — 0 se su DIR restano più di BYTES + 256 MB.
+bk_space_free_ok() {
+  local free
+  [[ "${2-}" =~ ^[0-9]{1,16}$ ]] || return 1
+  free="$(df -PB1 "${1-}" 2>/dev/null | awk 'NR == 2 {print $4}')"
+  [[ "$free" =~ ^[0-9]{1,18}$ ]] || return 1
+  ((10#$free > 10#$2 + 268435456))
+}
+
+# bk_prune_site_tmp SLUG RADICE — avanzi di ripristini interrotti (kill, riavvio) in tmp/
+# del sito, oltre un giorno: contenuto di prima, aree di estrazione, file delle credenziali.
+# Come utente del sito, mai da root.
+bk_prune_site_tmp() {
+  [[ -d "$2/tmp" ]] || return 0
+  fm_as_site "$1" "$2" sh -c 'find tmp -maxdepth 1 \( -name ".vpsbackup-old.*" -o -name ".vpsbackup-x.*" -o -name ".vpsbackup-c.*" \) -mmin +1440 -exec rm -rf -- {} + 2>/dev/null; exit 0' sh >/dev/null 2>&1 || true
+}
+
+# _bk_nolock_fn FUNZIONE ARG... — come _bk_nolock, ma per una funzione di shell.
+_bk_nolock_fn() {
+  (
+    if [[ -n "${BK_GLOBAL_FD:-}" ]]; then exec {BK_GLOBAL_FD}>&-; fi
+    if [[ -n "${BK_SITE_LOCK_FD:-}" ]]; then exec {BK_SITE_LOCK_FD}>&-; fi
+    "$@"
+  )
+}
+
+# _bk_mon_send TESTO — mon_send senza i lock nei figli (curl). MON_SEND_ERR torna al
+# chiamante attraverso un file, perché la funzione gira in una subshell.
+_bk_mon_send_inner() {
+  local rc=0
+  mon_send "$1" && rc=0 || rc=$?
+  printf '%s' "${MON_SEND_ERR:-}" >"$BK_RUN_DIR/send.err"
+  return "$rc"
+}
+_bk_mon_send() {
+  local rc=0
+  : >"$BK_RUN_DIR/send.err"
+  _bk_nolock_fn _bk_mon_send_inner "$1" || rc=$?
+  MON_SEND_ERR="$(cat "$BK_RUN_DIR/send.err" 2>/dev/null || true)"
+  return "$rc"
+}
+
 # _bk_stage_files SLUG RADICE FILES.TAR.GZ — estrae public/ come utente del sito in una
 # cartella vuota nuova di tmp/ (mai in public/) e la controlla. Imposta _BK_STAGE
 # (percorso relativo alla radice). BK_ERR se fallisce; l'area, se creata, resta
 # in _BK_STAGE e la toglie chi chiama.
 _bk_stage_files() {
-  local slug="$1" root="$2" files="$3" first s
+  local slug="$1" root="$2" files="$3" first s total
   _BK_STAGE=""
   first="$(tar -tzf "$files" 2>/dev/null | head -n1 || true)"
   if [[ "$first" != public && "$first" != public/ ]]; then
     BK_ERR="la copia non contiene public/ (non è una copia dei file)"
     return 1
   fi
-  if ! bk_space_ok "$root/tmp" "$(($(stat -c %s "$files") * 2))"; then
+  # peso non compresso dall'elenco di tar (lo stesso che legge bk_verify), più un margine
+  total="$(LC_ALL=C.UTF-8 tar -P --numeric-owner --quoting-style=c -tvzf "$files" 2>/dev/null | awk '{ s += $3 } END { print s + 0 }')"
+  if ! bk_space_free_ok "$root/tmp" "$total"; then
     BK_ERR="spazio insufficiente per estrarre la copia"
     return 1
   fi
-  # avanzi di ripristini interrotti (kill, riavvio)
-  fm_as_site "$slug" "$root" sh -c 'find tmp -maxdepth 1 -name ".vpsbackup-x.*" -mmin +1440 -exec rm -rf -- {} + 2>/dev/null; exit 0' sh >/dev/null 2>&1 || true
   s="$(fm_as_site "$slug" "$root" mktemp -d tmp/.vpsbackup-x.XXXXXX 2>/dev/null)" || s=""
   if [[ ! "$s" =~ ^tmp/\.vpsbackup-x\.[A-Za-z0-9]{6}$ ]]; then
     BK_ERR="area di estrazione non creata (tmp/ del sito non scrivibile)"
@@ -1548,7 +1630,7 @@ _bk_swap_files() {
       return 1
       ;;
     4)
-      BK_ERR="scambio dei file non riuscito e il contenuto di prima NON è tornato in public/: è in $root/$old (copia di sicurezza: ${_BK_SAFETY:-nessuna})"
+      BK_ERR="scambio dei file non riuscito e qualcosa NON è tornato al suo posto: il contenuto di prima è in $root/$old, quello arrivato dalla copia in $root/$_BK_STAGE; usa la copia di sicurezza ${_BK_SAFETY##*/}"
       _BK_R_NOTE=hard
       return 1
       ;;
@@ -1573,7 +1655,7 @@ _bk_files_undo() {
     _BK_OLD=""
     return 0
   fi
-  BK_ERR="$BK_ERR; i file di prima NON sono tornati in public/: sono in $2/$_BK_OLD"
+  BK_ERR="$BK_ERR; i file di prima NON sono tornati in public/: sono in $2/$_BK_OLD (e il contenuto nuovo in $2/$_BK_OLD.new); usa la copia di sicurezza ${_BK_SAFETY##*/}"
   _BK_R_NOTE=hard
   return 1
 }
@@ -1600,34 +1682,54 @@ _bk_sql() {
   return "$rc"
 }
 
-# _bk_db_cnf SLUG RADICE — file di opzioni (600, nella cartella di lavoro di root) con
-# utente e password del sito, letta da db.env (di root nella radice): la password non
-# passa mai dagli argomenti.
-_bk_db_cnf() {
+# _bk_db_pw RADICE — la password del sito da db.env (di root nella radice); stampa e
+# restituisce 0 solo se si può scrivere tra virgolette in un file di opzioni.
+_bk_db_pw() {
   local pw
-  pw="$(env_get "$2/db.env" DB_PASS)"
+  pw="$(env_get "$1/db.env" DB_PASS)"
   [[ -n "$pw" && "$pw" != *\"* && "$pw" != *\\* && "$pw" != *$'\n'* ]] || return 1
-  (
-    umask 077
-    printf '[client]\nuser=%s\npassword="%s"\n' "$1" "$pw" >"$BK_RUN_DIR/my.cnf"
-  )
+  printf '%s' "$pw"
+}
+
+# Il client SQL che legge il dump non è mai root: un dump può contenere comandi del
+# client (\! comando, system, tee, source, LOAD DATA LOCAL INFILE) e chi scrive su
+# Drive potrebbe farli eseguire. Gira come utente del sito (fm_as_site, env -i), con
+# --sandbox --binary-mode --local-infile=0, e il file delle credenziali lo crea lo
+# stesso utente del sito in tmp/ (la password arriva da stdin, mai dagli argomenti) e
+# lo toglie alla fine: root non scrive mai in cartelle del sito.
+
+_BK_CNF=""
+# _bk_cnf_make SLUG RADICE UTENTE PASSWORD — imposta _BK_CNF (percorso relativo alla radice).
+_bk_cnf_make() {
+  local f
+  _BK_CNF=""
+  f="$(printf '[client]\nuser=%s\npassword="%s"\n' "$3" "$4" \
+    | fm_as_site "$1" "$2" sh -c 'f="$(mktemp tmp/.vpsbackup-c.XXXXXX)" || exit 1; cat >"$f" || exit 1; printf "%s" "$f"' sh 2>/dev/null)" || return 1
+  [[ "$f" =~ ^tmp/\.vpsbackup-c\.[A-Za-z0-9]{6}$ ]] || return 1
+  _BK_CNF="$f"
+}
+
+_bk_cnf_rm() {
+  [[ "$_BK_CNF" =~ ^tmp/\.vpsbackup-c\.[A-Za-z0-9]{6}$ ]] || return 0
+  fm_as_site "$1" "$2" rm -f -- "$_BK_CNF" >/dev/null 2>&1 || log "ATTENZIONE: file delle credenziali $2/$_BK_CNF non rimosso"
+  _BK_CNF=""
 }
 
 _BK_LOADERR=""
-# _bk_db_load DATABASE DUMP.GZ — carica il dump con l'utente del sito. gzip, sed e
-# mariadb in una pipeline con pipefail: un .gz troncato è un errore anche se SQL già
-# eseguito. sed toglie DEFINER=`utente`@`host` dalle sole righe di definizione di
-# oggetti (iniziano con /*!NNNNN o CREATE/ALTER; le righe INSERT non si toccano):
-# un trigger o una vista creati un tempo da root non si caricherebbero con l'utente
-# del sito (serve il privilegio SET USER), e così diventano suoi.
+# _bk_db_load DATABASE DUMP.GZ SLUG RADICE CNF — carica il dump con il client SQL
+# sandbox, come utente del sito. gzip, sed e client in una pipeline con pipefail: un .gz
+# troncato è un errore anche se SQL già eseguito. sed toglie DEFINER=`utente`@`host`
+# dalle sole righe di definizione di oggetti (iniziano con /*!NNNNN o CREATE/ALTER; le
+# righe INSERT non si toccano): un trigger o una vista creati un tempo da root non si
+# caricherebbero con l'utente del sito (serve il privilegio SET USER), e così diventano suoi.
 _bk_db_load() {
   local rc=0
   (
     set -o pipefail
     _bk_nolock gzip -dc "$2" \
       | _bk_nolock sed -E '/^(\/\*![0-9]+ |CREATE |ALTER )/ s/DEFINER=`[^`]*`@`[^`]*`//g' \
-      | _bk_nolock mariadb --defaults-file="$BK_RUN_DIR/my.cnf" "$1"
-  ) >>"$VPS_LOG" 2>"$BK_RUN_DIR/load.err" || rc=$?
+      | fm_as_site "$3" "$4" timeout 7200 mariadb --defaults-file="$5" --sandbox --binary-mode --local-infile=0 "$1"
+  ) >/dev/null 2>"$BK_RUN_DIR/load.err" || rc=$?
   _BK_LOADERR=""
   if ((rc != 0)); then _BK_LOADERR="$(bk_clean_msg "$(cat "$BK_RUN_DIR/load.err" 2>/dev/null || true)")"; fi
   return "$rc"
@@ -1639,46 +1741,75 @@ _bk_db_recreate() {
 CREATE DATABASE \`$1\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 }
 
-# _bk_db_dryrun SLUG RADICE DUMP.GZ — prova di caricamento in <slug>__ripristino.
+# _bk_db_tmp_clean SLUG — toglie utente e database della prova; si può ripetere (anche
+# all'inizio, per gli avanzi di una prova uccisa).
+_bk_db_tmp_clean() {
+  _bk_sql "DROP USER IF EXISTS '${1}_r'@'localhost';
+DROP DATABASE IF EXISTS \`${1}__ripristino\`;" || log "ATTENZIONE: utente o database temporaneo della prova di $1 non rimossi ($_BK_SQLERR)"
+}
+
+# _bk_db_dryrun SLUG RADICE DUMP.GZ — prova di caricamento senza toccare il sito: in
+# <slug>__ripristino con un utente usa-e-getta <slug>_r (password casuale) che ha
+# permessi solo su quel database. Un dump che nomina il database del sito (USE ...) o
+# prova altro non ottiene nulla e la prova fallisce.
 _bk_db_dryrun() {
-  local slug="$1" t="${1}__ripristino" esc rc=0
-  if ! sql_ident_ok "$t" || ! _bk_db_cnf "$slug" "$2"; then
+  local slug="$1" root="$2" dump="$3" u="${1}_r" t="${1}__ripristino" esc pw rc=0
+  if ! sql_ident_ok "$t" || ! sql_ident_ok "$u" || ! _bk_db_pw "$root" >/dev/null; then
     BK_ERR="password del database non leggibile (db.env)"
     return 1
   fi
   esc="${t//_/\\_}"
-  if ! _bk_sql "DROP DATABASE IF EXISTS \`$t\`;
-CREATE DATABASE \`$t\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-GRANT ALL PRIVILEGES ON \`$esc\`.* TO '$slug'@'localhost';"; then
+  _bk_db_tmp_clean "$slug"
+  pw="$(rand_secret 32)"
+  if ! _bk_sql "CREATE DATABASE \`$t\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER '$u'@'localhost' IDENTIFIED BY '$pw';
+GRANT ALL PRIVILEGES ON \`$esc\`.* TO '$u'@'localhost';"; then
     BK_ERR="database temporaneo non creato: $_BK_SQLERR"
-    _bk_sql "REVOKE ALL PRIVILEGES ON \`$esc\`.* FROM '$slug'@'localhost';
-DROP DATABASE IF EXISTS \`$t\`;" || true
+    _bk_db_tmp_clean "$slug"
     return 1
   fi
-  _bk_db_load "$t" "$3" || rc=$?
-  _bk_sql "REVOKE ALL PRIVILEGES ON \`$esc\`.* FROM '$slug'@'localhost';
-DROP DATABASE IF EXISTS \`$t\`;" || log "ATTENZIONE: database temporaneo $t non rimosso ($_BK_SQLERR)"
+  if ! _bk_cnf_make "$slug" "$root" "$u" "$pw"; then
+    BK_ERR="file delle credenziali della prova non creato (tmp/ del sito non scrivibile)"
+    _bk_db_tmp_clean "$slug"
+    return 1
+  fi
+  _bk_db_load "$t" "$dump" "$slug" "$root" "$_BK_CNF" || rc=$?
+  _bk_cnf_rm "$slug" "$root"
+  _bk_db_tmp_clean "$slug"
   if ((rc != 0)); then
     BK_ERR="il dump del database non si carica: $_BK_LOADERR"
     return 1
   fi
 }
 
-# _bk_db_swap SLUG DUMP.GZ SICUREZZA — il database del sito diventa il dump. Se fallisce
-# si ricarica il dump della copia di sicurezza SICUREZZA (archivio).
+# _bk_db_swap SLUG RADICE DUMP.GZ SICUREZZA — il database del sito diventa il dump. Se
+# fallisce si ricarica il dump della copia di sicurezza SICUREZZA (archivio).
 _bk_db_swap() {
-  local slug="$1" dump="$2" safety="$3" msg
-  if _bk_db_recreate "$slug" && _bk_db_load "$slug" "$dump"; then
+  local slug="$1" root="$2" dump="$3" safety="$4" msg pw ok=0
+  pw="$(_bk_db_pw "$root")" || {
+    BK_ERR="password del database non leggibile (db.env)"
+    return 1
+  }
+  if ! _bk_cnf_make "$slug" "$root" "$slug" "$pw"; then
+    BK_ERR="file delle credenziali non creato (tmp/ del sito non scrivibile)"
+    return 1
+  fi
+  if _bk_db_recreate "$slug" && _bk_db_load "$slug" "$dump" "$slug" "$root" "$_BK_CNF"; then
+    _bk_cnf_rm "$slug" "$root"
     return 0
   fi
   msg="${_BK_LOADERR:-$_BK_SQLERR}"
   mkdir -p "$BK_RUN_DIR/s"
   if tar -xzf "$safety" -C "$BK_RUN_DIR/s" --no-same-owner --no-same-permissions db.sql.gz 2>/dev/null \
-    && _bk_db_recreate "$slug" && _bk_db_load "$slug" "$BK_RUN_DIR/s/db.sql.gz"; then
+    && _bk_db_recreate "$slug" && _bk_db_load "$slug" "$BK_RUN_DIR/s/db.sql.gz" "$slug" "$root" "$_BK_CNF"; then
+    ok=1
+  fi
+  _bk_cnf_rm "$slug" "$root"
+  if ((ok)); then
     BK_ERR="caricamento del database non riuscito ($msg): il database è tornato com'era"
     return 1
   fi
-  BK_ERR="caricamento del database non riuscito ($msg) e la copia di sicurezza non si è ricaricata: il database potrebbe essere incompleto, la copia è $safety"
+  BK_ERR="caricamento del database non riuscito ($msg) e la copia di sicurezza non si è ricaricata: il database potrebbe essere incompleto, la copia è ${safety##*/}"
   _BK_R_NOTE=hard
   return 1
 }
@@ -1690,7 +1821,7 @@ _bk_db_swap() {
 _bk_flush_cache() {
   local d="$1" slug="$2" zone
   if grep -q "^user $slug " "$REDIS_ACL_FILE" 2>/dev/null; then
-    site_redis_purge "$d" >/dev/null 2>&1 || log "ATTENZIONE: cache Redis di $d non svuotata"
+    _bk_nolock_fn site_redis_purge "$d" >/dev/null 2>&1 || log "ATTENZIONE: cache Redis di $d non svuotata"
   fi
   zone="$(site_reg_get "$d" '.zone // ""' 2>/dev/null || true)"
   if [[ -n "$zone" && "$(jq -r '.cloudflare.enabled // false' "$(manifest_path)" 2>/dev/null || true)" == true && -x "$BK_CF_PURGE" ]]; then
@@ -1701,7 +1832,7 @@ _bk_flush_cache() {
 # _bk_send TESTO — manda il messaggio e stampa l'esito per last_restore.alert.
 _bk_send() {
   local rc=0
-  mon_send "$1" || rc=$?
+  _bk_mon_send "$1" || rc=$?
   if ((rc == 0)); then
     printf '"sent"'
   elif [[ "${MON_SEND_ERR:-}" == "Telegram non configurato" ]]; then
@@ -1715,7 +1846,8 @@ _bk_send() {
 _bk_rprogress() {
   local job
   job="$(jq -nc --arg u "${BK_UNIT:-vps-backup-restore}" --arg s "$_BK_STARTED" --arg st "$1" --arg d "$_BK_R_DOM" \
-    '{unit: $u, op: "restore", started: $s, step: $st, domain: $d}')"
+    --arg sf "${_BK_SAFETY##*/}" \
+    '{unit: $u, op: "restore", started: $s, step: $st, domain: $d, safety: (if $sf == "" then null else $sf end)}')"
   _bk_state_write "$job" "$_BK_PREV_LAST" || log "vps-backup: state.json non scritto"
 }
 
@@ -1818,7 +1950,9 @@ _bk_restore_do() {
     fi
   fi
 
-  # 4. copia di sicurezza di ciò che si sta per sovrascrivere
+  # 4. copia di sicurezza di ciò che si sta per sovrascrivere. Il nome va nel job prima
+  # di cominciare: se il processo muore, il pannello può dire dov'è.
+  _BK_SAFETY="$BK_BACKUPS/restore/$d-$(date +%Y%m%d-%H%M%S).tar.gz"
   _bk_rprogress safety
   if ! sz="$(_bk_site_size "$d" "$parts")"; then
     _bk_stage_clean "$slug" "$root"
@@ -1835,7 +1969,6 @@ _bk_restore_do() {
     BK_ERR="cartella delle copie di sicurezza non disponibile"
     return 1
   }
-  _BK_SAFETY="$BK_BACKUPS/restore/$d-$(date +%Y%m%d-%H%M%S).tar.gz"
   if ! bk_archive "$d" "$_BK_SAFETY" "$parts"; then
     BK_ERR="copia di sicurezza non riuscita: ${BK_ERR:-errore}"
     _BK_SAFETY=""
@@ -1854,7 +1987,7 @@ _bk_restore_do() {
   fi
   if [[ "$mode" != files ]]; then
     _bk_rprogress database
-    if ! _bk_db_swap "$slug" "$w/x/db.sql.gz" "$_BK_SAFETY"; then
+    if ! _bk_db_swap "$slug" "$root" "$w/x/db.sql.gz" "$_BK_SAFETY"; then
       # tutto o niente: anche i file tornano come prima
       if ((files_done)); then _bk_files_undo "$slug" "$root" || true; fi
       return 1
@@ -1912,6 +2045,7 @@ bk_restore_run() {
   [[ -n "$_BK_KNOWN" ]] || _BK_KNOWN='[]'
   [[ -n "$_BK_LAST_RESTORE" ]] || _BK_LAST_RESTORE='null'
   _bk_rprogress start
+  bk_prune_site_tmp "$slug" "$root"
   log "vps-backup: ripristino di $d ($mode) da $src ${name//[^[:print:]]/?}"
 
   _bk_restore_do "$src" "$d" "$name" "$mode" "$slug" "$root" || ok=false

@@ -76,7 +76,8 @@ existing() {
 # no_restore DOMINIO — un ripristino (o la copia del sito) tiene il lock del sito:
 # niente lavori né cambi di database finché non ha finito.
 no_restore() {
-  if bk_site_locked "$(site_reg_get "$1" .slug)"; then
+  # lock condiviso fino alla fine del comando (un ripristino esclusivo non parte nel frattempo)
+  if ! bk_site_lock_shared "$(site_reg_get "$1" .slug)"; then
     json_err "ripristino in corso (o copia del sito in corso): riprova tra poco"
   fi
 }

@@ -723,7 +723,8 @@ site_run() {
   fi
   # Un ripristino (o la copia del sito) tiene il lock del sito: l'eliminazione o
   # l'installazione di WordPress in coda non devono partire a metà.
-  if [[ "$op" != create ]] && bk_site_locked "$(site_reg_get "$d" .slug)"; then
+  # Lo tiene (condiviso) per tutta la durata del lavoro: un ripristino non parte nel frattempo.
+  if [[ "$op" != create ]] && ! bk_site_lock_shared "$(site_reg_get "$d" .slug)"; then
     exec 9>&-
     site_abort "$d" "$op" "ripristino in corso (o copia del sito in corso): riprova tra poco"
     return 1
@@ -740,6 +741,7 @@ site_run() {
   # wpinstall non parla con Cloudflare: il token serve solo a creare ed eliminare.
   if [[ "$op" != wpinstall ]] && ! site_cf_token; then
     exec 9>&-
+    bk_site_unlock
     site_abort "$d" "$op" "token Cloudflare mancante in $VPS_OPT/secrets/cloudflare.ini"
     return 1
   fi
@@ -752,6 +754,7 @@ site_run() {
   # Libera il lucchetto: in un processo a sé si chiude da solo, ma chi chiama
   # site_run da una shell che resta viva (i test) non deve bloccare il lavoro dopo.
   exec 9>&-
+  bk_site_unlock
   return "$rc"
 }
 
