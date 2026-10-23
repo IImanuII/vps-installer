@@ -2621,3 +2621,149 @@ exec /usr/bin/mv "$@"'
   [ "$status" -eq 1 ]
   [ -z "$(ls -A "$BK_BACKUPS/tmp")" ]
 }
+
+# ---------------------------------------------------------------------------
+# Fix round 1 di Task 5: copie parziali, manifest limitato, prefisso, attesa del lock
+# ---------------------------------------------------------------------------
+
+@test "_restore: una copia solo-database con modalità files o all è rifiutata prima di toccare il sito, senza copia di sicurezza" {
+  rs_env
+  rs_site
+  mkdir -p "$BK_BACKUPS/restore"
+  bk_archive a.it "$BK_BACKUPS/restore/a.it-20261002-101500.tar.gz" db
+  local m
+  for m in files all; do
+    rs_run local a.it restore/a.it-20261002-101500.tar.gz "$m"
+    [ "$status" -ne 0 ]
+    jq -e '.last_restore.ok == false and (.last_restore.error | test("solo il database")) and .last_restore.safety == null' "$BK_STATE"
+  done
+  [ -f "$SITES_WWW/a.it/public/nuovo.txt" ]
+  [ ! -e "$SITES_WWW/a.it/public/-x" ]
+  [ "$(ls "$BK_BACKUPS/restore" | wc -l)" -eq 1 ]
+  [ -z "$(ls -A "$SITES_WWW/a.it/tmp" | grep -v '^sess$' || true)" ]
+  # la modalità giusta passa
+  rs_run local a.it restore/a.it-20261002-101500.tar.gz db
+  [ "$status" -eq 0 ]
+}
+
+@test "_restore: una copia solo-file con modalità db o all è rifiutata, con files passa" {
+  rs_env
+  rs_site
+  mkdir -p "$BK_BACKUPS/restore"
+  bk_archive a.it "$BK_BACKUPS/restore/a.it-20261002-101500.tar.gz" files
+  local m
+  for m in db all; do
+    rs_run local a.it restore/a.it-20261002-101500.tar.gz "$m"
+    [ "$status" -ne 0 ]
+    jq -e '.last_restore.ok == false and (.last_restore.error | test("solo i file")) and .last_restore.safety == null' "$BK_STATE"
+  done
+  [ "$(fdb_tables site_a_it)" = "extra utenti" ]
+  rs_run local a.it restore/a.it-20261002-101500.tar.gz files
+  [ "$status" -eq 0 ]
+}
+
+@test "list-local: parts (all, db, files) per le copie nel formato nuovo, null per le altre" {
+  rs_env
+  mk_site a.it no
+  mkdir -p "$BK_BACKUPS"/{panel,sites,restore}
+  bk_archive a.it "$BK_BACKUPS/sites/a.it-20261001-0400.tar.gz"
+  bk_archive a.it "$BK_BACKUPS/restore/a.it-20261002-101500.tar.gz" db
+  bk_archive a.it "$BK_BACKUPS/restore/a.it-20261003-101500.tar.gz" files
+  tar -czf "$BK_BACKUPS/sites/b.it-20260901-120000.tar.gz" -C "$SITES_WWW" a.it
+  echo y | gzip >"$BK_BACKUPS/panel/p-20261003-030000.sql.gz"
+  bk_tool list-local
+  [ "$status" -eq 0 ]
+  jq -e '(.items[] | select(.name == "sites/a.it-20261001-0400.tar.gz") | .parts) == "all"' <<<"$output"
+  jq -e '(.items[] | select(.name == "restore/a.it-20261002-101500.tar.gz") | .parts) == "db"' <<<"$output"
+  jq -e '(.items[] | select(.name == "restore/a.it-20261003-101500.tar.gz") | .parts) == "files"' <<<"$output"
+  jq -e '(.items[] | select(.name == "sites/b.it-20260901-120000.tar.gz") | .parts) == null' <<<"$output"
+  jq -e '(.items[] | select(.kind == "panel") | .parts) == null' <<<"$output"
+}
+
+@test "bk_archive: table_prefix nel manifest di un WordPress, dal wp-config.php vivo e solo se valido" {
+  mk_site wp.it yes
+  site_reg_update wp.it '.type = "wordpress"'
+  printf "<?php\n\$table_prefix = 'xy7_';\n" >"$SITES_WWW/wp.it/wp-config.php"
+  bk_archive wp.it "$BATS_TEST_TMPDIR/o1.tar.gz"
+  [ "$(bk_manifest "$BATS_TEST_TMPDIR/o1.tar.gz" | jq -r .table_prefix)" = xy7_ ]
+  printf "<?php\n\$table_prefix = 'a;b';\n" >"$SITES_WWW/wp.it/wp-config.php"
+  bk_archive wp.it "$BATS_TEST_TMPDIR/o2.tar.gz"
+  [ "$(bk_manifest "$BATS_TEST_TMPDIR/o2.tar.gz" | jq -r .table_prefix)" = wp_ ]
+  printf "<?php\n\$table_prefix = '%s';\n" "$(printf 'a%.0s' {1..21})" >"$SITES_WWW/wp.it/wp-config.php"
+  bk_archive wp.it "$BATS_TEST_TMPDIR/o3.tar.gz"
+  [ "$(bk_manifest "$BATS_TEST_TMPDIR/o3.tar.gz" | jq -r .table_prefix)" = wp_ ]
+  # un sito non WordPress non ha il campo
+  mk_site php.it no
+  bk_archive php.it "$BATS_TEST_TMPDIR/o4.tar.gz"
+  [ "$(bk_manifest "$BATS_TEST_TMPDIR/o4.tar.gz" | jq -r .table_prefix)" = null ]
+}
+
+@test "bk_manifest: un manifest oltre 64 KiB è rifiutato" {
+  local w="$BATS_TEST_TMPDIR/big"
+  mkdir -p "$w"
+  jq -n --arg pad "$(head -c 70000 /dev/zero | tr '\0' x)" '{domain:"x.it", pad:$pad}' >"$w/manifest.json"
+  echo f >"$w/files.tar.gz"
+  tar -czf "$w/a.tar.gz" -C "$w" manifest.json files.tar.gz
+  run bk_manifest "$w/a.tar.gz"
+  [ "$status" -ne 0 ]
+  jq -n '{domain:"x.it"}' >"$w/manifest.json"
+  tar -czf "$w/b.tar.gz" -C "$w" manifest.json files.tar.gz
+  run bk_manifest "$w/b.tar.gz"
+  [ "$status" -eq 0 ]
+}
+
+@test "bk_remote_manifest: manifest.json deve essere il primo membro, e non può superare 64 KiB; timeout breve" {
+  rs_env
+  mkdir -p "$DRIVE/F/a.it" "$BATS_TEST_TMPDIR/w"
+  local w="$BATS_TEST_TMPDIR/w"
+  jq -n '{domain:"a.it"}' >"$w/manifest.json"
+  echo f >"$w/files.tar.gz"
+  # primo membro sbagliato
+  tar -czf "$DRIVE/F/a.it/a.it-20261001-0400.tar.gz" -C "$w" files.tar.gz manifest.json
+  run bk_remote_manifest a.it/a.it-20261001-0400.tar.gz
+  [ "$status" -eq 1 ]
+  # manifest enorme
+  jq -n --arg pad "$(head -c 70000 /dev/zero | tr '\0' x)" '{domain:"a.it", pad:$pad}' >"$w/manifest.json"
+  tar -czf "$DRIVE/F/a.it/a.it-20261002-0400.tar.gz" -C "$w" manifest.json files.tar.gz
+  run bk_remote_manifest a.it/a.it-20261002-0400.tar.gz
+  [ "$status" -eq 1 ]
+  # normale
+  jq -n '{domain:"a.it"}' >"$w/manifest.json"
+  tar -czf "$DRIVE/F/a.it/a.it-20261003-0400.tar.gz" -C "$w" manifest.json files.tar.gz
+  bk_remote_manifest a.it/a.it-20261003-0400.tar.gz
+  [ "$(jq -r .domain <<<"$_BK_MANIFEST")" = a.it ]
+  grep -q 'timeout 45 ' "$REPO_ROOT/lib/backup.sh"
+}
+
+@test "_restore con BK_LOCK_WAIT aspetta un giro che finisce; senza, fallisce subito" {
+  rs_env
+  rs_site
+  flock -x -w 5 "$BK_LOCK_DIR/vps-backup.lock" sleep 3 &
+  local bg=$!
+  sleep 0.5
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"backup in corso"* ]]
+  BK_LOCK_WAIT=10 rs_run local a.it "$ARC_NAME" files
+  wait "$bg"
+  [ "$status" -eq 0 ]
+  jq -e '.last_restore.ok == true' "$BK_STATE"
+}
+
+@test "_restore files su un WordPress senza cron: lo installa; con 'db' no" {
+  rs_env
+  rs_site
+  site_reg_update a.it '.type = "wordpress"'
+  [ ! -e "$CRON_D/vps-site-site_a_it" ]
+  rs_run local a.it "$ARC_NAME" db
+  [ "$status" -eq 0 ]
+  [ ! -e "$CRON_D/vps-site-site_a_it" ]
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -eq 0 ]
+  [ -f "$CRON_D/vps-site-site_a_it" ]
+}
+
+@test "vps-backup: BK_LOCK_WAIT non entra dall'ambiente del chiamante sotto sudo" {
+  grep -q 'BK_LOCK_WAIT' "$REPO_ROOT/tools/vps-backup"
+  grep -q 'BK_CF_PURGE BK_LOCK_WAIT' "$REPO_ROOT/tools/vps-backup"
+}

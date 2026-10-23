@@ -26,7 +26,7 @@ answers() { printf '%s\n' "$TOKEN" manu 123456789 'Una-Password-12!' 'Una-Passwo
   grep -q 'reload php8.4-fpm' "$BATS_TEST_TMPDIR/systemctl.args"
   [ "$(jq -r .panel.version "$VPS_OPT/manifest.json")" = 1.1.0 ]
   [[ "$output" == *"https://panel.test/login"* ]]
-  ! grep -q 'Una-Password-12!' "$VPS_LOG"
+  run ! grep -q 'Una-Password-12!' "$VPS_LOG"
   ! grep -q AAAAAAAAAAAA "$VPS_LOG"
 }
 

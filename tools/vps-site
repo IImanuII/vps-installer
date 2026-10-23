@@ -235,6 +235,8 @@ case "$cmd" in
         || json_err "con --from-backup il tipo, www e il database vengono dalla copia: togli --type, --www, --db e le opzioni di WordPress"
       valid_domain "$d" || json_err "dominio non valido: $d"
       site_fb_load "$d" "$fb" || json_err "$FB_ERR"
+      # il ripristino in coda al lavoro non può partire con un giro o un ripristino in corso
+      if bk_global_busy || bk_unit_alive; then json_err "backup o ripristino in corso, riprova più tardi"; fi
       type="$FB_TYPE" www="$FB_WWW" db="$FB_DB"
     else
       [[ "$type" == static || "$type" == php || "$type" == wordpress ]] || json_err "tipo non valido: usa --type static, php o wordpress"
@@ -272,8 +274,8 @@ case "$cmd" in
     fi
     site_reg_new "$d" "$type" "$www" "$db"
     if [[ -n "$fb" ]]; then
-      site_reg_update "$d" '.from_backup = {source: $s, name: $n, login_path: (if $l == "" then null else $l end)}' \
-        --arg s "$FB_SRC" --arg n "$FB_NAME" --arg l "$FB_LOGIN"
+      site_reg_update "$d" '.from_backup = {source: $s, name: $n, login_path: (if $l == "" then null else $l end), table_prefix: (if $t == "" then null else $t end)}' \
+        --arg s "$FB_SRC" --arg n "$FB_NAME" --arg l "$FB_LOGIN" --arg t "$FB_PREFIX"
     elif [[ "$type" == wordpress ]]; then
       write_wp_files "$d"
     fi

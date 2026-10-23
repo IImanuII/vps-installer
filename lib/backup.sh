@@ -155,8 +155,12 @@ bk_keep_plan() {
 # --- archivio ---------------------------------------------------------------
 
 # bk_manifest ARCHIVIO — stampa manifest.json dell'archivio.
+# Il manifest non è autenticato: si legge al massimo 64 KiB (oltre, è un errore).
 bk_manifest() {
-  tar -xzOf "${1-}" manifest.json 2>/dev/null
+  local m
+  m="$(tar -xzOf "${1-}" manifest.json 2>/dev/null | head -c 65537)" || true
+  ((${#m} > 0 && ${#m} <= 65536)) || return 1
+  printf '%s\n' "$m"
 }
 
 # bk_tmp_dir — cartella di lavoro dentro BK_BACKUPS/tmp (root 700; non /tmp, che
@@ -267,6 +271,15 @@ _bk_archive_in() {
     return 1
   }
 
+  # Prefisso delle tabelle di un WordPress: dal wp-config.php vivo (di root, il sito non lo
+  # riscrive), mai da quello dell'archivio né dai nomi delle tabelle del dump.
+  local prefix=""
+  if [[ "$type" == wordpress && -f "$root/wp-config.php" && ! -L "$root/wp-config.php" ]]; then
+    prefix="$(sed -n "s/^\$table_prefix *= *'\([A-Za-z0-9_]*\)' *;.*/\1/p" "$root/wp-config.php" | head -n1)"
+  fi
+  [[ "$prefix" =~ ^[A-Za-z0-9_]{1,20}$ ]] || prefix=""
+  [[ "$type" != wordpress || -n "$prefix" ]] || prefix=wp_
+
   local dbsha=""
   if [[ "$hasdb" == true && "$parts" != files ]]; then
     # dump su file, poi gzip: se il dump fallisce lo si sa dal suo codice di uscita
@@ -284,11 +297,11 @@ _bk_archive_in() {
 
   jq -n --arg d "$d" --arg t "$type" --arg slug "$slug" --arg login "$login" \
     --arg www "$www" --arg db "$hasdb" --arg at "$(date -Iseconds)" \
-    --arg v "$VPS_INSTALLER_VERSION" --arg parts "$parts" \
+    --arg v "$VPS_INSTALLER_VERSION" --arg parts "$parts" --arg prefix "$prefix" \
     --arg fsha "$(sha256sum "$w/files.tar.gz" | cut -d' ' -f1)" --arg dsha "$dbsha" '
     {domain: $d, type: $t, www: ($www == "true"), db: ($db == "true"), slug: $slug,
      login_path: (if $login == "" then null else $login end), date: $at,
-     installer_version: $v, parts: $parts,
+     installer_version: $v, parts: $parts, table_prefix: (if $prefix == "" then null else $prefix end),
      sha256: {files: $fsha, db: (if $dsha == "" then null else $dsha end)}}' >"$w/manifest.json" || {
     echo "manifest non scritto" >"$w/err"
     return 1
@@ -758,15 +771,21 @@ bk_global_lock_file() {
   printf '%s/vps-backup.lock' "$BK_LOCK_DIR"
 }
 
-# bk_lock_global — 0 lock preso (resta tenuto fino a bk_unlock_global o alla fine
+# bk_lock_global [SECONDI] — 0 lock preso (resta tenuto fino a bk_unlock_global o alla fine
 # del processo); 1 occupato o non apribile.
 bk_lock_global() {
-  local f fd
+  local f fd wait="${1:-0}"
+  [[ "$wait" =~ ^[0-9]{1,4}$ ]] || wait=0
   f="$(bk_global_lock_file)"
   # shellcheck disable=SC2261
   { exec {fd}>>"$f"; } 2>/dev/null || return 1
   chmod 600 "$f" 2>/dev/null || true
-  if ! flock -n "$fd"; then
+  if ((wait > 0)); then
+    flock -w "$wait" "$fd" || {
+      exec {fd}>&-
+      return 1
+    }
+  elif ! flock -n "$fd"; then
     exec {fd}>&-
     return 1
   fi
@@ -1264,7 +1283,7 @@ bk_local_path() {
 # `expires`: data di scadenza (modifica + 30 giorni per sites, + 7 per restore, null
 # per il pannello, di cui restano gli ultimi 5).
 bk_list_local_json() {
-  local k dir p f mt days exp restorable first kind dom sz TAB=$'\t' tbl=""
+  local k dir p f mt days exp restorable first kind dom sz parts TAB=$'\t' tbl=""
   for k in panel sites restore; do
     dir="$BK_BACKUPS/$k"
     [[ -d "$dir" && ! -L "$dir" ]] || continue
@@ -1275,6 +1294,7 @@ bk_list_local_json() {
       mt="$(stat -c %Y "$p")" || continue
       sz="$(stat -c %s "$p")" || continue
       restorable=false
+      parts=""
       exp=""
       dom="$_BK_LD"
       case "$k" in
@@ -1292,18 +1312,23 @@ bk_list_local_json() {
         exp="$(date -d "@$((mt + days * 86400))" +%F)" || exp=""
         if [[ "$f" == *.tar.gz ]]; then
           first="$(tar -tzf "$p" 2>/dev/null | head -n1 || true)"
-          if [[ "$first" == manifest.json ]]; then restorable=true; fi
+          if [[ "$first" == manifest.json ]]; then
+            restorable=true
+            parts="$(bk_manifest "$p" | jq -r '.parts // "all"' 2>/dev/null || true)"
+            [[ "$parts" =~ ^(all|db|files)$ ]] || parts=all
+          fi
         fi
       fi
-      tbl+="$kind$TAB$k/$f$TAB$dom$TAB$mt$TAB$sz$TAB$exp$TAB$restorable"$'\n'
+      tbl+="$kind$TAB$k/$f$TAB$dom$TAB$mt$TAB$sz$TAB$exp$TAB$restorable$TAB$parts"$'\n'
     done
   done
   printf '%s' "$tbl" | jq -Rnc '
     [inputs | split("\t") | {kind: .[0], name: .[1], domain: (if .[2] == "" then null else .[2] end),
        t: (.[3] | tonumber), size: (.[4] | tonumber),
-       expires: (if .[5] == "" then null else .[5] end), restorable: (.[6] == "true")}]
+       expires: (if .[5] == "" then null else .[5] end), restorable: (.[6] == "true"),
+       parts: (if (.[7] // "") == "" then null else .[7] end)}]
     | sort_by(-.t, .name)
-    | map({kind, name, domain, date: (.t | strflocaltime("%Y-%m-%dT%H:%M:%S")), size, expires, restorable})
+    | map({kind, name, domain, date: (.t | strflocaltime("%Y-%m-%dT%H:%M:%S")), size, expires, restorable, parts})
     | {ok: true, items: .}'
 }
 
@@ -1450,13 +1475,18 @@ bk_remote_manifest() {
     BK_ERR="cartella temporanea non disponibile"
     return 1
   }
-  if ! _bk_nolock timeout 300 "${_BK_RC[@]}" cat --count 262144 "gdrive:$folder/$_BK_RD/$_BK_RF" >"$w/head" 2>"$w/err" </dev/null; then
+  if ! _bk_nolock timeout 45 "${_BK_RC[@]}" cat --count 262144 "gdrive:$folder/$_BK_RD/$_BK_RF" >"$w/head" 2>"$w/err" </dev/null; then
     BK_ERR="Google Drive non risponde: $(bk_clean_msg "$(cat "$w/err" 2>/dev/null || true)")"
     rm -rf -- "$w"
     return 1
   fi
-  tar -xzOf "$w/head" manifest.json >"$w/m.json" 2>/dev/null || true
-  if ! jq -e 'type == "object"' "$w/m.json" >/dev/null 2>&1; then
+  # come per una copia locale: manifest.json deve essere il PRIMO membro, e il manifest
+  # (non autenticato) non può superare 64 KiB
+  tar -tzf "$w/head" 2>/dev/null | head -n1 >"$w/first" || true
+  if [[ "$(cat "$w/first")" == manifest.json ]]; then
+    tar -xzOf "$w/head" manifest.json 2>/dev/null | head -c 65537 >"$w/m.json" || true
+  fi
+  if [[ ! -s "$w/m.json" ]] || (($(stat -c %s "$w/m.json") > 65536)) || ! jq -e 'type == "object"' "$w/m.json" >/dev/null 2>&1; then
     BK_ERR="manifest della copia non leggibile (non è una copia nel formato nuovo?)"
     rm -rf -- "$w"
     return 1
@@ -1893,7 +1923,7 @@ _bk_rprogress() {
 # nessuna copia di sicurezza. Imposta BK_ERR; 0 se riuscito.
 _bk_restore_do() {
   local src="$1" d="$2" name="$3" mode="$4" slug="$5" root="$6"
-  local w="$BK_RUN_DIR" arc mdom sitedb hasdb parts sz files_done=0
+  local w="$BK_RUN_DIR" arc mdom sitedb hasdb parts sz files_done=0 mparts
   BK_ERR=""
   _BK_R_NOTE=""
   _BK_SAFETY=""
@@ -1947,6 +1977,29 @@ _bk_restore_do() {
       return 1
     }
   fi
+  # Una copia parziale (la copia di sicurezza di un ripristino 'db' o 'files') contiene
+  # solo una parte: le altre modalità si rifiutano prima di toccare qualsiasi cosa.
+  mparts="$(jq -r '.parts // "all"' "$w/x/manifest.json")"
+  case "$mparts" in
+    all) ;;
+    db)
+      if [[ "$mode" != db ]]; then
+        BK_ERR="la copia contiene solo il database (copia parziale): si può ripristinare solo il database"
+        return 1
+      fi
+      ;;
+    files)
+      if [[ "$mode" != files ]]; then
+        BK_ERR="la copia contiene solo i file (copia parziale): si possono ripristinare solo i file"
+        return 1
+      fi
+      ;;
+    *)
+      BK_ERR="copia con contenuto non riconosciuto nel manifest"
+      return 1
+      ;;
+  esac
+
   sitedb="$(site_reg_get "$d" .db)"
   case "$mode" in
     db)
@@ -2030,6 +2083,11 @@ _bk_restore_do() {
     fi
   fi
   _bk_files_commit "$slug" "$root"
+  # Un WordPress ricreato da una copia il cui ripristino era fallito non ha il suo cron:
+  # un ripristino riuscito di file lo mette.
+  if [[ "$mode" != db && "$(site_reg_get "$d" .type)" == wordpress && ! -e "$(site_wp_cron_file "$d")" ]]; then
+    (site_wp_cron_add "$d") || log "ATTENZIONE: cron di WordPress di $d non installato"
+  fi
 
   # 6. cache (solo registro in caso d'errore)
   _bk_rprogress cache
@@ -2058,7 +2116,9 @@ bk_restore_run() {
   }
   slug="${info%% *}"
   root="${info#* }"
-  if ! bk_lock_global; then
+  # Dentro la creazione di un sito da copia (vps-site) si aspetta che un giro finisca,
+  # invece di far fallire il ripristino subito (BK_LOCK_WAIT: secondi, solo da lì).
+  if ! bk_lock_global "${BK_LOCK_WAIT:-0}"; then
     printf '{"ok":false,"error":"backup in corso"}\n'
     return 1
   fi

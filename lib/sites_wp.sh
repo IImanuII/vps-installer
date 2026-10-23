@@ -46,11 +46,15 @@ site_placeholder_intact() {
   timeout 5 runuser -u "$slug" -- head -c 8192 -- "$pub/index.html" 2>/dev/null | grep -qF -- "$SITE_PLACEHOLDER_MARK"
 }
 
-# site_wp_config_write DOMINIO DB_PASSWORD REDIS_PASSWORD — wp-config.php nella
+# site_wp_config_write DOMINIO DB_PASSWORD REDIS_PASSWORD [PREFISSO] — wp-config.php nella
 # radice (di root), fuori dalla webroot: il sito lo legge, non può riscriverlo.
 # shellcheck disable=SC2034
 site_wp_config_write() {
-  local d="$1" i rc
+  local d="$1" i rc prefix="${4:-wp_}"
+  if [[ ! "$prefix" =~ ^[A-Za-z0-9_]{1,20}$ ]]; then
+    site_fail "prefisso delle tabelle non valido"
+    return 1
+  fi
   # Le password finiscono in stringhe PHP tra apici: qui si rifiuta ciò che le romperebbe.
   if ! site_valid_db_password "$2" || ! site_valid_db_password "$3"; then
     site_fail "password non valida per wp-config.php"
@@ -60,11 +64,12 @@ site_wp_config_write() {
   WP_DB_NAME="$(site_reg_get "$d" .slug)"
   WP_DB_PASSWORD="$2"
   WP_REDIS_PASSWORD="$3"
+  WP_TABLE_PREFIX="$prefix"
   for i in 1 2 3 4 5 6 7 8; do
     printf -v "WP_KEY$i" '%s' "$(rand_secret 64)"
   done
   render_template "$VPS_TEMPLATES/wp-config.php.tmpl" "$(site_root "$d")/wp-config.php" 640 "root:$WP_DB_NAME" \
-    WP_DOMAIN WP_DB_NAME WP_DB_PASSWORD WP_REDIS_PASSWORD WP_KEY1 WP_KEY2 WP_KEY3 WP_KEY4 WP_KEY5 WP_KEY6 WP_KEY7 WP_KEY8
+    WP_DOMAIN WP_DB_NAME WP_DB_PASSWORD WP_REDIS_PASSWORD WP_TABLE_PREFIX WP_KEY1 WP_KEY2 WP_KEY3 WP_KEY4 WP_KEY5 WP_KEY6 WP_KEY7 WP_KEY8
   rc=$?
   # I segreti non devono restare nell'ambiente dei processi figli successivi.
   export -n WP_DB_PASSWORD WP_REDIS_PASSWORD WP_KEY1 WP_KEY2 WP_KEY3 WP_KEY4 WP_KEY5 WP_KEY6 WP_KEY7 WP_KEY8

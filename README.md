@@ -153,4 +153,4 @@ Da sapere:
   archivio manomesso da chi può scrivere su Drive non diventa root, ma potrebbe cambiare
   la password del database di quel sito. Rischio accettato.
 - Il ripristino non tocca mai `wp-config.php`; un sito ricreato ne riceve uno nuovo, con
-  credenziali nuove e tabelle col prefisso `wp_`.
+  credenziali nuove e il prefisso delle tabelle letto dal manifest (predefinito `wp_`).

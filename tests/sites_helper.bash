@@ -102,9 +102,9 @@ fb_archive() {
   fi
   mkdir -p "$root/public/wp-content" "$root/logs" "$root/tmp" "$BK_BACKUPS/sites"
   echo "contenuto di $d" >"$root/public/index.php"
-  printf '<?php // wp-config vecchio\n' >"$root/wp-config.php"
+  printf '<?php // wp-config vecchio\n$table_prefix = '"'%s'"';\n' "${FB_PREFIX:-wp_}" >"$root/wp-config.php"
   FB_ARC="sites/$d-20261001-040000.tar.gz"
-  bk_archive "$d" "$BK_BACKUPS/$FB_ARC" || return 1
+  bk_archive "$d" "$BK_BACKUPS/$FB_ARC" "${FB_PARTS:-all}" || return 1
   rm -f "$(site_reg_path "$d")"
   rm -rf "$root"
 }
@@ -115,6 +115,8 @@ fb_backup_stub() {
   # shellcheck disable=SC2016
   make_stub vps-backup-fb 'T="$BATS_TEST_TMPDIR"; echo "$*" >>"$T/fb.calls"
 state="$(jq -r .state "$SITES_DIR/$3.json" 2>/dev/null)"; echo "$state" >>"$T/fb.state"
+# il lock globale dei lavori di vps-site non deve essere tenuto durante il ripristino
+if flock -n "$SITES_LOCK" true; then echo libero >>"$T/fb.joblock"; else echo preso >>"$T/fb.joblock"; fi
 rc="${FB_STUB_RC:-0}"
 if [[ "$rc" == 0 ]]; then echo "{\"ok\":true,\"finished\":true,\"restore_ok\":true}"; else echo "{\"ok\":false,\"error\":\"${FB_STUB_ERR:-ripristino fallito}\"}"; fi
 exit "$rc"'

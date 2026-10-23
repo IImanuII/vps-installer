@@ -541,7 +541,7 @@ site_create_step() {
 # shellcheck disable=SC2034 # le variabili FB_* le legge vps-site
 site_fb_load() {
   local d="$1" nome="$2" path m mdom
-  FB_ERR="" FB_SRC="" FB_NAME="" FB_TYPE="" FB_WWW="" FB_DB="" FB_LOGIN=""
+  FB_ERR="" FB_SRC="" FB_NAME="" FB_TYPE="" FB_WWW="" FB_DB="" FB_LOGIN="" FB_PREFIX=""
   if [[ "$nome" == remote:* ]]; then
     FB_SRC=remote
     FB_NAME="${nome#remote:}"
@@ -594,8 +594,18 @@ site_fb_load() {
     FB_ERR="tipo di sito non valido nella copia"
     return 1
   fi
+  # una copia parziale (solo database o solo file) non basta a ricreare un sito
+  if [[ "$(jq -r '.parts // "all"' <<<"$m")" != all ]]; then
+    FB_ERR="copia parziale: non basta a ricreare il sito"
+    return 1
+  fi
   FB_WWW="$(jq -r 'if .www == true then "yes" else "no" end' <<<"$m")"
   FB_DB="$(jq -r 'if ((.sha256.db // "") | type) == "string" and (.sha256.db // "") != "" then "yes" else "no" end' <<<"$m")"
+  # il campo db deve essere booleano e dire lo stesso del checksum del dump
+  if [[ "$(jq -r 'if (.db | type) == "boolean" then (if .db then "yes" else "no" end) else "?" end' <<<"$m")" != "$FB_DB" ]]; then
+    FB_ERR="la copia è parziale o incoerente: il manifest non è d'accordo con se stesso sul database"
+    return 1
+  fi
   if [[ "$FB_TYPE" == static && "$FB_DB" == yes ]] || [[ "$FB_TYPE" == wordpress && "$FB_DB" == no ]]; then
     FB_ERR="la copia non è coerente: tipo $FB_TYPE e database $FB_DB"
     return 1
@@ -606,6 +616,11 @@ site_fb_load() {
       FB_ERR="percorso di login WordPress non valido nella copia"
       return 1
     }
+    FB_PREFIX="$(jq -r '.table_prefix // "wp_"' <<<"$m")"
+    [[ "$FB_PREFIX" =~ ^[A-Za-z0-9_]{1,20}$ ]] || {
+      FB_ERR="prefisso delle tabelle non valido nella copia"
+      return 1
+    }
   fi
 }
 
@@ -614,9 +629,12 @@ site_fb_load() {
 # Redis e un wp-config.php nuovi, con credenziali nuove. Quello dell'archivio non si
 # ripristina mai.
 site_fb_wpcfg() {
-  local redis_pw
+  local redis_pw prefix
   redis_pw="$(rand_secret 48)"
-  site_wp_config_write "$1" "$2" "$redis_pw" || return 1
+  # il prefisso viene dal manifest (scritto da bk_archive leggendo il wp-config.php vivo),
+  # già controllato in site_fb_load e ricontrollato da site_wp_config_write
+  prefix="$(site_reg_get "$1" '.from_backup.table_prefix // "wp_"')"
+  site_wp_config_write "$1" "$2" "$redis_pw" "$prefix" || return 1
   site_redis_user_add "$1" "$redis_pw"
 }
 
@@ -630,7 +648,8 @@ site_fb_restore() {
   name="$(site_reg_get "$d" .from_backup.name)"
   mode=files
   [[ "$(site_reg_get "$d" .db)" != true ]] || mode=all
-  out="$("$VPS_BACKUP_SELF" _restore "$src" "$d" "$name" "$mode" 2>>"$VPS_LOG")" || rc=$?
+  # Se un giro è in corso si aspetta (al massimo 10 minuti) invece di fallire subito.
+  out="$(BK_LOCK_WAIT=600 "$VPS_BACKUP_SELF" _restore "$src" "$d" "$name" "$mode" 9>&- 2>>"$VPS_LOG")" || rc=$?
   ((rc == 0)) && return 0
   err="$(jq -r '.error // empty' <<<"$out" 2>/dev/null | head -n1 || true)"
   st="${BK_STATE:-$VPS_OPT/backup/state.json}"
@@ -645,11 +664,13 @@ site_fb_restore() {
 # vhost e il cron. Si fa anche se il ripristino è fallito: il sito esiste, e un
 # ripristino fatto dopo dalla pagina Backup deve trovarlo già a posto.
 site_fb_settle() {
-  local d="$1"
+  local d="$1" restored="${2:-yes}"
   [[ "$(site_reg_get "$d" .type)" == wordpress ]] || return 0
   site_reg_update "$d" '.wordpress = {login_path: $p, admin_user: null, cloudflare_plugin: false, installed_at: $at}' \
     --arg p "$(site_reg_get "$d" '.from_backup.login_path // ""')" --arg at "$(date -Iseconds)" || return 1
   site_vhost_add "$d" normal || return 1
+  # il cron lo mette solo un ripristino riuscito (se fallito, lo mette il primo che riesce)
+  [[ "$restored" == yes ]] || return 0
   site_wp_cron_add "$d"
 }
 
@@ -657,10 +678,24 @@ site_fb_settle() {
 # non riesce il sito resta com'è (attivo e vuoto, come uno appena creato): il motivo va
 # in job.error e il ripristino si può rifare dalla pagina Backup.
 site_job_restore() {
-  local d="$1" msg
-  if ! site_step "$d" create restore site_fb_restore "$d"; then
+  local d="$1" msg rc=0
+  # Il ripristino può durare ore: il lock globale dei lavori (fd 9) si lascia, così gli
+  # altri lavori di vps-site non aspettano. Niente si rompe: site_refresh_locked vede
+  # l'unità di questo lavoro ancora attiva, delete rifiuta un sito in "creating",
+  # site_validate_new rifiuta lo stesso dominio, e _restore prende i suoi lock (globale
+  # di backup e del sito). Si riprende alla fine, per vhost e registro.
+  exec 9>&-
+  site_step "$d" create restore site_fb_restore "$d" || rc=$?
+  exec 9>"$SITES_LOCK"
+  if ! flock -w "${SITES_LOCK_WAIT:-600}" 9; then
+    exec 9>&-
+    site_reg_update "$d" '.state = "active"'
+    site_job "$d" create restore "la coda dei lavori è ferma da troppo tempo: il sito è stato creato, controlla lo stato del ripristino dalla pagina Backup"
+    return 1
+  fi
+  if ((rc != 0)); then
     msg="$(site_error_text restore)"
-    (site_fb_settle "$d") || log "ATTENZIONE: configurazione WordPress di $d non completata"
+    (site_fb_settle "$d" no) || log "ATTENZIONE: configurazione WordPress di $d non completata"
     site_reg_update "$d" '.state = "active"'
     site_job "$d" create restore "sito creato ma vuoto, ripristino non riuscito: $msg"
     return 1
@@ -681,8 +716,8 @@ site_undo_create() {
     case "${!i}" in
       # I file di WordPress e wp-config.php spariscono con la radice (passo user);
       # restano fuori solo cron e utente Redis. Chi ha tentato plugins ha
-      # tentato anche wp: basta il caso wp.
-      wp)
+      # tentato anche wp: basta il caso wp. Lo stesso per wpcfg (creazione da copia).
+      wp | wpcfg)
         (site_wp_cron_remove "$d")
         (site_redis_user_remove "$d") || log "ATTENZIONE: utente Redis di $d non rimosso"
         ;;

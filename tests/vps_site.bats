@@ -601,3 +601,128 @@ wp_opts=(--title "Il blog" --admin-user gestore --admin-email io@miosito.it --lo
   [ -s "$BATS_TEST_TMPDIR/job.lock" ]
   [ "$(sort -u "$BATS_TEST_TMPDIR/job.lock")" = preso ]
 }
+
+# --- create --from-backup: fix round 1 ----------------------------------------
+
+@test "create --from-backup: una copia parziale (solo database o solo file) non basta a ricreare il sito" {
+  FB_PARTS=db fb_archive blog.miosito.it php no yes
+  run --separate-stderr bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --from-backup '$FB_ARC'"
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"copia parziale: non basta a ricreare il sito"* ]]
+  FB_PARTS=files fb_archive dyn.miosito.it php no no
+  vs create dyn.miosito.it --from-backup "$FB_ARC"
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"copia parziale"* ]]
+  run site_reg_exists blog.miosito.it
+  [ "$status" -eq 1 ]
+  run site_reg_exists dyn.miosito.it
+  [ "$status" -eq 1 ]
+}
+
+@test "create --from-backup: il campo db del manifest deve essere booleano e d'accordo col checksum" {
+  fb_archive blog.miosito.it php no yes
+  local w="$BATS_TEST_TMPDIR/m" f
+  mkdir -p "$w"
+  tar -xzf "$BK_BACKUPS/$FB_ARC" -C "$w"
+  for f in '.db = false' '.db = "true"' 'del(.db)' '.parts = "files"'; do
+    mkdir -p "$w/n"
+    cp "$w/files.tar.gz" "$w/db.sql.gz" "$w/n/"
+    jq "$f" "$w/manifest.json" >"$w/n/manifest.json"
+    tar -czf "$BK_BACKUPS/sites/blog.miosito.it-20261002-040000.tar.gz" -C "$w/n" manifest.json files.tar.gz db.sql.gz
+    run --separate-stderr bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --from-backup sites/blog.miosito.it-20261002-040000.tar.gz"
+    [ "$status" -eq 1 ] || { echo "accettato: $f"; false; }
+    rm -rf "$w/n"
+  done
+}
+
+@test "create --from-backup: con un giro o un ripristino in corso (lock globale di vps-backup) si rifiuta subito" {
+  fb_archive blog.miosito.it php no no
+  exec {gl}>>"$BK_LOCK_DIR/vps-backup.lock"
+  flock -n "$gl"
+  vs create blog.miosito.it --from-backup "$FB_ARC"
+  exec {gl}>&-
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"backup o ripristino in corso, riprova più tardi"* ]]
+  run site_reg_exists blog.miosito.it
+  [ "$status" -eq 1 ]
+  vs create blog.miosito.it --from-backup "$FB_ARC"
+  [ "$status" -eq 0 ]
+}
+
+@test "_run create da archivio: il lock globale dei lavori è libero durante il ripristino e ripreso dopo" {
+  fb_backup_stub
+  fb_archive fisso.miosito.it static no no
+  vs create fisso.miosito.it --from-backup "$FB_ARC"
+  run bash "$T" _run create fisso.miosito.it
+  [ "$status" -eq 0 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/fb.joblock")" = libero ]
+  [ "$(site_reg_get fisso.miosito.it .state)" = active ]
+  # un lavoro (di un altro sito) può prendere il lock mentre si ripristina: lo prova lo stub
+  grep -q 'BK_LOCK_WAIT' "$REPO_ROOT/lib/sites.sh"
+}
+
+@test "_run create da archivio: il ripristino aspetta un giro in corso (BK_LOCK_WAIT) invece di fallire subito" {
+  fb_backup_stub
+  # shellcheck disable=SC2016
+  make_stub vps-backup-fb 'echo "wait=${BK_LOCK_WAIT:-} fd9=$(ls -l /proc/self/fd 2>/dev/null | grep -c vps-site.lock)" >>"$BATS_TEST_TMPDIR/fb.env"; echo "{\"ok\":true,\"finished\":true,\"restore_ok\":true}"'
+  fb_archive fisso.miosito.it static no no
+  vs create fisso.miosito.it --from-backup "$FB_ARC"
+  run bash "$T" _run create fisso.miosito.it
+  [ "$status" -eq 0 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/fb.env")" = "wait=600 fd9=0" ]
+}
+
+@test "_run create da archivio WordPress: il prefisso delle tabelle viene dal manifest" {
+  fb_backup_stub
+  FB_PREFIX=xy7_ fb_archive blog.miosito.it wordpress no yes accesso-7k2f
+  [ "$(bk_manifest "$BK_BACKUPS/$FB_ARC" | jq -r .table_prefix)" = xy7_ ]
+  run --separate-stderr bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --from-backup '$FB_ARC'"
+  [ "$status" -eq 0 ]
+  [ "$(site_reg_get blog.miosito.it .from_backup.table_prefix)" = xy7_ ]
+  run bash "$T" _run create blog.miosito.it
+  [ "$status" -eq 0 ]
+  grep -qx "\$table_prefix = 'xy7_';" "$SITES_WWW/blog.miosito.it/wp-config.php"
+}
+
+@test "_run create da archivio WordPress: prefisso predefinito wp_ se il manifest non ne ha uno valido" {
+  fb_backup_stub
+  fb_archive blog.miosito.it wordpress no yes accesso-7k2f
+  local w="$BATS_TEST_TMPDIR/m"
+  mkdir -p "$w/n"
+  tar -xzf "$BK_BACKUPS/$FB_ARC" -C "$w"
+  cp "$w/files.tar.gz" "$w/db.sql.gz" "$w/n/"
+  jq '.table_prefix = "wp_; DROP"' "$w/manifest.json" >"$w/n/manifest.json"
+  tar -czf "$BK_BACKUPS/sites/blog.miosito.it-20261002-040000.tar.gz" -C "$w/n" manifest.json files.tar.gz db.sql.gz
+  run --separate-stderr bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --from-backup sites/blog.miosito.it-20261002-040000.tar.gz"
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"prefisso"* ]]
+  # senza il campo: wp_
+  jq 'del(.table_prefix)' "$w/manifest.json" >"$w/n/manifest.json"
+  tar -czf "$BK_BACKUPS/sites/blog.miosito.it-20261002-040000.tar.gz" -C "$w/n" manifest.json files.tar.gz db.sql.gz
+  run --separate-stderr bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --from-backup sites/blog.miosito.it-20261002-040000.tar.gz"
+  [ "$status" -eq 0 ]
+  run bash "$T" _run create blog.miosito.it
+  grep -qx "\$table_prefix = 'wp_';" "$SITES_WWW/blog.miosito.it/wp-config.php"
+}
+
+@test "_run create da archivio WordPress: ripristino fallito, niente cron; un ripristino riuscito dopo lo installa" {
+  fb_backup_stub
+  export FB_STUB_RC=1
+  fb_archive blog.miosito.it wordpress no yes accesso-7k2f
+  run --separate-stderr bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --from-backup '$FB_ARC'"
+  run bash "$T" _run create blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ ! -e "$CRON_D/vps-site-site_blog_miosito_it" ]
+  [ -f "$NGINX_CONF_D/blog.miosito.it.conf" ]
+}
+
+@test "site_undo_create: il passo wpcfg toglie l'utente Redis e il cron come wp" {
+  nuovo() { site_reg_new "$1" "$2" "$3" "$4"; }
+  nuovo blog.miosito.it wordpress no yes
+  printf 'user default off\nuser site_blog_miosito_it on #abc ~site_blog_miosito_it:* +@all\n' >"$REDIS_ACL_FILE"
+  site_wp_cron_add blog.miosito.it
+  [ -f "$CRON_D/vps-site-site_blog_miosito_it" ]
+  site_undo_create blog.miosito.it wpcfg
+  run ! grep -q '^user site_blog_miosito_it ' "$REDIS_ACL_FILE"
+  [ ! -e "$CRON_D/vps-site-site_blog_miosito_it" ]
+}
