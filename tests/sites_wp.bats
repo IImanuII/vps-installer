@@ -656,3 +656,18 @@ exec "$BATS_TEST_TMPDIR/bin/wp.orig" "$@"'
   [ "$(stat -c %a "$REDIS_ACL_FILE")" = 640 ]
   [ -z "$(find "$BATS_TEST_TMPDIR" "$BATS_TEST_TMPDIR/redis" -maxdepth 1 -name '.vps-acl.*')" ]
 }
+
+@test "site_wp_config_write: prefisso delle tabelle scritto se valido, rifiutato altrimenti" {
+  site_reg_new blog.miosito.it wordpress no yes
+  mkdir -p "$SITES_WWW/blog.miosito.it"
+  site_wp_config_write blog.miosito.it 'Password-db-1234567890' 'Password-redis-1234567890' xy7_
+  grep -qx "\$table_prefix = 'xy7_';" "$SITES_WWW/blog.miosito.it/wp-config.php"
+  site_wp_config_write blog.miosito.it 'Password-db-1234567890' 'Password-redis-1234567890'
+  grep -qx "\$table_prefix = 'wp_';" "$SITES_WWW/blog.miosito.it/wp-config.php"
+  local p
+  for p in "a;b" "wp'_" "" "$(printf 'a%.0s' {1..21})" 'a b'; do
+    run site_wp_config_write blog.miosito.it 'Password-db-1234567890' 'Password-redis-1234567890' "$p"
+    if [ -n "$p" ]; then [ "$status" -eq 1 ] || { echo "accettato: $p"; false; }; fi
+  done
+  grep -qx "\$table_prefix = 'wp_';" "$SITES_WWW/blog.miosito.it/wp-config.php"
+}

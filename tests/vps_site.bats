@@ -429,6 +429,9 @@ wp_opts=(--title "Il blog" --admin-user gestore --admin-email io@miosito.it --lo
   vs create fisso.miosito.it --from-backup "$FB_ARC"
   [ "$status" -eq 0 ]
   [ "$(site_reg_get fisso.miosito.it '"\(.type) \(.www) \(.db)"')" = "static false false" ]
+  # la creazione da copia di prima deve essere finita, altrimenti la seconda si rifiuta
+  fb_backup_stub
+  bash "$T" _run create fisso.miosito.it
   fb_archive dyn.miosito.it php no no
   vs create dyn.miosito.it --from-backup "$FB_ARC"
   [ "$status" -eq 0 ]
@@ -702,6 +705,7 @@ wp_opts=(--title "Il blog" --admin-user gestore --admin-email io@miosito.it --lo
   run --separate-stderr bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --from-backup sites/blog.miosito.it-20261002-040000.tar.gz"
   [ "$status" -eq 0 ]
   run bash "$T" _run create blog.miosito.it
+  [ "$status" -eq 0 ]
   grep -qx "\$table_prefix = 'wp_';" "$SITES_WWW/blog.miosito.it/wp-config.php"
 }
 
@@ -725,4 +729,47 @@ wp_opts=(--title "Il blog" --admin-user gestore --admin-email io@miosito.it --lo
   site_undo_create blog.miosito.it wpcfg
   run ! grep -q '^user site_blog_miosito_it ' "$REDIS_ACL_FILE"
   [ ! -e "$CRON_D/vps-site-site_blog_miosito_it" ]
+}
+
+@test "create --from-backup: con un'altra creazione da copia in corso si rifiuta" {
+  fb_archive blog.miosito.it php no no
+  fb_archive altro.miosito.it php no no
+  vs create altro.miosito.it --from-backup "$FB_ARC"
+  [ "$status" -eq 0 ]
+  fb_archive blog.miosito.it php no no
+  vs create blog.miosito.it --from-backup "sites/blog.miosito.it-20261001-040000.tar.gz"
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"un'altra creazione da copia"* ]]
+}
+
+@test "_run create da archivio: il lock globale dei lavori è ripreso dopo il ripristino, anche con la coda occupata, e il motivo del fallimento resta" {
+  export FB_STUB_RC=1 FB_STUB_ERR="motivo-vero"
+  # shellcheck disable=SC2016
+  make_stub vps-backup-fb 'echo "{\"ok\":false,\"error\":\"motivo-vero\"}"; sleep 1; exit 1'
+  export VPS_BACKUP_SELF="$BATS_TEST_TMPDIR/bin/vps-backup-fb"
+  export SITES_LOCK_WAIT=1
+  fb_archive fisso.miosito.it static no no
+  vs create fisso.miosito.it --from-backup "$FB_ARC"
+  # un altro lavoro prende il lock mentre il ripristino gira e lo tiene più a lungo dell'attesa vecchia
+  { sleep 0.3; flock "$SITES_LOCK" sleep 2; } &
+  pid=$!
+  run bash "$T" _run create fisso.miosito.it
+  [ "$status" -eq 1 ]
+  [[ "$(site_reg_get fisso.miosito.it .job.error)" == *"motivo-vero"* ]]
+  [ "$(site_reg_get fisso.miosito.it .state)" = active ]
+  wait "$pid"
+  pid=""
+}
+
+@test "_run create da archivio WordPress: dopo il ripristino il lock dei lavori è ripreso (vhost e cron girano sotto lock)" {
+  fb_backup_stub
+  fb_archive blog.miosito.it wordpress no yes accesso-7k2f
+  run --separate-stderr bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --from-backup '$FB_ARC'"
+  # shellcheck disable=SC2016
+  make_stub nginx 'if flock -n "$SITES_LOCK" true; then echo libero >>"$BATS_TEST_TMPDIR/nginx.lock"; else echo preso >>"$BATS_TEST_TMPDIR/nginx.lock"; fi; exit 0'
+  run bash "$T" _run create blog.miosito.it
+  [ "$status" -eq 0 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/fb.joblock")" = libero ]
+  [ "$(tail -n1 "$BATS_TEST_TMPDIR/nginx.lock")" = preso ]
+  [ "$(sort -u "$BATS_TEST_TMPDIR/nginx.lock")" = preso ]
 }

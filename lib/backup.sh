@@ -1314,8 +1314,12 @@ bk_list_local_json() {
           first="$(tar -tzf "$p" 2>/dev/null | head -n1 || true)"
           if [[ "$first" == manifest.json ]]; then
             restorable=true
+            # manifest illeggibile (oltre 64 KiB, non JSON) o parts sconosciuto: non ripristinabile
             parts="$(bk_manifest "$p" | jq -r '.parts // "all"' 2>/dev/null || true)"
-            [[ "$parts" =~ ^(all|db|files)$ ]] || parts=all
+            if [[ ! "$parts" =~ ^(all|db|files)$ ]]; then
+              restorable=false
+              parts=""
+            fi
           fi
         fi
       fi

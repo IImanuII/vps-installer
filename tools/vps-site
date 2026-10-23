@@ -237,6 +237,13 @@ case "$cmd" in
       site_fb_load "$d" "$fb" || json_err "$FB_ERR"
       # il ripristino in coda al lavoro non può partire con un giro o un ripristino in corso
       if bk_global_busy || bk_unit_alive; then json_err "backup o ripristino in corso, riprova più tardi"; fi
+      # un'altra creazione da copia già al lavoro (il suo ripristino può non aver ancora preso il lock)
+      for f in "$SITES_DIR"/*.json; do
+        [[ -f "$f" ]] || continue
+        if [[ "$(jq -r '(.state == "creating" and .from_backup != null)' "$f" 2>/dev/null)" == true ]]; then
+          json_err "un'altra creazione da copia è in corso, riprova più tardi"
+        fi
+      done
       type="$FB_TYPE" www="$FB_WWW" db="$FB_DB"
     else
       [[ "$type" == static || "$type" == php || "$type" == wordpress ]] || json_err "tipo non valido: usa --type static, php o wordpress"

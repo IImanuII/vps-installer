@@ -2767,3 +2767,20 @@ exec /usr/bin/mv "$@"'
   grep -q 'BK_LOCK_WAIT' "$REPO_ROOT/tools/vps-backup"
   grep -q 'BK_CF_PURGE BK_LOCK_WAIT' "$REPO_ROOT/tools/vps-backup"
 }
+
+@test "list-local: manifest illeggibile (oltre 64 KiB) o parts sconosciuto = restorable false, parts null" {
+  rs_env
+  mk_site a.it no
+  mkdir -p "$BK_BACKUPS/sites" "$BATS_TEST_TMPDIR/w"
+  local w="$BATS_TEST_TMPDIR/w"
+  echo f >"$w/files.tar.gz"
+  jq -n --arg pad "$(head -c 70000 /dev/zero | tr '\0' x)" '{domain:"a.it", pad:$pad}' >"$w/manifest.json"
+  tar -czf "$BK_BACKUPS/sites/a.it-20261001-0400.tar.gz" -C "$w" manifest.json files.tar.gz
+  jq -n '{domain:"a.it", parts:"strano"}' >"$w/manifest.json"
+  tar -czf "$BK_BACKUPS/sites/a.it-20261002-0400.tar.gz" -C "$w" manifest.json files.tar.gz
+  echo 'non json' >"$w/manifest.json"
+  tar -czf "$BK_BACKUPS/sites/a.it-20261003-0400.tar.gz" -C "$w" manifest.json files.tar.gz
+  bk_tool list-local
+  [ "$status" -eq 0 ]
+  jq -e '[.items[] | select(.restorable == false and .parts == null)] | length == 3' <<<"$output"
+}

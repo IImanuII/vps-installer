@@ -686,13 +686,10 @@ site_job_restore() {
   # di backup e del sito). Si riprende alla fine, per vhost e registro.
   exec 9>&-
   site_step "$d" create restore site_fb_restore "$d" || rc=$?
+  # Senza scadenza: i passi dopo il ripristino (vhost, registro, cron) devono girare
+  # sempre, e un motivo di fallimento del ripristino non si sovrascrive.
   exec 9>"$SITES_LOCK"
-  if ! flock -w "${SITES_LOCK_WAIT:-600}" 9; then
-    exec 9>&-
-    site_reg_update "$d" '.state = "active"'
-    site_job "$d" create restore "la coda dei lavori è ferma da troppo tempo: il sito è stato creato, controlla lo stato del ripristino dalla pagina Backup"
-    return 1
-  fi
+  flock 9
   if ((rc != 0)); then
     msg="$(site_error_text restore)"
     (site_fb_settle "$d" no) || log "ATTENZIONE: configurazione WordPress di $d non completata"
