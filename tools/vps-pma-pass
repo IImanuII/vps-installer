@@ -9,7 +9,7 @@ if [[ -n "${SUDO_USER:-}" ]]; then
   VPS_TEMPLATES=$VPS_OPT/templates
   VPS_LOG=/var/log/vps-tools.log
   unset MSMTPRC_LINK HTPASSWD_PMA ALIASES_FILE PMA_DIR NGINX_SNIPPETS CF_API CF_IPS_URL PMA_BASE_URL \
-    PD_LOCK VPS_PMA_LOCK_WAIT VPS_NO_CHOWN
+    PD_LOCK VPS_PMA_LOCK_WAIT VPS_NO_CHOWN PD_AS_PANEL PD_PANEL_OWNER PMA_AS_PANEL_PATH
   [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
   chmod 640 "$VPS_LOG"
 fi
@@ -23,7 +23,12 @@ tool_init
 
 mode="${1:-}"
 [[ "$mode" == set || "$mode" == dbadmin ]] || json_err "uso: vps-pma-pass set|dbadmin (password da stdin)"
-pass="$(read_stdin_limited 257)"
+# Letto in esadecimale: $(...) butterebbe via i byte NUL in silenzio, e la password
+# messa in MariaDB sarebbe diversa da quella digitata.
+hex="$(read_stdin_limited 257 | od -An -v -tx1 | tr -d ' \n')"
+if printf '%s' "$hex" | fold -w2 | grep -qx 00; then json_err "password non valida: minimo 12 caratteri, una riga"; fi
+# shellcheck disable=SC2059  # il formato contiene solo escape hex generati qui generati qui
+pass="$(printf "$(printf '%s' "$hex" | sed 's/../\\x&/g')")"
 pass="${pass%$'\n'}"
 (($(printf '%s' "$pass" | wc -c) <= 72)) || json_err "password troppo lunga: massimo 72 caratteri"
 valid_password "$pass" || json_err "password non valida: minimo 12 caratteri, una riga"

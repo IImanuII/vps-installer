@@ -1,6 +1,8 @@
 # shellcheck shell=bash
 # Generazione di SQL idempotente per MariaDB.
 
+# sql_quote STR — letterale SQL tra apici. Raddoppia \ e ': giusto col sql_mode di
+# default di MariaDB; con NO_BACKSLASH_ESCAPES il raddoppio del \ sarebbe sbagliato.
 sql_quote() {
   # shellcheck disable=SC1003
   local s="$1" q="'" b='\'

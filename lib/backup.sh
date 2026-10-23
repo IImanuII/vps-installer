@@ -1044,7 +1044,8 @@ _bk_panel() {
   # Come pd_db_name, ma senza pd_load (che termina il processo se il manifest manca).
   penv="$(jq -r '.panel.path // empty' "$(manifest_path)" 2>/dev/null || true)"
   db=""
-  if [[ -n "$penv" ]]; then db="$(env_get "$penv/config/.env" DB_NAME 2>/dev/null || true)"; fi
+  # .env è di panel: un link verso un altro file di root non va seguito.
+  if [[ -n "$penv" && ! -L "$penv/config" && ! -L "$penv/config/.env" ]]; then db="$(env_get "$penv/config/.env" DB_NAME 2>/dev/null || true)"; fi
   if ! sql_ident_ok "$db"; then
     _BK_PANEL="$(jq -nc '{ok: false, error: "database del pannello non trovato", file: null}')"
     return 1

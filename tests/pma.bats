@@ -205,13 +205,17 @@ pma_web_env() {
 
 dbadmin_setup() {
   export VPS_LIB="$REPO_ROOT/lib" PD_LOCK="$BATS_TEST_TMPDIR/panel.lock"
+  # niente utente panel nei test: stesso utente, ma la scrittura passa da _pma_as_panel
+  export PD_AS_PANEL=0 PD_PANEL_OWNER="$(id -un):$(id -gn)" PMA_AS_PANEL_PATH="$BATS_TEST_TMPDIR/bin:/usr/bin:/bin"
   PROOT="$BATS_TEST_TMPDIR/www/panel.example.com"
   mkdir -p "$PROOT/config"
   jq -n --arg p "$PROOT" '{admin_user:"manu", panel:{domain:"panel.example.com", path:$p}}' >"$VPS_OPT/manifest.json"
   printf '# conf\nDB_HOST=localhost\nDB_PASS=segretoDB\nDBADMIN_USER=panel_dbadmin\nDBADMIN_PASS=vecchiaPassword1\nAPP_KEY=abc=def\n' >"$PROOT/config/.env"
   chmod 640 "$PROOT/config/.env"
   # il vero mariadb: SQL su stdin; qui si registrano stdin e argomenti
-  make_stub mariadb 'cat >>"$BATS_TEST_TMPDIR/mariadb.stdin"; printf "%s\n" "$*" >>"$BATS_TEST_TMPDIR/mariadb.args"; exit "${STUB_MARIADB_RC:-0}"'
+  make_stub mariadb 'in="$(cat)"; printf "%s
+" "$in" >>"$BATS_TEST_TMPDIR/mariadb.stdin"; [ -z "${STUB_MARIADB_ECHO:-}" ] || { printf "ERROR 1064 (42000) at line 1: near %s
+" "$in" >&2; }; printf "%s\n" "$*" >>"$BATS_TEST_TMPDIR/mariadb.args"; exit "${STUB_MARIADB_RC:-0}"'
   DBA="$REPO_ROOT/tools/vps-pma-pass"
 }
 
@@ -323,4 +327,112 @@ dbadmin_setup() {
 @test "sudoers: vps-pma-pass (set e dbadmin) è consentito al pannello" {
   grep -q '^panel ALL=(root) NOPASSWD:.*/opt/vps/bin/vps-pma-pass\(,\|$\)' "$REPO_ROOT/templates/sudoers-vps-panel"
   run ! grep -q 'vps-pma-pass [a-z]' "$REPO_ROOT/templates/sudoers-vps-panel"
+}
+
+@test "vps-pma-pass dbadmin: la scrittura passa da runuser come panel, mai da root, password non negli argomenti" {
+  dbadmin_setup
+  unset PD_AS_PANEL
+  make_stub runuser 'printf "%s\n" "$*" >>"$BATS_TEST_TMPDIR/runuser.args"; [ "$1" = -u ] && [ "$3" = -- ] || exit 9; shift 3; exec "$@"'
+  run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '^-u panel -- env -i ' "$BATS_TEST_TMPDIR/runuser.args")" = 2 ]
+  run ! grep -q 'NuovaPassword' "$BATS_TEST_TMPDIR/runuser.args"
+  [ "$(env_get "$PROOT/config/.env" DBADMIN_PASS)" = 'NuovaPassword-123' ]
+}
+
+@test "vps-pma-pass dbadmin: config sostituita da un link, rifiutato e bersaglio intatto" {
+  dbadmin_setup
+  mkdir "$BATS_TEST_TMPDIR/bersaglio"
+  printf 'DBADMIN_PASS=x\n' >"$BATS_TEST_TMPDIR/bersaglio/.env"
+  mv "$PROOT/config" "$PROOT/config.vera"
+  ln -s "$BATS_TEST_TMPDIR/bersaglio" "$PROOT/config"
+  run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/bersaglio/.env")" = 'DBADMIN_PASS=x' ]
+  [ "$(ls -A "$BATS_TEST_TMPDIR/bersaglio" | wc -l)" = 1 ]
+  [ ! -e "$BATS_TEST_TMPDIR/mariadb.stdin" ]
+}
+
+@test "vps-pma-pass dbadmin: .env link o di un altro proprietario rifiutato" {
+  dbadmin_setup
+  mv "$PROOT/config/.env" "$BATS_TEST_TMPDIR/vero.env"
+  ln -s "$BATS_TEST_TMPDIR/vero.env" "$PROOT/config/.env"
+  run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  rm "$PROOT/config/.env"; cp "$BATS_TEST_TMPDIR/vero.env" "$PROOT/config/.env"
+  PD_PANEL_OWNER=altro:altro run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  [ ! -e "$BATS_TEST_TMPDIR/mariadb.stdin" ]
+}
+
+@test "vps-pma-pass dbadmin: proprietario del .env conservato e nessun temporaneo" {
+  dbadmin_setup
+  before="$(stat -c %U:%G "$PROOT/config/.env")"
+  run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  [ "$status" -eq 0 ]
+  [ "$(stat -c %U:%G "$PROOT/config/.env")" = "$before" ]
+  [ "$(ls -A "$PROOT/config" | wc -l)" = 1 ]
+}
+
+@test "vps-pma-pass dbadmin: scrittura fallita non lascia temporanei e riporta MariaDB indietro" {
+  dbadmin_setup
+  make_stub chmod 'exit 1'
+  run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  [ "$(ls -A "$PROOT/config" | wc -l)" = 1 ]
+  [ "$(grep -c '^ALTER USER' "$BATS_TEST_TMPDIR/mariadb.stdin")" = 2 ]
+  [ "$(env_get "$PROOT/config/.env" DBADMIN_PASS)" = vecchiaPassword1 ]
+}
+
+@test "vps-pma-pass dbadmin: mv fallito non lascia il temporaneo con i segreti" {
+  dbadmin_setup
+  make_stub mv 'exit 1'
+  run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  [ "$(ls -A "$PROOT/config" | wc -l)" = 1 ]
+}
+
+@test "vps-pma-pass dbadmin: scrittura fallita senza vecchio valore, messaggio di attenzione" {
+  dbadmin_setup
+  printf 'DB_HOST=localhost\n' >"$PROOT/config/.env"
+  make_stub mv 'exit 1'
+  run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  [[ "${lines[-1]}" == *ATTENZIONE* ]]
+  [ "$(grep -c '^ALTER USER' "$BATS_TEST_TMPDIR/mariadb.stdin")" = 1 ]
+}
+
+@test "vps-pma-pass dbadmin: se mariadb ripete l'SQL negli errori, nel log solo il codice" {
+  dbadmin_setup
+  pw="a'b\c-Password12"
+  STUB_MARIADB_ECHO=1 STUB_MARIADB_RC=1 PW="$pw" run bash -c "printf '%s' \"\$PW\" | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  run ! grep -qF "b\c-Password" "$VPS_LOG"
+  run ! grep -qF "Password12" "$VPS_LOG"
+  grep -q 'ERROR 1064' "$VPS_LOG"
+  [[ "$output" != *Password12* ]]
+}
+
+@test "vps-pma-pass: byte NUL nella password rifiutato (set e dbadmin)" {
+  dbadmin_setup
+  run bash -c "printf 'abcdefghijkl\0mno' | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  [[ "${lines[-1]}" == *"non valida"* ]]
+  run bash -c "printf 'abcdefghijkl\0mno' | bash '$DBA' set"
+  [ "$status" -eq 1 ]
+  [ ! -e "$BATS_TEST_TMPDIR/mariadb.stdin" ]
+}
+
+
+@test "backup del pannello: .env che è un link non viene seguito" {
+  dbadmin_setup
+  mv "$PROOT/config/.env" "$BATS_TEST_TMPDIR/altro.env"
+  printf 'DB_NAME=panel\n' >"$BATS_TEST_TMPDIR/altro.env"
+  ln -s "$BATS_TEST_TMPDIR/altro.env" "$PROOT/config/.env"
+  BK_RUN_DIR="$BATS_TEST_TMPDIR"
+  _bk_progress() { :; }
+  make_stub mariadb-dump 'echo chiamato >>"$BATS_TEST_TMPDIR/dump.called"'
+  run _bk_panel x
+  [ "$status" -ne 0 ]
+  [ ! -e "$BATS_TEST_TMPDIR/dump.called" ]
 }
