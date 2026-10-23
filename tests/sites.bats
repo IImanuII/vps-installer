@@ -636,6 +636,20 @@ nuovo() { # DOMINIO TIPO WWW DB [PASSWORD]
   [ "$output" = 0 ]
 }
 
+@test "site_user_add: index.html scritto da root prima di cedere public/ al sito" {
+  site_reg_new blog.miosito.it php no no
+  export VPS_NO_CHOWN=0
+  # shellcheck disable=SC2016
+  make_stub chown 'echo "chown $*" >>"$CALLS"'
+  site_user_add blog.miosito.it
+  r="$SITES_WWW/blog.miosito.it"
+  f="$(grep -n "^chown site_blog_miosito_it:site_blog_miosito_it $r/public/\.tmp\." "$CALLS" | head -1 | cut -d: -f1)"
+  d="$(grep -n "^chown site_blog_miosito_it:site_blog_miosito_it .*$r/public" "$CALLS" | grep -v '\.tmp\.' | head -1 | cut -d: -f1)"
+  [ -n "$f" ] && [ -n "$d" ]
+  [ "$f" -lt "$d" ]
+  [ -f "$r/public/index.html" ]
+}
+
 @test "site_db_add: db.env di root, gruppo del sito" {
   site_reg_new blog.miosito.it php no yes
   mkdir -p "$SITES_WWW/blog.miosito.it"

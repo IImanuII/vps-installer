@@ -264,14 +264,16 @@ site_user_add() {
   install -d -m 2750 "$root" "$root/logs" || return 1
   own "root:$slug" "$root" "$root/logs" || return 1
   install -d -m 2770 "$root/logs/php" "$root/public" "$root/tmp" || return 1
-  own "$slug:$slug" "$root/logs/php" "$root/public" "$root/tmp" || return 1
   setfacl -m u:www-data:x "$root" || return 1
   setfacl -m u:www-data:rX -m d:u:www-data:rX "$root/public" || return 1
   # I file creati da PHP restano modificabili dall'admin e viceversa.
   setfacl -m d:g::rwX "$root/public" "$root/tmp" || return 1
+  # Il segnaposto lo scrive root finché public/ è ancora di root: ceduta al sito,
+  # un file temporaneo di root lì dentro si potrebbe scambiare con un link.
   # shellcheck disable=SC2016
   SITE_DOMAIN="$d" envsubst '${SITE_DOMAIN}' <"$VPS_TEMPLATES/site-placeholder.html.tmpl" \
-    | write_file "$root/public/index.html" 664 "$slug:$slug"
+    | write_file "$root/public/index.html" 664 "$slug:$slug" || return 1
+  own "$slug:$slug" "$root/logs/php" "$root/public" "$root/tmp"
 }
 
 # site_user_remove DOMINIO — utente, gruppo e radice; ciò che manca già si salta.
