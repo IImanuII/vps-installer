@@ -15,6 +15,8 @@ src="$(cd "$(dirname "$0")/../.." && pwd)"
 work="$(mktemp -d /tmp/backup-auth-e2e.XXXXXX)"
 chmod 755 "$work"
 made_rclone=
+made_ipt=
+fw_chain=
 mock=
 
 fail() {
@@ -27,14 +29,21 @@ cleanup() {
   set +e
   /usr/bin/systemctl stop vps-backup-auth.service >/dev/null 2>&1
   [[ -z "$mock" ]] || kill "$mock" 2>/dev/null
+  if [[ -n "$fw_chain" ]]; then
+    iptables -D OUTPUT -j ufw-before-output 2>/dev/null
+    iptables -F ufw-before-output 2>/dev/null
+    iptables -X ufw-before-output 2>/dev/null
+  fi
+  [[ -z "$made_ipt" ]] || DEBIAN_FRONTEND=noninteractive apt-get purge -y -q iptables >/dev/null 2>&1
   [[ -z "$made_rclone" ]] || DEBIAN_FRONTEND=noninteractive apt-get purge -y -q rclone >/dev/null 2>&1
   rm -rf "$work"
 }
 trap cleanup EXIT
 
-for p in rclone curl jq perl; do
-  command -v "$p" >/dev/null 2>&1 && continue
+for p in rclone curl jq perl iptables util-linux; do
+  dpkg -s "$p" >/dev/null 2>&1 && continue
   [[ "$p" != rclone ]] || made_rclone=1
+  [[ "$p" != iptables ]] || made_ipt=1
   DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$p" >/dev/null
 done
 ss -ltn | grep -q ':53682 ' && fail "la porta 53682 è già in uso"
@@ -71,10 +80,31 @@ printf 'RCLONE_DRIVE_TOKEN_URL=http://127.0.0.1:53901/token\n' >"$work/extra.env
 unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND
 export VPS_OPT="$work/opt" VPS_LIB="$src/lib" VPS_LOG="$work/tools.log" VPS_TEMPLATES="$src/templates"
 export BK_DIR="$work/opt/backup" BK_LOCK_DIR="$work/locks" SYSTEMD_DIR="$work/systemd"
+export BK_AUTH_RCLONE=/usr/bin/rclone BK_UFW_DIR="$work/ufw"
 export BK_RCLONE="$work/rclone-w --config $work/opt/secrets/rclone.conf" BK_AUTH_EXTRA="$work/extra.env"
-mkdir -p "$VPS_OPT/secrets" "$BK_LOCK_DIR" "$SYSTEMD_DIR"
+mkdir -p "$VPS_OPT/secrets" "$BK_LOCK_DIR" "$SYSTEMD_DIR" "$BK_UFW_DIR"
 : >"$VPS_LOG"
 vb() { bash "$src/tools/vps-backup" "$@"; }
+
+echo "== firewall: regola generata da bk_firewall_install, controllata e applicata davvero con iptables"
+printf '*filter
+:ufw-before-output - [0:0]
+-A ufw-before-output -o lo -j ACCEPT
+COMMIT
+' >"$BK_UFW_DIR/before.rules"
+printf '*filter
+:ufw6-before-output - [0:0]
+-A ufw6-before-output -o lo -j ACCEPT
+COMMIT
+' >"$BK_UFW_DIR/before6.rules"
+# shellcheck disable=SC1090
+(for l in "$src"/lib/*.sh; do source "$l"; done; bk_firewall_install) || fail "bk_firewall_install"
+grep -q -- '--dport 53682 -m owner ! --uid-owner 0 -j REJECT' "$BK_UFW_DIR/before.rules" || fail "regola v4 assente"
+grep -q -- 'ufw6-before-output 1' "$BK_UFW_DIR/before6.rules" || fail "regola v6 assente"
+iptables-restore --test <"$BK_UFW_DIR/before.rules" || fail "iptables-restore non accetta before.rules"
+iptables-restore -n <"$BK_UFW_DIR/before.rules" || fail "iptables-restore"
+fw_chain=1
+iptables -I OUTPUT 1 -j ufw-before-output
 
 echo "== auth-start con client id e secret propri"
 res="$(printf 'e2e-id.apps.googleusercontent.com\nE2E-SECRET-xyz\n' | vb auth-start)" || fail "auth-start: $res"
@@ -90,10 +120,21 @@ ss -ltn | grep ':53682 ' | grep -q '127.0.0.1:53682' || fail "listener non su 12
 vb status | jq -e '.auth.pending == true and (.auth.expires | test("Z$"))' >/dev/null || fail "status auth"
 [[ "$(stat -c %a "$BK_DIR/auth")" == 700 ]] || fail "permessi della cartella"
 [[ "$(stat -c %a "$BK_DIR/auth/env")" == 600 ]] || fail "permessi di env"
-if pgrep -f -e "[E]2E-SECRET|[e]2e-id.apps" >/dev/null; then fail "client id/secret negli argomenti di un processo"; fi
+if pgrep -f "[E]2E-SECRET|[e]2e-id.apps" >/dev/null; then fail "client id/secret negli argomenti di un processo"; fi
 if systemctl show vps-backup-auth.service -p Environment -p ExecStart | grep -F E2E-SECRET >/dev/null; then fail "secret nelle proprietà dell'unità"; fi
 systemctl show vps-backup-auth.service -p RuntimeMaxUSec | grep -q '15min' || fail "RuntimeMaxSec: $(systemctl show vps-backup-auth.service -p RuntimeMaxUSec)"
 state="$(jq -r .state "$BK_DIR/auth/meta.json")"
+mainpid="$(systemctl show -p MainPID --value vps-backup-auth.service)"
+[[ "$(ps -o user= -p "$mainpid")" != root ]] || fail "rclone gira come root: DynamicUser non attivo"
+echo "   rclone gira come: $(ps -o user= -p "$mainpid")"
+[[ "$(readlink -f "/proc/$mainpid/exe")" == /usr/bin/rclone ]] || fail "exe di rclone: $(readlink -f "/proc/$mainpid/exe")"
+
+echo "== solo root può connettersi alla porta (firewall), root passa"
+curl -s -o /dev/null --max-time 5 "http://127.0.0.1:53682/auth?state=$state" || fail "root non riesce a connettersi (non dovrebbe esser bloccato)"
+if setpriv --reuid=nobody --regid=nogroup --clear-groups curl -s -o /dev/null --max-time 5 "http://127.0.0.1:53682/?state=FALSO&code=x"; then
+  fail "un utente non root riesce a connettersi alla porta 53682"
+fi
+systemctl is-active --quiet vps-backup-auth.service || fail "l'unità è morta per un tentativo bloccato"
 
 echo "== indirizzi sbagliati: rifiutati, l'autorizzazione resta"
 for u in "http://127.0.0.1:53682/?state=ALTRO&code=abc" "http://evil:53682/?state=$state&code=abc" "http://127.0.0.1:53682/?state=$state"; do
@@ -135,7 +176,7 @@ jq -e '.ok == false and (.error | test("negato"))' <<<"$res" >/dev/null || fail 
 [[ ! -e "$BK_DIR/auth" ]] || fail "cartella rimasta dopo access_denied"
 systemctl is-active --quiet vps-backup-auth.service && fail "unità attiva dopo access_denied"
 
-echo "== state sbagliato mandato direttamente al listener: rclone si ferma, auth-finish dice di ricominciare"
+echo "== state sbagliato mandato da root al listener: rclone si ferma, auth-finish dice di ricominciare"
 vb auth-start </dev/null >/dev/null || fail "auth-start 4"
 state="$(jq -r .state "$BK_DIR/auth/meta.json")"
 curl -s -o /dev/null "http://127.0.0.1:53682/?state=FALSO&code=x" || true
@@ -144,5 +185,13 @@ vb status | jq -e '.auth.pending == false' >/dev/null || fail "status dopo lo st
 res="$(printf 'http://127.0.0.1:53682/?state=%s&code=abc\n' "$state" | vb auth-finish)" && fail "auth-finish dopo rclone morto"
 jq -e '.ok == false and (.error | test("ricomincia"))' <<<"$res" >/dev/null || fail "messaggio: $res"
 [[ ! -e "$BK_DIR/auth" ]] || fail "cartella rimasta"
+
+echo "== porta occupata da un altro processo: auth-start rifiuta"
+(perl -MIO::Socket::INET -e '$s=IO::Socket::INET->new(LocalAddr=>"127.0.0.1",LocalPort=>53682,Listen=>1,ReuseAddr=>1) or die; sleep 20' &)
+sleep 1
+res="$(vb auth-start </dev/null)" && fail "auth-start con la porta occupata"
+jq -e '.ok == false and (.error | test("occupata da un altro processo"))' <<<"$res" >/dev/null || fail "messaggio: $res"
+[[ ! -e "$BK_DIR/auth" ]] || fail "cartella rimasta"
+pkill -f 'LocalPort=>53682' || true
 
 echo "E2E BACKUP AUTH OK"

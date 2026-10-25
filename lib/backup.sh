@@ -611,6 +611,7 @@ bk_drive_json() {
 # bk_status_json — risposta di `vps-backup status`.
 bk_status_json() {
   local cfg state='{}' drive=null conn=false interrupted running=0 ijob
+  bk_auth_prune
   # Prima si guarda se un giro è vivo (lock o unità systemd), poi si legge lo stato:
   # un giro che parte o finisce nel frattempo non può essere dichiarato interrotto.
   if bk_global_busy || bk_unit_alive; then running=1; fi
@@ -708,14 +709,14 @@ bk_connect() {
   read -ra cmd <<<"$BK_RCLONE"
   # Ogni chiamata ha un tetto di tempo: il pannello aspetta il comando intero per un
   # tempo preciso (3 chiamate x BK_CONNECT_TIMEOUT, con 25 s restano ~75 s).
-  out="$(timeout "$BK_CONNECT_TIMEOUT" "${cmd[@]}" mkdir "gdrive:$folder" 2>&1 </dev/null)" || rc=$?
+  out="$(_bk_nolock timeout -k 5 "$BK_CONNECT_TIMEOUT" "${cmd[@]}" mkdir "gdrive:$folder" 2>&1 </dev/null)" || rc=$?
   if ((rc == 0)); then
-    out="$(printf 'plancia' | timeout "$BK_CONNECT_TIMEOUT" "${cmd[@]}" rcat "gdrive:$folder/.plancia-test" 2>&1)" || rc=$?
+    out="$(printf 'plancia' | _bk_nolock timeout -k 5 "$BK_CONNECT_TIMEOUT" "${cmd[@]}" rcat "gdrive:$folder/.plancia-test" 2>&1)" || rc=$?
   fi
   if ((rc == 0)); then
-    out="$(timeout "$BK_CONNECT_TIMEOUT" "${cmd[@]}" deletefile "gdrive:$folder/.plancia-test" 2>&1 </dev/null)" || rc=$?
+    out="$(_bk_nolock timeout -k 5 "$BK_CONNECT_TIMEOUT" "${cmd[@]}" deletefile "gdrive:$folder/.plancia-test" 2>&1 </dev/null)" || rc=$?
   fi
-  if ((rc == 124)); then out="tempo scaduto, Drive non risponde"; fi
+  if ((rc == 124 || rc == 137)); then out="tempo scaduto, Drive non risponde"; fi
   if ((rc != 0)); then
     # Il collegamento non è valido: torna il file di prima, o nessun file.
     BK_ERR="Google Drive non ha accettato il collegamento: $(bk_clean_msg "$out" "$tok" "$at" "$rt" "$sec")"
@@ -1179,6 +1180,7 @@ bk_run_all() {
   find "$BK_BACKUPS/tmp" -mindepth 1 -maxdepth 1 -name 'bk.run.*' -exec rm -rf -- {} + 2>/dev/null || true
   find "$BK_BACKUPS/tmp" -mindepth 1 -maxdepth 1 -name 'bk.*' -mmin +1440 -exec rm -rf -- {} + 2>/dev/null || true
   bk_prune_restore
+  bk_auth_prune
   BK_RUN_DIR="$(mktemp -d "$BK_BACKUPS/tmp/bk.run.XXXXXX")"
   # shellcheck disable=SC2064
   trap "rm -rf -- '$BK_RUN_DIR'" EXIT
@@ -1384,14 +1386,13 @@ bk_list_remote_json() {
   # Il pannello aspetta una risposta entro un tempo preciso: ogni chiamata ha il suo
   # tetto e, finito il budget, si restituisce quanto raccolto con "partial":true.
   SECONDS=0
-  _BK_RCQ_TO="$BK_RC_TIMEOUT"
-  trap '_BK_RCQ_TO=""' RETURN
+  local _BK_RCQ_TO="$BK_RC_TIMEOUT"
   if ! _bk_rcq lsjson --dirs-only "gdrive:$folder"; then
     if ((_BK_RCRC == 3)); then
       printf '{"ok":true,"sites":[],"panel":[]}\n'
       return 0
     fi
-    if ((_BK_RCRC == 124)); then _BK_ERRMSG="tempo scaduto"; fi
+    if ((_BK_RCRC == 124 || _BK_RCRC == 137)); then _BK_ERRMSG="tempo scaduto"; fi
     BK_ERR="Google Drive non risponde: $_BK_ERRMSG"
     return 1
   fi
@@ -1420,7 +1421,7 @@ bk_list_remote_json() {
     fi
     if ((left < BK_RC_TIMEOUT)); then _BK_RCQ_TO="$left"; else _BK_RCQ_TO="$BK_RC_TIMEOUT"; fi
     if ! _bk_ls_files "$folder/$d"; then
-      if ((_BK_RCRC == 124)); then
+      if ((_BK_RCRC == 124 || _BK_RCRC == 137)); then
         partial=true
         break
       fi
@@ -2231,15 +2232,25 @@ bk_restore_run() {
 # rclone (l'uscita contiene il token: non va al journal, ma in un file che si cancella
 # appena letto) e meta.json con lo state e la scadenza.
 #
-# Nota: il listener di rclone ascolta su 127.0.0.1, quindi un utente di un sito può
-# connettersi alla porta; non conosce lo state (sta solo in file di root e nell'indirizzo
-# di Google dato al pannello), e rclone con uno state sbagliato si ferma: al peggio può
-# far annullare l'autorizzazione (si ricomincia), non può farne accettare una sua.
+# Sicurezza della porta 53682 (loopback, quindi raggiungibile anche da un utente di un
+# sito; PHP-FPM non ha hidepid): rclone con uno state sbagliato si ferma e la porta
+# resterebbe libera per chi arriva dopo, che vedrebbe state e code che noi (root)
+# gli consegniamo. Tre difese: (1) il firewall (bk_firewall_install) vieta a ogni
+# uid diverso da 0 di CONNETTERSI alla porta, quindi nessuno può nemmeno mandare lo state
+# sbagliato; (2) prima di ogni curl si verifica che l'unico listener sia il processo
+# principale della nostra unità (bk_auth_port_ok); (3) l'indirizzo di Google restituito si
+# controlla parametro per parametro (bk_auth_check_location). Resta possibile, a chi è
+# già su questa macchina, solo far fallire il collegamento (si ricomincia).
 
 : "${BK_AUTH_DIR:=$BK_DIR/auth}"
 : "${BK_AUTH_START_WAIT:=20}" "${BK_AUTH_FINISH_WAIT:=30}"
 BK_AUTH_UNIT=vps-backup-auth
 BK_AUTH_PORT=53682
+# Client id che rclone 1.60 (pacchetto Debian 13 e Ubuntu 24.04) mette nell'indirizzo di
+# Google quando non se ne dà uno proprio (verificato con rclone vero).
+BK_AUTH_DEFAULT_CLIENT_ID=202264815644.apps.googleusercontent.com
+: "${BK_PROC_DIR:=/proc}"
+: "${BK_UFW_DIR:=/etc/ufw}"
 BK_AUTH_FD=""
 export BK_AUTH_URL="" BK_AUTH_EXPIRES=""
 _BK_AU_CODE=""
@@ -2248,16 +2259,105 @@ _BK_PCT=""
 # bk_auth_lock — lock che serializza auth-start/finish/cancel (senza toccare quello
 # globale dei giri); resta tenuto fino a fine processo, _bk_nolock lo toglie ai figli.
 bk_auth_lock() {
-  local f fd
+  local f fd wait="${1:-5}"
   f="$BK_LOCK_DIR/vps-backup-auth.lock"
   # shellcheck disable=SC2261
   { exec {fd}>>"$f"; } 2>/dev/null || return 1
   chmod 600 "$f" 2>/dev/null || true
-  if ! flock -w 5 "$fd"; then
+  if ((wait > 0)); then
+    flock -w "$wait" "$fd" || {
+      exec {fd}>&-
+      return 1
+    }
+  elif ! flock -n "$fd"; then
     exec {fd}>&-
     return 1
   fi
   BK_AUTH_FD="$fd"
+}
+
+bk_auth_unlock() {
+  if [[ -n "$BK_AUTH_FD" ]]; then
+    exec {BK_AUTH_FD}>&-
+    BK_AUTH_FD=""
+  fi
+}
+
+# bk_auth_prune — toglie gli avanzi di un'autorizzazione mai chiusa (il client secret resta
+# in auth/env): cartella più vecchia di 900 s e senza un meta.json ancora valido. Senza
+# attendere il lock: se un'altra operazione è in corso non si tocca nulla.
+bk_auth_prune() {
+  local m="$BK_AUTH_DIR/meta.json" exp=""
+  [[ -d "$BK_AUTH_DIR" ]] || return 0
+  [[ -z "$(find "$BK_AUTH_DIR" -maxdepth 0 -mmin +15 2>/dev/null)" ]] && return 0
+  if [[ -f "$m" ]]; then exp="$(jq -r '.expires | if type == "number" then floor else empty end' "$m" 2>/dev/null || true)"; fi
+  if [[ "$exp" =~ ^[0-9]{1,12}$ ]] && ((exp > $(date +%s))); then return 0; fi
+  if bk_auth_lock 0; then
+    bk_auth_clean
+    bk_auth_unlock
+  fi
+  return 0
+}
+
+# bk_auth_port_ok BIN — 0 solo se l'unico listener su 127.0.0.1:53682 è il processo
+# principale della nostra unità e il suo eseguibile è BIN. Se no, BK_ERR e 1 (e nel
+# registro il pid e l'utente di chi occupa la porta, mai state o code).
+bk_auth_port_ok() {
+  local bin="$1" out lines pid main exe who
+  BK_ERR="la porta $BK_AUTH_PORT è occupata da un altro processo: collegamento annullato"
+  out="$(_bk_nolock ss -Hltnp "sport = :$BK_AUTH_PORT" 2>/dev/null || true)"
+  lines="$(grep -c . <<<"$out" || true)"
+  [[ "$lines" == 1 ]] || { log "vps-backup: porta $BK_AUTH_PORT: $lines listener invece di 1"; return 1; }
+  # shellcheck disable=SC2086
+  set -- $out
+  [[ "${4:-}" == "127.0.0.1:$BK_AUTH_PORT" ]] || { log "vps-backup: porta $BK_AUTH_PORT in ascolto su ${4:-?}, non su 127.0.0.1"; return 1; }
+  if [[ "$out" =~ pid=([0-9]+) ]]; then pid="${BASH_REMATCH[1]}"; else return 1; fi
+  [[ "$(grep -o 'pid=' <<<"$out" | grep -c .)" == 1 ]] || return 1
+  main="$(_bk_nolock systemctl show -p MainPID --value "$BK_AUTH_UNIT.service" 2>/dev/null || true)"
+  if [[ ! "$main" =~ ^[1-9][0-9]*$ || "$main" != "$pid" ]]; then
+    who="$(ps -o user= -p "$pid" 2>/dev/null | head -n1 || true)"
+    log "vps-backup: la porta $BK_AUTH_PORT è del processo $pid (utente ${who:-?}), non dell'unità (pid ${main:-?})"
+    return 1
+  fi
+  exe="$(readlink -f "$BK_PROC_DIR/$pid/exe" 2>/dev/null || true)"
+  if [[ -z "$exe" || "$exe" != "$(readlink -f "$bin" 2>/dev/null)" ]]; then
+    log "vps-backup: il processo $pid sulla porta $BK_AUTH_PORT non è rclone (${exe:-?})"
+    return 1
+  fi
+  BK_ERR=""
+}
+
+# bk_auth_check_location LOCATION STATE CLIENT_ID — l'indirizzo di Google dato da rclone
+# deve essere esattamente quello atteso: stesso client, redirect locale, solo lo scope
+# drive.file, lo state nostro; nessun altro parametro.
+bk_auth_check_location() {
+  local loc="$1" state="$2" cid="$3" q part key val dec
+  local -a parts
+  local -A seen=()
+  [[ "$loc" =~ ^https://accounts\.google\.com/o/oauth2/auth\?([A-Za-z0-9_.~%=\&+-]+)$ ]] || return 1
+  q="${BASH_REMATCH[1]}"
+  IFS='&' read -ra parts <<<"$q"
+  for part in "${parts[@]}"; do
+    [[ "$part" == *=* ]] || return 1
+    key="${part%%=*}"
+    val="${part#*=}"
+    [[ -z "${seen[$key]:-}" ]] || return 1
+    seen[$key]=1
+    [[ "$val" =~ ^([A-Za-z0-9_.~-]|%[0-9A-Fa-f]{2})+$ ]] || return 1
+    [[ "$val" != *%00* ]] || return 1
+    val="${val//%/\\x}"
+    printf -v dec '%b' "$val"
+    case "$key" in
+      access_type) [[ "$dec" == offline ]] || return 1 ;;
+      client_id) [[ "$dec" == "$cid" ]] || return 1 ;;
+      redirect_uri) [[ "$dec" == "http://127.0.0.1:$BK_AUTH_PORT/" ]] || return 1 ;;
+      response_type) [[ "$dec" == code ]] || return 1 ;;
+      scope) [[ "$dec" == "https://www.googleapis.com/auth/drive.file" ]] || return 1 ;;
+      state) [[ "$dec" == "$state" ]] || return 1 ;;
+      *) return 1 ;;
+    esac
+  done
+  ((${#seen[@]} == 6)) || return 1
 }
 
 # bk_auth_alive — 0 se l'unità di rclone sta girando.
@@ -2313,13 +2413,19 @@ bk_auth_start() {
     return 1
   fi
   read -ra cmd <<<"$BK_RCLONE"
-  bin="$(command -v "${cmd[0]}" 2>/dev/null || true)"
+  bin="$(command -v "${BK_AUTH_RCLONE:-${cmd[0]}}" 2>/dev/null || true)"
   if [[ "$bin" != /* ]]; then
     BK_ERR="rclone non è installato su questa VPS"
     return 1
   fi
   # Una nuova richiesta sostituisce la vecchia (stessa porta, stessa unità).
   bk_auth_clean
+  # La porta deve essere libera: se la tiene un altro, non si parte nemmeno.
+  if [[ -n "$(_bk_nolock ss -Hltn "sport = :$BK_AUTH_PORT" 2>/dev/null || true)" ]]; then
+    log "vps-backup: la porta $BK_AUTH_PORT è già occupata prima dell'avvio"
+    BK_ERR="la porta $BK_AUTH_PORT è occupata da un altro processo: collegamento annullato"
+    return 1
+  fi
   if ! install -d -m 700 "$BK_DIR" "$dir"; then
     BK_ERR="cartella delle autorizzazioni non disponibile"
     return 1
@@ -2340,7 +2446,9 @@ bk_auth_start() {
   # Uscita e errori in file: così il token (stdout di rclone) non passa dal journal.
   if ! _bk_nolock systemd-run --unit "$BK_AUTH_UNIT" --collect --quiet -p RuntimeMaxSec=900 \
     -p EnvironmentFile="$dir/env" -p StandardInput=null -p "StandardOutput=file:$dir/out" -p "StandardError=file:$dir/err" \
-    -p Nice=10 "$bin" authorize drive --auth-no-open-browser >>"$VPS_LOG" 2>&1 </dev/null; then
+    -p Nice=10 -p DynamicUser=yes -p NoNewPrivileges=yes -p ProtectSystem=strict -p ProtectHome=yes -p PrivateTmp=yes \
+    -p CapabilityBoundingSet= -p "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX" -p TimeoutStopSec=5 \
+    "$bin" authorize drive --auth-no-open-browser >>"$VPS_LOG" 2>&1 </dev/null; then
     bk_auth_clean
     BK_ERR="impossibile avviare l'autorizzazione (dettagli in $VPS_LOG)"
     return 1
@@ -2365,9 +2473,16 @@ bk_auth_start() {
     bk_auth_clean
     return 1
   fi
-  if ! (umask 077; jq -nc --arg s "$state" --argjson e "$exp" '{state: $s, expires: $e}' >"$dir/meta.json"); then
+  if ! (umask 077; jq -nc --arg s "$state" --argjson e "$exp" --arg b "$bin" '{state: $s, expires: $e, bin: $b}' >"$dir/meta.json"); then
     bk_auth_clean
     BK_ERR="stato dell'autorizzazione non scritto"
+    return 1
+  fi
+  # Prima di parlare alla porta si controlla chi ci sta in ascolto, e che l'unità viva.
+  if ! bk_auth_alive || ! bk_auth_port_ok "$bin"; then
+    t="$BK_ERR"
+    bk_auth_clean
+    BK_ERR="${t:-la porta $BK_AUTH_PORT è occupata da un altro processo: collegamento annullato}"
     return 1
   fi
   # L'indirizzo locale risponde con un redirect a Google: lo si legge senza seguirlo.
@@ -2385,9 +2500,9 @@ bk_auth_start() {
       fi
     done <<<"$hdr"
   fi
-  if [[ ! "$loc" =~ ^https://accounts\.google\.com/[!-~]*$ ]]; then
+  if ! bk_auth_check_location "$loc" "$state" "${id:-$BK_AUTH_DEFAULT_CLIENT_ID}"; then
     bk_auth_clean
-    BK_ERR="rclone non ha dato un indirizzo di Google valido: riprova"
+    BK_ERR="rclone non ha dato l'indirizzo di Google atteso: collegamento annullato"
     return 1
   fi
   BK_AUTH_URL="$loc"
@@ -2488,7 +2603,8 @@ bk_auth_parse() {
 # Tempi: curl al massimo 10 s, attesa del token BK_AUTH_FINISH_WAIT (30), poi le tre
 # chiamate di bk_connect (BK_CONNECT_TIMEOUT ciascuna): dentro i ~110 s del pannello.
 _bk_auth_consume() {
-  local state="$1" code="$_BK_AU_CODE" dir="$BK_AUTH_DIR" enc k n got=0 tok="" dati line inblk=0 id="" sec="" rc=0
+  local state="$1" code="$_BK_AU_CODE" dir="$BK_AUTH_DIR" enc k n got=0 tok="" dati line inblk=0 id="" sec="" rc=0 bin
+  bin="$(jq -r '.bin // ""' "$dir/meta.json" 2>/dev/null || true)"
   enc="${code//\//%2F}"
   if [[ -f "$dir/env" ]]; then
     while IFS= read -r line; do
@@ -2497,6 +2613,11 @@ _bk_auth_consume() {
         RCLONE_DRIVE_CLIENT_SECRET=*) sec="${line#*=}" ;;
       esac
     done <"$dir/env"
+  fi
+  # Il code lo si consegna solo al nostro rclone: ultima verifica di unità e porta.
+  if ! bk_auth_alive || ! bk_auth_port_ok "$bin"; then
+    [[ -n "$BK_ERR" ]] || BK_ERR="la porta $BK_AUTH_PORT è occupata da un altro processo: collegamento annullato"
+    return 1
   fi
   # L'indirizzo (con il code) passa da stdin di curl, mai dagli argomenti.
   printf '%s\n' 'silent' 'fail' 'output = "/dev/null"' 'max-time = 10' 'connect-timeout = 5' 'noproxy = "*"' \
@@ -2579,4 +2700,35 @@ bk_auth_finish() {
   bk_auth_clean
   _BK_AU_CODE=""
   return "$rc"
+}
+
+# bk_firewall_install — regole UFW (before.rules e before6.rules): sulla porta 53682 di
+# loopback può connettersi solo root (uid 0). Così un utente di un sito non può mandare
+# a rclone uno state sbagliato (che lo ferma e libera la porta) né parlare col suo
+# listener. Vale per chi si connette: il curl di root passa, qualunque utente abbia
+# l'unità. Idempotente (blocco con marcatori), si inserisce con -I in testa alla catena
+# prima dell'ACCEPT su lo, e si ricarica ufw solo se qualcosa è cambiato.
+bk_firewall_install() {
+  local f chain tmp changed=0 begin="# vps-backup-auth BEGIN" end="# vps-backup-auth END" rule
+  for f in before.rules before6.rules; do
+    [[ -f "$BK_UFW_DIR/$f" ]] || continue
+    grep -qF "$begin" "$BK_UFW_DIR/$f" && continue
+    chain=ufw-before-output
+    [[ "$f" == before6.rules ]] && chain=ufw6-before-output
+    rule="-I $chain 1 -o lo -p tcp --dport $BK_AUTH_PORT -m owner ! --uid-owner 0 -j REJECT"
+    tmp="$(mktemp "$BK_UFW_DIR/.$f.XXXXXX")" || return 1
+    if ! awk -v b="$begin" -v e="$end" -v r="$rule" '/^COMMIT$/ && !done { print b; print r; print e; done = 1 } { print }' "$BK_UFW_DIR/$f" >"$tmp" \
+      || ! grep -qF "$begin" "$tmp"; then
+      rm -f "$tmp"
+      log "ATTENZIONE: regola della porta $BK_AUTH_PORT non inserita in $f (nessun COMMIT)"
+      return 1
+    fi
+    chmod --reference="$BK_UFW_DIR/$f" "$tmp" 2>/dev/null || chmod 640 "$tmp"
+    mv -f "$tmp" "$BK_UFW_DIR/$f" || { rm -f "$tmp"; return 1; }
+    changed=1
+  done
+  if ((changed)) && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw reload >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: ufw reload non riuscito dopo la regola della porta $BK_AUTH_PORT"
+  fi
+  return 0
 }

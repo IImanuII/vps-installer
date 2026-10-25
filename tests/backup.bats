@@ -2790,7 +2790,8 @@ exec /usr/bin/mv "$@"'
 # ---------------------------------------------------------------------------
 
 AUTH_STATE='Xy_9-abcDEF123456789xyz'
-AUTH_LOC='https://accounts.google.com/o/oauth2/auth?client_id=x&state=Xy_9-abcDEF123456789xyz'
+AUTH_CID='202264815644.apps.googleusercontent.com'
+AUTH_LOC="https://accounts.google.com/o/oauth2/auth?access_type=offline&client_id=$AUTH_CID&redirect_uri=http%3A%2F%2F127.0.0.1%3A53682%2F&response_type=code&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file&state=Xy_9-abcDEF123456789xyz"
 
 # auth_env — ambiente del tool con systemd-run, curl e systemctl finti. systemd-run annota
 # gli argomenti, copia il file d'ambiente dell'unità e "fa partire rclone": scrive nel file
@@ -2800,6 +2801,16 @@ AUTH_LOC='https://accounts.google.com/o/oauth2/auth?client_id=x&state=Xy_9-abcDE
 # di auth.out (come farebbe rclone) e fallisce se esiste curl.fail.
 auth_env() {
   bk_tool_env
+  export BK_PROC_DIR="$BATS_TEST_TMPDIR/proc"
+  mkdir -p "$BK_PROC_DIR/4242" "$BK_PROC_DIR/999"
+  ln -sf "$(command -v rclone)" "$BK_PROC_DIR/4242/exe"
+  ln -sf /bin/sleep "$BK_PROC_DIR/999/exe"
+  # shellcheck disable=SC2016
+  make_stub ss 'T="$BATS_TEST_TMPDIR"
+echo "ss $*" >>"$T/ss.calls"
+if [[ -f "$T/ss.out" ]]; then cat "$T/ss.out"; exit 0; fi
+if [[ -f "$T/auth.active" ]]; then echo "LISTEN 0 4096 127.0.0.1:53682 0.0.0.0:* users:((\"rclone\",pid=4242,fd=7))"; fi
+exit 0'
   # shellcheck disable=SC2016
   make_stub systemctl 'T="$BATS_TEST_TMPDIR"
 echo "$*" >>"$T/systemctl.calls"
@@ -2812,6 +2823,7 @@ if [[ "$1" == is-active ]]; then
   echo inactive; echo inactive; exit 3
 fi
 if [[ "$1" == stop && "$*" == *vps-backup-auth* ]]; then rm -f "$T/auth.active"; exit 0; fi
+if [[ "$1" == show ]]; then cat "$T/mainpid" 2>/dev/null || echo 4242; exit 0; fi
 if [[ -f "$T/fail.$1" ]]; then exit 1; fi
 exit 0'
   # shellcheck disable=SC2016
@@ -2838,7 +2850,8 @@ cat >"$T/curl.stdin"
 ls -l /proc/$$/fd >"$T/curl.fds" 2>/dev/null
 if [[ -f "$T/curl.fail" ]]; then exit 22; fi
 if grep -q "/auth?state=" "$T/curl.stdin"; then
-  loc="https://accounts.google.com/o/oauth2/auth?client_id=x&state=Xy_9-abcDEF123456789xyz"
+  cid="$(sed -n "s/^RCLONE_DRIVE_CLIENT_ID=//p" "$T/auth.env.copy")"
+  loc="https://accounts.google.com/o/oauth2/auth?access_type=offline&client_id=${cid:-202264815644.apps.googleusercontent.com}&redirect_uri=http%3A%2F%2F127.0.0.1%3A53682%2F&response_type=code&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file&state=Xy_9-abcDEF123456789xyz"
   [[ ! -f "$T/auth.location" ]] || loc="$(cat "$T/auth.location")"
   printf "HTTP/1.1 307 Temporary Redirect\r\nContent-Type: text/html\r\nLocation: %s\r\nDate: x\r\n\r\n" "$loc"
   exit 0
@@ -2883,6 +2896,7 @@ AUTH_REDIRECT="http://127.0.0.1:53682/?state=$AUTH_STATE&code=4%2F0AbC_d-e.f~g&s
   [ "$(jq -r .state "$BK_DIR/auth/meta.json")" = "$AUTH_STATE" ]
   # curl: indirizzo locale su stdin, mai negli argomenti
   grep -q "^url = \"http://127.0.0.1:53682/auth?state=$AUTH_STATE\"" "$BATS_TEST_TMPDIR/curl.stdin"
+  [ -e "$BATS_TEST_TMPDIR/curl.calls" ]
   run ! grep -q "$AUTH_STATE" "$BATS_TEST_TMPDIR/curl.calls"
   grep -q 'curl -K -' "$BATS_TEST_TMPDIR/curl.calls"
 }
@@ -2894,8 +2908,10 @@ AUTH_REDIRECT="http://127.0.0.1:53682/?state=$AUTH_STATE&code=4%2F0AbC_d-e.f~g&s
   grep -qxF 'RCLONE_DRIVE_SCOPE=drive.file' "$BATS_TEST_TMPDIR/auth.env.copy"
   grep -qxF 'RCLONE_DRIVE_CLIENT_ID=mio-id.apps.googleusercontent.com' "$BATS_TEST_TMPDIR/auth.env.copy"
   grep -qxF 'RCLONE_DRIVE_CLIENT_SECRET=GOCSPX-abc_DEF-123' "$BATS_TEST_TMPDIR/auth.env.copy"
+  [ -e "$BATS_TEST_TMPDIR/calls" ]
   run ! grep -q 'GOCSPX\|mio-id' "$BATS_TEST_TMPDIR/calls"
   run ! grep -q 'GOCSPX' <<<"$output$stderr"
+  [ -e "$VPS_LOG" ]
   run ! grep -q 'GOCSPX' "$VPS_LOG"
 }
 
@@ -2985,8 +3001,11 @@ exit 0'
   auth_env
   bk_auth auth-start </dev/null
   [ "$status" -eq 0 ]
+  [ -e "$BATS_TEST_TMPDIR/sdrun.fds" ]
   run ! grep -q 'vps-backup.*\.lock' "$BATS_TEST_TMPDIR/sdrun.fds"
+  [ -e "$BATS_TEST_TMPDIR/curl.fds" ]
   run ! grep -q 'vps-backup.*\.lock' "$BATS_TEST_TMPDIR/curl.fds"
+  [ -e "$BATS_TEST_TMPDIR/curl.fds" ]
   run ! grep -q 'vps-backup-auth.*\.lock' "$BATS_TEST_TMPDIR/curl.fds"
   run bk_global_busy
   [ "$status" -ne 0 ]
@@ -3003,6 +3022,7 @@ exit 0'
   jq -e --arg f "Plancia-$(hostname -s)" '.ok == true and .folder == $f' <<<"$output"
   # l'indirizzo chiamato è ricostruito da state e code (la barra obliqua codificata), senza il resto
   grep -qxF "url = \"http://127.0.0.1:53682/?state=$AUTH_STATE&code=4%2F0AbC_d-e.f~g\"" "$BATS_TEST_TMPDIR/curl.stdin"
+  [ -e "$BATS_TEST_TMPDIR/curl.stdin" ]
   run ! grep -q 'scope' "$BATS_TEST_TMPDIR/curl.stdin"
   # argomenti di curl: nessun code, nessun state
   grep -qx 'curl -K -' "$BATS_TEST_TMPDIR/curl.calls"
@@ -3011,11 +3031,17 @@ exit 0'
   grep -qxF 'scope = drive.file' "$c"
   grep -q '"refresh_token":"1//SEGRETO-RINNOVO"' "$c"
   run ! grep -q 'SEGRETO\|0AbC' <<<"$output$stderr"
+  [ -e "$VPS_LOG" ]
   run ! grep -q 'SEGRETO\|0AbC' "$VPS_LOG"
+  [ -e "$BATS_TEST_TMPDIR/calls" ]
+  [ -e "$BATS_TEST_TMPDIR/rclone.calls" ]
+  [ -e "$BATS_TEST_TMPDIR/systemctl.calls" ]
+  [ -e "$BATS_TEST_TMPDIR/curl.calls" ]
   run ! grep -q 'SEGRETO\|0AbC' "$BATS_TEST_TMPDIR/calls" "$BATS_TEST_TMPDIR/rclone.calls" "$BATS_TEST_TMPDIR/systemctl.calls" "$BATS_TEST_TMPDIR/curl.calls"
   # unità fermata, cartella delle autorizzazioni tolta (con il token dentro)
   grep -q 'stop vps-backup-auth' "$BATS_TEST_TMPDIR/systemctl.calls"
   [ ! -e "$BK_DIR/auth" ]
+  [ -e "$BK_DIR" ]
   run ! grep -rl 'SEGRETO' "$BK_DIR"
 }
 
@@ -3181,6 +3207,7 @@ exit 0'
   auth_out_token
   bk_auth auth-finish <<<"$AUTH_REDIRECT"
   [ "$status" -eq 0 ]
+  [ -e "$BATS_TEST_TMPDIR/curl.fds" ]
   run ! grep -q 'vps-backup.*\.lock' "$BATS_TEST_TMPDIR/curl.fds"
 }
 
@@ -3210,6 +3237,7 @@ exit 0'
   [ "$status" -ne 0 ]
   jq -e '.ok == false and (.error | test("invalid_grant"))' <<<"$output"
   run ! grep -q '0AbC' <<<"$output$stderr"
+  [ -e "$VPS_LOG" ]
   run ! grep -q '0AbC' "$VPS_LOG"
   [ ! -e "$BK_DIR/auth" ]
 }
@@ -3400,4 +3428,232 @@ exit 0'
   for v in BK_CONNECT_TIMEOUT BK_RC_TIMEOUT BK_LIST_BUDGET _BK_RCQ_TO; do
     grep -q "$v" "$REPO_ROOT/tools/vps-backup"
   done
+}
+
+# --- fix round 1: porta riservata a root, ascolto verificato, indirizzo di Google controllato ---
+
+PORT_MSG='la porta 53682 è occupata da un altro processo: collegamento annullato'
+
+@test "auth-start: l'unità è indurita (DynamicUser, nessun privilegio, filesystem in sola lettura, solo rete)" {
+  auth_env
+  bk_auth auth-start </dev/null
+  [ "$status" -eq 0 ]
+  c="$BATS_TEST_TMPDIR/calls"
+  local p
+  for p in DynamicUser=yes NoNewPrivileges=yes ProtectSystem=strict ProtectHome=yes PrivateTmp=yes 'CapabilityBoundingSet=' TimeoutStopSec=5; do
+    grep -q -- "-p $p " "$c"
+  done
+  grep -q -- '-p RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX ' "$c"
+}
+
+@test "auth-start: porta già occupata prima dell'avvio = rifiutato senza avviare rclone" {
+  auth_env
+  echo 'LISTEN 0 4096 127.0.0.1:53682 0.0.0.0:* users:(("php-fpm",pid=999,fd=7))' >"$BATS_TEST_TMPDIR/ss.out"
+  bk_auth auth-start </dev/null
+  [ "$status" -ne 0 ]
+  jq -e --arg m "$PORT_MSG" '.ok == false and .error == $m' <<<"$output"
+  [ ! -e "$BATS_TEST_TMPDIR/calls" ]
+  [ ! -e "$BATS_TEST_TMPDIR/curl.calls" ]
+  [ ! -e "$BK_DIR/auth" ]
+}
+
+@test "auth-start: il listener non è il processo dell'unità (altro pid, due listener, 0.0.0.0, eseguibile diverso) = rifiutato, nessun curl, tutto pulito" {
+  auth_env
+  local case_
+  for case_ in \
+    'LISTEN 0 4096 127.0.0.1:53682 0.0.0.0:* users:(("php-fpm",pid=999,fd=7))' \
+    'LISTEN 0 4096 127.0.0.1:53682 0.0.0.0:* users:(("rclone",pid=4242,fd=7))
+LISTEN 0 4096 [::1]:53682 [::]:* users:(("x",pid=999,fd=7))' \
+    'LISTEN 0 4096 0.0.0.0:53682 0.0.0.0:* users:(("rclone",pid=4242,fd=7))' \
+    'LISTEN 0 4096 127.0.0.1:53682 0.0.0.0:* users:(("rclone",pid=4242,fd=7),("x",pid=999,fd=3))' \
+    'LISTEN 0 4096 127.0.0.1:53682 0.0.0.0:*'; do
+    rm -f "$BATS_TEST_TMPDIR/curl.calls" "$BATS_TEST_TMPDIR/ss.out"
+    # il listener "strano" compare solo dopo l'avvio di rclone
+    # shellcheck disable=SC2016
+    make_stub ss 'T="$BATS_TEST_TMPDIR"; if [[ -f "$T/auth.active" ]]; then cat "$T/ss.after"; fi'
+    printf '%s\n' "$case_" >"$BATS_TEST_TMPDIR/ss.after"
+    bk_auth auth-start </dev/null
+    [ "$status" -ne 0 ]
+    jq -e --arg m "$PORT_MSG" '.ok == false and .error == $m' <<<"$output"
+    [ ! -e "$BATS_TEST_TMPDIR/curl.calls" ]
+    [ ! -e "$BK_DIR/auth" ]
+  done
+  # MainPID diverso dal listener
+  auth_env
+  echo 31337 >"$BATS_TEST_TMPDIR/mainpid"
+  bk_auth auth-start </dev/null
+  [ "$status" -ne 0 ]
+  [ ! -e "$BATS_TEST_TMPDIR/curl.calls" ]
+  rm -f "$BATS_TEST_TMPDIR/mainpid"
+  # eseguibile del processo diverso da rclone
+  ln -sf /bin/sleep "$BK_PROC_DIR/4242/exe"
+  bk_auth auth-start </dev/null
+  [ "$status" -ne 0 ]
+  [ ! -e "$BATS_TEST_TMPDIR/curl.calls" ]
+  # il registro dice chi occupava la porta, non lo state
+  grep -q 'porta 53682' "$VPS_LOG"
+  run ! grep -q "$AUTH_STATE" "$VPS_LOG"
+}
+
+@test "auth-finish: se la porta passa a un altro processo il code non viene consegnato, tutto pulito" {
+  auth_env
+  bk_auth auth-start </dev/null
+  [ "$status" -eq 0 ]
+  auth_out_token
+  : >"$BATS_TEST_TMPDIR/curl.calls"
+  echo 'LISTEN 0 4096 127.0.0.1:53682 0.0.0.0:* users:(("php-fpm",pid=999,fd=7))' >"$BATS_TEST_TMPDIR/ss.out"
+  bk_auth auth-finish <<<"$AUTH_REDIRECT"
+  [ "$status" -ne 0 ]
+  jq -e --arg m "$PORT_MSG" '.ok == false and .error == $m' <<<"$output"
+  [ ! -s "$BATS_TEST_TMPDIR/curl.calls" ]
+  [ ! -e "$VPS_OPT/secrets/rclone.conf" ]
+  [ ! -e "$BK_DIR/auth" ]
+  grep -q 'stop vps-backup-auth' "$BATS_TEST_TMPDIR/systemctl.calls"
+}
+
+@test "auth-start: l'indirizzo di Google viene controllato parametro per parametro" {
+  auth_env
+  local base="https://accounts.google.com/o/oauth2/auth?access_type=offline&client_id=$AUTH_CID&redirect_uri=http%3A%2F%2F127.0.0.1%3A53682%2F&response_type=code&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file&state=$AUTH_STATE"
+  local bad
+  for bad in \
+    "${base/$AUTH_CID/evil.apps.googleusercontent.com}" \
+    "${base/127.0.0.1%3A53682/evil.it%3A53682}" \
+    "${base/53682%2F&response_type/53683%2F&response_type}" \
+    "${base/drive.file/drive}" \
+    "${base/auth%2Fdrive.file/auth%2Fdrive.file%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive}" \
+    "${base/state=$AUTH_STATE/state=ALTRO}" \
+    "${base/response_type=code/response_type=token}" \
+    "${base/https:\/\/accounts.google.com/https://accounts.google.com.evil.it}" \
+    "${base/o\/oauth2\/auth/o\/oauth2\/v2\/auth}" \
+    "${base/https:/http:}" \
+    "$base&login_hint=x" \
+    "$base&state=$AUTH_STATE" \
+    "${base/access_type=offline&/}" ; do
+    printf '%s' "$bad" >"$BATS_TEST_TMPDIR/auth.location"
+    bk_auth auth-start </dev/null
+    [ "$status" -ne 0 ] || { echo "accettato: $bad"; false; }
+    jq -e '.ok == false and (has("url") | not)' <<<"$output"
+    [ ! -e "$BK_DIR/auth" ]
+  done
+}
+
+@test "auth-start: con client id proprio l'indirizzo di Google deve usare quello" {
+  auth_env
+  bk_auth auth-start < <(printf 'mio-id.apps.googleusercontent.com\nGOCSPX-abc_DEF-123\n')
+  [ "$status" -eq 0 ]
+  jq -e '.url | contains("client_id=mio-id.apps.googleusercontent.com")' <<<"$output"
+  # un indirizzo con il client di default invece non va bene
+  printf '%s' "$AUTH_LOC" >"$BATS_TEST_TMPDIR/auth.location"
+  bk_auth auth-start < <(printf 'mio-id.apps.googleusercontent.com\nGOCSPX-abc_DEF-123\n')
+  [ "$status" -ne 0 ]
+}
+
+# --- firewall ---
+
+fw_files() {
+  export BK_UFW_DIR="$BATS_TEST_TMPDIR/ufw"
+  mkdir -p "$BK_UFW_DIR"
+  printf '*filter\n:ufw-before-output - [0:0]\n-A ufw-before-output -o lo -j ACCEPT\nCOMMIT\n' >"$BK_UFW_DIR/before.rules"
+  printf '*filter\n:ufw6-before-output - [0:0]\n-A ufw6-before-output -o lo -j ACCEPT\nCOMMIT\n' >"$BK_UFW_DIR/before6.rules"
+  chmod 640 "$BK_UFW_DIR/before.rules" "$BK_UFW_DIR/before6.rules"
+}
+
+@test "bk_firewall_install: solo uid 0 può connettersi alla porta 53682 di loopback, v4 e v6, prima dell'ACCEPT" {
+  fw_files
+  bk_firewall_install
+  grep -qxF -- '-I ufw-before-output 1 -o lo -p tcp --dport 53682 -m owner ! --uid-owner 0 -j REJECT' "$BK_UFW_DIR/before.rules"
+  grep -qxF -- '-I ufw6-before-output 1 -o lo -p tcp --dport 53682 -m owner ! --uid-owner 0 -j REJECT' "$BK_UFW_DIR/before6.rules"
+  # la regola sta prima di COMMIT e il file ha ancora tutto il resto
+  [ "$(tail -n1 "$BK_UFW_DIR/before.rules")" = COMMIT ]
+  grep -qxF -- '-A ufw-before-output -o lo -j ACCEPT' "$BK_UFW_DIR/before.rules"
+  [ "$(stat -c %a "$BK_UFW_DIR/before.rules")" = 640 ]
+}
+
+@test "bk_firewall_install: idempotente, ufw ricaricato solo la prima volta e solo se attivo" {
+  fw_files
+  # shellcheck disable=SC2016
+  make_stub ufw 'echo "ufw $*" >>"$BATS_TEST_TMPDIR/ufw.log"; if [[ "$1" == status ]]; then echo "Status: active"; fi'
+  bk_firewall_install
+  cp "$BK_UFW_DIR/before.rules" "$BATS_TEST_TMPDIR/b1"
+  bk_firewall_install
+  cmp "$BK_UFW_DIR/before.rules" "$BATS_TEST_TMPDIR/b1"
+  [ "$(grep -c -- '--dport 53682' "$BK_UFW_DIR/before.rules")" -eq 1 ]
+  [ "$(grep -c -- '--dport 53682' "$BK_UFW_DIR/before6.rules")" -eq 1 ]
+  [ "$(grep -c 'ufw reload' "$BATS_TEST_TMPDIR/ufw.log")" -eq 1 ]
+}
+
+@test "bk_firewall_install: ufw spento = nessun reload; file assenti = niente da fare; file senza COMMIT = errore e file intatto" {
+  fw_files
+  # shellcheck disable=SC2016
+  make_stub ufw 'echo "ufw $*" >>"$BATS_TEST_TMPDIR/ufw.log"; if [[ "$1" == status ]]; then echo "Status: inactive"; fi'
+  bk_firewall_install
+  run ! grep -q 'ufw reload' "$BATS_TEST_TMPDIR/ufw.log"
+  export BK_UFW_DIR="$BATS_TEST_TMPDIR/nessuno"
+  bk_firewall_install
+  fw_files
+  echo 'senza commit' >"$BK_UFW_DIR/before.rules"
+  run bk_firewall_install
+  [ "$status" -ne 0 ]
+  [ "$(cat "$BK_UFW_DIR/before.rules")" = 'senza commit' ]
+}
+
+@test "opt_backup_files installa la regola del firewall (anche con --tools-only)" {
+  grep -q 'bk_firewall_install' "$REPO_ROOT/lib/opt.sh"
+  # --tools-only passa da opt_system_files, che chiama opt_backup_files
+  grep -q 'opt_backup_files' "$REPO_ROOT/lib/opt.sh"
+}
+
+@test "vps-backup: le variabili del firewall e dei processi non entrano dall'ambiente del chiamante sotto sudo" {
+  local v
+  for v in BK_AUTH_RCLONE BK_PROC_DIR BK_UFW_DIR; do
+    grep -q "$v" "$REPO_ROOT/tools/vps-backup"
+  done
+}
+
+# --- avanzi di auth/ ---
+
+@test "status e _run tolgono gli avanzi di un'autorizzazione vecchia; una recente o valida resta" {
+  auth_env
+  bk_auth auth-start </dev/null
+  # recente: resta anche se scaduta nel meta
+  jq -c '.expires = 1000' "$BK_DIR/auth/meta.json" >"$BK_DIR/auth/m" && mv "$BK_DIR/auth/m" "$BK_DIR/auth/meta.json"
+  bk_auth status
+  [ -d "$BK_DIR/auth" ]
+  # vecchia e scaduta: via
+  touch -d '2 hours ago' "$BK_DIR/auth"
+  bk_auth status
+  [ ! -e "$BK_DIR/auth" ]
+  grep -q 'stop vps-backup-auth' "$BATS_TEST_TMPDIR/systemctl.calls"
+  # vecchia ma ancora valida: resta
+  bk_auth auth-start </dev/null
+  touch -d '2 hours ago' "$BK_DIR/auth"
+  bk_auth status
+  [ -d "$BK_DIR/auth" ]
+  # _run: stessa pulizia
+  grep -q 'bk_auth_prune' <(sed -n '/^bk_run_all()/,/^}/p' "$REPO_ROOT/lib/backup.sh")
+}
+
+# --- connect: nessun lock ereditato da rclone, SIGKILL di scorta ---
+
+@test "connect: rclone non eredita i lock e, se ignora SIGTERM, viene ucciso dopo il tetto" {
+  bk_tool_env
+  export BK_CONNECT_TIMEOUT=1
+  # shellcheck disable=SC2016
+  make_stub rclone 'T="$BATS_TEST_TMPDIR"
+ls -l /proc/$$/fd >>"$T/rclone.fds" 2>/dev/null
+for a in "$@"; do
+  if [[ "$a" == mkdir ]]; then
+    trap "" TERM
+    # un figlio che non muore con SIGTERM: solo SIGKILL al gruppo lo ferma
+    while :; do sleep 1; done
+  fi
+done
+exit 0'
+  SECONDS=0
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -ne 0 ]
+  ((SECONDS < 15))
+  jq -e '.ok == false and (.error | test("tempo scaduto"))' <<<"$output"
+  [ -f "$BATS_TEST_TMPDIR/rclone.fds" ]
+  run ! grep -q 'vps-backup.*\.lock' "$BATS_TEST_TMPDIR/rclone.fds"
 }

@@ -174,6 +174,7 @@ opt_backup_files() {
   if [[ ! -f "$BK_CONFIG" ]]; then
     bk_config_json | write_file "$BK_CONFIG" 600 root:root
   fi
+  bk_firewall_install || log "ATTENZIONE: regola del firewall per la porta di autorizzazione di Drive non installata"
   systemctl daemon-reload >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: systemctl daemon-reload non riuscito"
   if [[ "$(jq -r '.enabled == true' "$BK_CONFIG" 2>/dev/null)" == true && -f "${BK_RCLONE_CONF:-$VPS_OPT/secrets/rclone.conf}" ]]; then
     systemctl enable --now vps-backup.timer >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: timer di vps-backup non abilitato"

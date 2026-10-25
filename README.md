@@ -157,6 +157,9 @@ Il timer `vps-backup.timer` resta spento finché il backup non è attivato da Pl
 avvia `rclone authorize` sulla VPS (solo su 127.0.0.1, 15 minuti), l'utente consente su Google e
 incolla nel pannello l'indirizzo `http://127.0.0.1:53682/?state=…&code=…` che il browser non riesce
 a aprire; `auth-finish` lo controlla, lo ripete in locale e salva il token in `rclone.conf`.
+La porta 53682 di loopback è riservata a root da una regola UFW (`before.rules`/`before6.rules`,
+blocco `vps-backup-auth`), l'unità di rclone gira con `DynamicUser` e restrizioni, e prima di
+ogni chiamata locale si verifica che il listener sia proprio quell'unità.
 Contratto in `docs/PANEL-HANDOFF.md`.
 
 Da sapere:
