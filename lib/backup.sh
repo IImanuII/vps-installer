@@ -93,6 +93,7 @@ _bk_nolock() {
   (
     if [[ -n "${BK_GLOBAL_FD:-}" ]]; then exec {BK_GLOBAL_FD}>&-; fi
     if [[ -n "${BK_SITE_LOCK_FD:-}" ]]; then exec {BK_SITE_LOCK_FD}>&-; fi
+    if [[ -n "${BK_AUTH_FD:-}" ]]; then exec {BK_AUTH_FD}>&-; fi
     exec "$@"
   )
 }
@@ -542,6 +543,8 @@ _bk_verify_in() {
 # Comando rclone (sostituibile nei test). Il file di configurazione è sempre esplicito.
 : "${BK_RCLONE:=rclone --config $BK_RCLONE_CONF}"
 : "${BK_TIME_DEFAULT:=04:00}"
+# Tetti di tempo (secondi) delle chiamate a Drive fatte per conto del pannello.
+: "${BK_CONNECT_TIMEOUT:=25}" "${BK_RC_TIMEOUT:=30}" "${BK_LIST_BUDGET:=100}"
 
 # bk_valid_time HH:MM — 00:00-23:59.
 bk_valid_time() {
@@ -628,10 +631,10 @@ bk_status_json() {
     ijob="$(jq -c '.job' <<<"$state")"
     state="$(jq -c '.job = null' <<<"$state")"
   fi
-  jq -nc --argjson c "$cfg" --argjson s "$state" --argjson d "$drive" --argjson conn "$conn" --argjson i "$interrupted" --argjson ij "$ijob" \
+  jq -nc --argjson c "$cfg" --argjson s "$state" --argjson d "$drive" --argjson conn "$conn" --argjson i "$interrupted" --argjson ij "$ijob" --argjson a "$(bk_auth_json)" \
     '{ok: true, connected: $conn, folder: $c.folder, enabled: $c.enabled, time: $c.time,
       job: ($s.job // null), interrupted: $i, interrupted_job: $ij, last_run: ($s.last_run // null),
-      last_restore: ($s.last_restore // null), drive: $d}'
+      last_restore: ($s.last_restore // null), drive: $d, auth: $a}'
 }
 
 # bk_connect DATI_STDIN — riga 1: token JSON di `rclone authorize`; righe 2-3
@@ -703,13 +706,16 @@ bk_connect() {
   fi
 
   read -ra cmd <<<"$BK_RCLONE"
-  out="$("${cmd[@]}" mkdir "gdrive:$folder" 2>&1 </dev/null)" || rc=$?
+  # Ogni chiamata ha un tetto di tempo: il pannello aspetta il comando intero per un
+  # tempo preciso (3 chiamate x BK_CONNECT_TIMEOUT, con 25 s restano ~75 s).
+  out="$(timeout "$BK_CONNECT_TIMEOUT" "${cmd[@]}" mkdir "gdrive:$folder" 2>&1 </dev/null)" || rc=$?
   if ((rc == 0)); then
-    out="$(printf 'plancia' | "${cmd[@]}" rcat "gdrive:$folder/.plancia-test" 2>&1)" || rc=$?
+    out="$(printf 'plancia' | timeout "$BK_CONNECT_TIMEOUT" "${cmd[@]}" rcat "gdrive:$folder/.plancia-test" 2>&1)" || rc=$?
   fi
   if ((rc == 0)); then
-    out="$("${cmd[@]}" deletefile "gdrive:$folder/.plancia-test" 2>&1 </dev/null)" || rc=$?
+    out="$(timeout "$BK_CONNECT_TIMEOUT" "${cmd[@]}" deletefile "gdrive:$folder/.plancia-test" 2>&1 </dev/null)" || rc=$?
   fi
+  if ((rc == 124)); then out="tempo scaduto, Drive non risponde"; fi
   if ((rc != 0)); then
     # Il collegamento non è valido: torna il file di prima, o nessun file.
     BK_ERR="Google Drive non ha accettato il collegamento: $(bk_clean_msg "$out" "$tok" "$at" "$rt" "$sec")"
@@ -848,7 +854,13 @@ _bk_rcq() {
     ef="$(mktemp)" || return 1
     own=1
   fi
-  _BK_OUT="$(_bk_nolock "${_BK_RC[@]}" "$@" 2>"$ef" </dev/null)" || rc=$?
+  # _BK_RCQ_TO (secondi): tetto di tempo per la singola chiamata (list-remote, dove il
+  # pannello aspetta una risposta entro un tempo preciso); vuoto = nessun tetto.
+  if [[ -n "${_BK_RCQ_TO:-}" ]]; then
+    _BK_OUT="$(_bk_nolock timeout "$_BK_RCQ_TO" "${_BK_RC[@]}" "$@" 2>"$ef" </dev/null)" || rc=$?
+  else
+    _BK_OUT="$(_bk_nolock "${_BK_RC[@]}" "$@" 2>"$ef" </dev/null)" || rc=$?
+  fi
   _BK_ERRMSG=""
   _BK_RCRC="$rc"
   if ((rc != 0)); then _BK_ERRMSG="$(bk_clean_msg "$(cat "$ef" 2>/dev/null || true)")"; fi
@@ -1366,14 +1378,20 @@ _bk_remote_init() {
 # con i soli file dai nomi che crea il giro (gli altri sono di altri e non si mostrano).
 # Una cartella di backup ancora inesistente dà elenchi vuoti.
 bk_list_remote_json() {
-  local folder dirs d tag present re size name TAB=$'\t' tbl="" line
+  local folder dirs d tag present re size name TAB=$'\t' tbl="" line left partial=false
   _bk_remote_init || return 1
   folder="$(jq -r .folder <<<"$(bk_config_json)")"
+  # Il pannello aspetta una risposta entro un tempo preciso: ogni chiamata ha il suo
+  # tetto e, finito il budget, si restituisce quanto raccolto con "partial":true.
+  SECONDS=0
+  _BK_RCQ_TO="$BK_RC_TIMEOUT"
+  trap '_BK_RCQ_TO=""' RETURN
   if ! _bk_rcq lsjson --dirs-only "gdrive:$folder"; then
     if ((_BK_RCRC == 3)); then
       printf '{"ok":true,"sites":[],"panel":[]}\n'
       return 0
     fi
+    if ((_BK_RCRC == 124)); then _BK_ERRMSG="tempo scaduto"; fi
     BK_ERR="Google Drive non risponde: $_BK_ERRMSG"
     return 1
   fi
@@ -1395,7 +1413,17 @@ bk_list_remote_json() {
     else
       continue
     fi
+    left=$((BK_LIST_BUDGET - SECONDS))
+    if ((left < 3)); then
+      partial=true
+      break
+    fi
+    if ((left < BK_RC_TIMEOUT)); then _BK_RCQ_TO="$left"; else _BK_RCQ_TO="$BK_RC_TIMEOUT"; fi
     if ! _bk_ls_files "$folder/$d"; then
+      if ((_BK_RCRC == 124)); then
+        partial=true
+        break
+      fi
       BK_ERR="Google Drive non risponde: $_BK_ERRMSG"
       return 1
     fi
@@ -1407,14 +1435,15 @@ bk_list_remote_json() {
       tbl+="$tag$TAB$d$TAB$present$TAB$d/$name$TAB$size"$'\n'
     done <<<"$_BK_LST"
   done <<<"$dirs"
-  printf '%s' "$tbl" | jq -Rnc '
+  printf '%s' "$tbl" | jq -Rnc --argjson partial "$partial" '
     def mk: {name: .[3], date: (.[3] | capture("-(?<y>[0-9]{4})(?<m>[0-9]{2})(?<d>[0-9]{2})-(?<h>[0-9]{2})(?<i>[0-9]{2})\\.")
                                | "\(.y)-\(.m)-\(.d)T\(.h):\(.i):00"), size: (.[4] | tonumber)};
     [inputs | split("\t")] as $r
     | {ok: true,
        sites: ([$r[] | select(.[0] == "S")] | group_by(.[1])
                | map({domain: .[0][1], present: (.[0][2] == "true"), copies: (sort_by(.[3]) | reverse | map(mk))})),
-       panel: ([$r[] | select(.[0] == "P")] | sort_by(.[3]) | reverse | map(mk))}'
+       panel: ([$r[] | select(.[0] == "P")] | sort_by(.[3]) | reverse | map(mk))}
+    | if $partial then . + {partial: true} else . end'
 }
 
 # bk_remote_fetch NOME DEST — scarica la copia da Drive in DEST (file nuovo). Prima si
@@ -2189,4 +2218,365 @@ bk_restore_run() {
   log "vps-backup: ripristino di $d finito (ok=$ok)"
   jq -nc --argjson ok "$ok" '{ok: true, finished: true, restore_ok: $ok}'
   [[ "$ok" == true ]]
+}
+
+# --- collegamento a Drive senza rclone sul PC (auth-start, auth-finish, auth-cancel) ---
+#
+# La VPS esegue `rclone authorize drive` in un'unità temporanea (127.0.0.1:53682, 15 minuti).
+# L'utente consente su Google, il browser va a http://127.0.0.1:53682/?state=…&code=…
+# (che sul PC non si apre) e incolla quell'indirizzo nel pannello: qui lo si controlla, lo si
+# ricostruisce da state e code e lo si chiama sulla VPS; rclone stampa il token, che va
+# direttamente a bk_connect. Tutto sta in $BK_AUTH_DIR (root 700): file d'ambiente con
+# scope e client id/secret (mai negli argomenti di nessun processo), uscita e errori di
+# rclone (l'uscita contiene il token: non va al journal, ma in un file che si cancella
+# appena letto) e meta.json con lo state e la scadenza.
+#
+# Nota: il listener di rclone ascolta su 127.0.0.1, quindi un utente di un sito può
+# connettersi alla porta; non conosce lo state (sta solo in file di root e nell'indirizzo
+# di Google dato al pannello), e rclone con uno state sbagliato si ferma: al peggio può
+# far annullare l'autorizzazione (si ricomincia), non può farne accettare una sua.
+
+: "${BK_AUTH_DIR:=$BK_DIR/auth}"
+: "${BK_AUTH_START_WAIT:=20}" "${BK_AUTH_FINISH_WAIT:=30}"
+BK_AUTH_UNIT=vps-backup-auth
+BK_AUTH_PORT=53682
+BK_AUTH_FD=""
+export BK_AUTH_URL="" BK_AUTH_EXPIRES=""
+_BK_AU_CODE=""
+_BK_PCT=""
+
+# bk_auth_lock — lock che serializza auth-start/finish/cancel (senza toccare quello
+# globale dei giri); resta tenuto fino a fine processo, _bk_nolock lo toglie ai figli.
+bk_auth_lock() {
+  local f fd
+  f="$BK_LOCK_DIR/vps-backup-auth.lock"
+  # shellcheck disable=SC2261
+  { exec {fd}>>"$f"; } 2>/dev/null || return 1
+  chmod 600 "$f" 2>/dev/null || true
+  if ! flock -w 5 "$fd"; then
+    exec {fd}>&-
+    return 1
+  fi
+  BK_AUTH_FD="$fd"
+}
+
+# bk_auth_alive — 0 se l'unità di rclone sta girando.
+bk_auth_alive() {
+  _bk_nolock systemctl is-active --quiet "$BK_AUTH_UNIT.service" >/dev/null 2>&1
+}
+
+# bk_auth_clean — ferma l'unità e toglie la cartella (token e client secret compresi).
+bk_auth_clean() {
+  _bk_nolock systemctl stop "$BK_AUTH_UNIT.service" >/dev/null 2>&1 || true
+  rm -rf -- "$BK_AUTH_DIR"
+}
+
+_bk_iso() {
+  date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ
+}
+
+# bk_auth_json — {pending, expires} per `status`: aperta se c'è meta.json non scaduto
+# e l'unità gira. Sola lettura.
+bk_auth_json() {
+  local m="$BK_AUTH_DIR/meta.json" exp=""
+  if [[ -f "$m" ]]; then exp="$(jq -r '.expires | if type == "number" then floor else empty end' "$m" 2>/dev/null || true)"; fi
+  if [[ "$exp" =~ ^[0-9]{1,12}$ ]] && ((exp > $(date +%s))) && bk_auth_alive; then
+    jq -nc --arg e "$(_bk_iso "$exp")" '{pending: true, expires: $e}'
+  else
+    printf '{"pending":false,"expires":null}'
+  fi
+}
+
+# _bk_auth_msg FILE [SEGRETO...] — ultima riga utile degli errori di rclone, ripulita.
+_bk_auth_msg() {
+  local f="$1" t=""
+  shift
+  if [[ -f "$f" ]]; then t="$(sed -E 's/^<[0-9]>//' "$f" | tail -n 5)"; fi
+  bk_clean_msg "$t" "$@"
+}
+
+# bk_auth_start DATI — righe 1-2 facoltative (insieme): client id e secret propri.
+# Imposta BK_AUTH_URL (indirizzo di Google) e BK_AUTH_EXPIRES; BK_ERR e 1 se non riesce,
+# senza unità né file lasciati. Senza $(...): le variabili andrebbero perse.
+bk_auth_start() {
+  local -a righe cmd
+  local id sec bin dir="$BK_AUTH_DIR" f state="" k n exp hdr loc line rc=0 t
+  mapfile -t righe < <(printf '%s' "$1")
+  id="${righe[0]:-}" sec="${righe[1]:-}"
+  id="${id%$'\r'}" sec="${sec%$'\r'}"
+  if [[ -n "${righe[2]:-}" ]]; then
+    BK_ERR="dati inattesi dopo client id e secret"
+    return 1
+  fi
+  if [[ -n "$id$sec" && (! "$id" =~ ^[A-Za-z0-9._~-]{1,256}$ || ! "$sec" =~ ^[A-Za-z0-9._~-]{1,256}$) ]]; then
+    BK_ERR="client id e secret vanno indicati insieme e con caratteri validi"
+    return 1
+  fi
+  read -ra cmd <<<"$BK_RCLONE"
+  bin="$(command -v "${cmd[0]}" 2>/dev/null || true)"
+  if [[ "$bin" != /* ]]; then
+    BK_ERR="rclone non è installato su questa VPS"
+    return 1
+  fi
+  # Una nuova richiesta sostituisce la vecchia (stessa porta, stessa unità).
+  bk_auth_clean
+  if ! install -d -m 700 "$BK_DIR" "$dir"; then
+    BK_ERR="cartella delle autorizzazioni non disponibile"
+    return 1
+  fi
+  for f in env out err; do
+    if ! install -m 600 /dev/null "$dir/$f"; then
+      bk_auth_clean
+      BK_ERR="file delle autorizzazioni non creato"
+      return 1
+    fi
+  done
+  {
+    printf 'RCLONE_DRIVE_SCOPE=drive.file\n'
+    if [[ -n "$id" ]]; then printf 'RCLONE_DRIVE_CLIENT_ID=%s\nRCLONE_DRIVE_CLIENT_SECRET=%s\n' "$id" "$sec"; fi
+    # Solo per i collaudi (token_url finto): sotto sudo la variabile è azzerata.
+    if [[ -n "${BK_AUTH_EXTRA:-}" && -f "$BK_AUTH_EXTRA" ]]; then cat "$BK_AUTH_EXTRA"; fi
+  } >"$dir/env"
+  # Uscita e errori in file: così il token (stdout di rclone) non passa dal journal.
+  if ! _bk_nolock systemd-run --unit "$BK_AUTH_UNIT" --collect --quiet -p RuntimeMaxSec=900 \
+    -p EnvironmentFile="$dir/env" -p StandardInput=null -p "StandardOutput=file:$dir/out" -p "StandardError=file:$dir/err" \
+    -p Nice=10 "$bin" authorize drive --auth-no-open-browser >>"$VPS_LOG" 2>&1 </dev/null; then
+    bk_auth_clean
+    BK_ERR="impossibile avviare l'autorizzazione (dettagli in $VPS_LOG)"
+    return 1
+  fi
+  exp=$(($(date +%s) + 900))
+  n=$((BK_AUTH_START_WAIT * 5))
+  for ((k = 0; k <= n; k++)); do
+    t="$(<"$dir/err")"
+    if [[ "$t" =~ http://127\.0\.0\.1:$BK_AUTH_PORT/auth\?state=([A-Za-z0-9_-]{6,128}) ]]; then
+      state="${BASH_REMATCH[1]}"
+      break
+    fi
+    if ((k >= 3)) && ! bk_auth_alive; then break; fi
+    sleep 0.2
+  done
+  if [[ -z "$state" ]]; then
+    if bk_auth_alive; then
+      BK_ERR="rclone non ha risposto in tempo: riprova"
+    else
+      BK_ERR="rclone si è fermato: $(_bk_auth_msg "$dir/err")"
+    fi
+    bk_auth_clean
+    return 1
+  fi
+  if ! (umask 077; jq -nc --arg s "$state" --argjson e "$exp" '{state: $s, expires: $e}' >"$dir/meta.json"); then
+    bk_auth_clean
+    BK_ERR="stato dell'autorizzazione non scritto"
+    return 1
+  fi
+  # L'indirizzo locale risponde con un redirect a Google: lo si legge senza seguirlo.
+  # La configurazione di curl passa da stdin (-K -).
+  hdr="$(printf '%s\n' 'silent' 'output = "/dev/null"' 'dump-header = "-"' 'max-time = 10' 'connect-timeout = 5' 'noproxy = "*"' \
+    "url = \"http://127.0.0.1:$BK_AUTH_PORT/auth?state=$state\"" | _bk_nolock curl -K - 2>/dev/null)" || rc=$?
+  loc=""
+  if ((rc == 0)); then
+    while IFS= read -r line; do
+      line="${line%$'\r'}"
+      if [[ "${line,,}" == location:* ]]; then
+        loc="${line#*:}"
+        loc="${loc# }"
+        break
+      fi
+    done <<<"$hdr"
+  fi
+  if [[ ! "$loc" =~ ^https://accounts\.google\.com/[!-~]*$ ]]; then
+    bk_auth_clean
+    BK_ERR="rclone non ha dato un indirizzo di Google valido: riprova"
+    return 1
+  fi
+  BK_AUTH_URL="$loc"
+  BK_AUTH_EXPIRES="$(_bk_iso "$exp")"
+}
+
+# _bk_pct_dec VALORE — decodifica %XX in _BK_PCT; 1 se contiene altro che caratteri
+# ammessi nel code (o %00).
+_bk_pct_dec() {
+  local v="$1"
+  _BK_PCT=""
+  [[ -n "$v" ]] || return 0
+  [[ "$v" =~ ^([A-Za-z0-9/_.~-]|%[0-9A-Fa-f]{2})+$ ]] || return 1
+  [[ "$v" != *%00* ]] || return 1
+  v="${v//%/\\x}"
+  printf -v _BK_PCT '%b' "$v"
+}
+
+# bk_auth_parse INDIRIZZO STATE — controlla l'indirizzo incollato; _BK_AU_CODE è il code
+# (decodificato, nei caratteri ammessi). 0 buono; 1 non valido (BK_ERR); 2 Google ha
+# negato l'accesso (BK_ERR, l'autorizzazione è da chiudere).
+bk_auth_parse() {
+  local u="$1" saved="$2" scheme host port q part key val
+  local -a parts
+  local st="" code="" er="" nst=0 ncode=0 ner=0
+  _BK_AU_CODE=""
+  u="${u#"${u%%[![:space:]]*}"}"
+  u="${u%"${u##*[![:space:]]}"}"
+  u="${u%%#*}"
+  if [[ -z "$u" ]]; then
+    BK_ERR="incolla l'indirizzo che il browser ha provato ad aprire (http://127.0.0.1:53682/?state=…)"
+    return 1
+  fi
+  if [[ ! "$u" =~ ^[A-Za-z0-9:/?\&=%._~+-]+$ ]]; then
+    BK_ERR="l'indirizzo contiene caratteri non validi: copialo intero dalla barra del browser"
+    return 1
+  fi
+  if [[ ! "$u" =~ ^([A-Za-z]+)://([A-Za-z0-9.-]+):([0-9]+)/?(\?(.*))?$ ]]; then
+    BK_ERR="non è l'indirizzo atteso: deve cominciare con http://127.0.0.1:$BK_AUTH_PORT/"
+    return 1
+  fi
+  scheme="${BASH_REMATCH[1],,}" host="${BASH_REMATCH[2],,}" port="${BASH_REMATCH[3]}" q="${BASH_REMATCH[5]}"
+  if [[ "$scheme" != http || ("$host" != 127.0.0.1 && "$host" != localhost) || "$port" != "$BK_AUTH_PORT" ]]; then
+    BK_ERR="non è l'indirizzo atteso: deve cominciare con http://127.0.0.1:$BK_AUTH_PORT/"
+    return 1
+  fi
+  IFS='&' read -ra parts <<<"$q"
+  for part in "${parts[@]}"; do
+    key="${part%%=*}"
+    val=""
+    if [[ "$part" == *=* ]]; then val="${part#*=}"; fi
+    case "$key" in
+      state)
+        nst=$((nst + 1))
+        if _bk_pct_dec "$val"; then st="$_BK_PCT"; else st="?"; fi
+        ;;
+      code)
+        ncode=$((ncode + 1))
+        if _bk_pct_dec "$val"; then code="$_BK_PCT"; else code="?"; fi
+        ;;
+      error)
+        ner=$((ner + 1))
+        if _bk_pct_dec "$val"; then er="$_BK_PCT"; else er="?"; fi
+        ;;
+    esac
+  done
+  if ((nst > 1 || ncode > 1 || ner > 1)); then
+    BK_ERR="l'indirizzo ha parametri ripetuti: copia quello della barra del browser"
+    return 1
+  fi
+  if ((nst == 0)) || [[ "$st" != "$saved" ]]; then
+    BK_ERR="l'indirizzo non appartiene a questa autorizzazione (state diverso): usa il link più recente"
+    return 1
+  fi
+  if ((ner)); then
+    if [[ "$er" == access_denied ]]; then
+      BK_ERR="Hai negato l'accesso a Google Drive: ricomincia da \"Collega Google Drive\" e premi Consenti"
+    elif [[ "$er" =~ ^[a-z_]{1,40}$ ]]; then
+      BK_ERR="Google ha rifiutato l'autorizzazione ($er): ricomincia da \"Collega Google Drive\""
+    else
+      BK_ERR="Google ha rifiutato l'autorizzazione: ricomincia da \"Collega Google Drive\""
+    fi
+    return 2
+  fi
+  if ((ncode == 0)) || [[ -z "$code" ]]; then
+    BK_ERR="nell'indirizzo manca il code: copia l'indirizzo completo dalla barra del browser"
+    return 1
+  fi
+  if [[ ! "$code" =~ ^[A-Za-z0-9/_.~-]{1,1024}$ ]]; then
+    BK_ERR="il code nell'indirizzo non è valido: copia l'indirizzo completo dalla barra del browser"
+    return 1
+  fi
+  _BK_AU_CODE="$code"
+}
+
+# _bk_auth_consume STATE — il code è buono: lo si consegna a rclone, si aspetta il
+# token e lo si passa a bk_connect. Chi chiama pulisce sempre dopo (il code vale una volta).
+# Tempi: curl al massimo 10 s, attesa del token BK_AUTH_FINISH_WAIT (30), poi le tre
+# chiamate di bk_connect (BK_CONNECT_TIMEOUT ciascuna): dentro i ~110 s del pannello.
+_bk_auth_consume() {
+  local state="$1" code="$_BK_AU_CODE" dir="$BK_AUTH_DIR" enc k n got=0 tok="" dati line inblk=0 id="" sec="" rc=0
+  enc="${code//\//%2F}"
+  if [[ -f "$dir/env" ]]; then
+    while IFS= read -r line; do
+      case "$line" in
+        RCLONE_DRIVE_CLIENT_ID=*) id="${line#*=}" ;;
+        RCLONE_DRIVE_CLIENT_SECRET=*) sec="${line#*=}" ;;
+      esac
+    done <"$dir/env"
+  fi
+  # L'indirizzo (con il code) passa da stdin di curl, mai dagli argomenti.
+  printf '%s\n' 'silent' 'fail' 'output = "/dev/null"' 'max-time = 10' 'connect-timeout = 5' 'noproxy = "*"' \
+    "url = \"http://127.0.0.1:$BK_AUTH_PORT/?state=$state&code=$enc\"" | _bk_nolock curl -K - >/dev/null 2>&1 || rc=$?
+  if ((rc != 0)); then
+    BK_ERR="l'autorizzazione non ha risposto (rclone non è raggiungibile): ricomincia da \"Collega Google Drive\""
+    return 1
+  fi
+  n=$((BK_AUTH_FINISH_WAIT * 4))
+  for ((k = 0; k <= n; k++)); do
+    if [[ -f "$dir/out" ]] && grep -q '^<---End paste' "$dir/out"; then
+      got=1
+      break
+    fi
+    if ((k >= 1)) && ! bk_auth_alive; then
+      # rclone è finito: ultima occhiata al file prima di arrendersi
+      if [[ -f "$dir/out" ]] && grep -q '^<---End paste' "$dir/out"; then got=1; fi
+      break
+    fi
+    sleep 0.25
+  done
+  if ((!got)); then
+    if bk_auth_alive; then
+      BK_ERR="il token non è arrivato entro $BK_AUTH_FINISH_WAIT secondi: ricomincia da \"Collega Google Drive\""
+    else
+      BK_ERR="Google non ha dato il token: $(_bk_auth_msg "$dir/err" "$code" "$enc")"
+    fi
+    return 1
+  fi
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    if [[ "$line" == "Paste the following into your remote machine --->"* ]]; then
+      inblk=1
+      continue
+    fi
+    if [[ "$line" == "<---End paste"* ]]; then break; fi
+    if ((inblk)) && [[ -n "$line" ]]; then tok="$line"; fi
+  done <"$dir/out"
+  # Il token esce dal file subito: da qui vive solo nella memoria di questo processo.
+  rm -f -- "$dir/out"
+  printf -v dati '%s\n%s\n%s\n' "$tok" "$id" "$sec"
+  tok=""
+  bk_connect "$dati"
+}
+
+# bk_auth_finish INDIRIZZO — completa il collegamento. Come bk_connect: BK_FOLDER, o BK_ERR e 1.
+bk_auth_finish() {
+  local m="$BK_AUTH_DIR/meta.json" saved exp rc=0
+  if [[ ! -f "$m" ]]; then
+    BK_ERR="nessuna autorizzazione aperta: premi \"Collega Google Drive\" per cominciare"
+    return 1
+  fi
+  saved="$(jq -r '.state // ""' "$m" 2>/dev/null || true)"
+  exp="$(jq -r '.expires | if type == "number" then floor else 0 end' "$m" 2>/dev/null || true)"
+  if [[ ! "$exp" =~ ^[0-9]{1,12}$ ]] || ((exp <= $(date +%s))); then
+    bk_auth_clean
+    BK_ERR="l'autorizzazione è scaduta (dura 15 minuti): ricomincia da \"Collega Google Drive\""
+    return 1
+  fi
+  if ! bk_auth_alive; then
+    bk_auth_clean
+    BK_ERR="l'autorizzazione non è più attiva: ricomincia da \"Collega Google Drive\""
+    return 1
+  fi
+  bk_auth_parse "$1" "$saved" || rc=$?
+  if ((rc == 2)); then
+    bk_auth_clean
+    return 1
+  elif ((rc != 0)); then
+    return 1
+  fi
+  # Come connect: non si tocca il collegamento mentre gira un backup. Prima di usare
+  # il code, che vale una volta sola.
+  if ! bk_lock_global; then
+    BK_ERR="backup in corso, riprova dopo"
+    return 1
+  fi
+  rc=0
+  _bk_auth_consume "$saved" || rc=$?
+  bk_auth_clean
+  _BK_AU_CODE=""
+  return "$rc"
 }

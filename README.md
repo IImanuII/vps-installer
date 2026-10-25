@@ -123,6 +123,8 @@ Da terminale: `sudo /opt/vps/bin/vps-monitor status` (stato in JSON) e
 - End-to-end dei siti (WSL, root): `sudo bash tests/e2e/site-e2e.sh`.
 - End-to-end di WordPress (WSL, root, serve internet): `sudo bash tests/e2e/wp-e2e.sh`
   (Redis con ACL e WP-CLI veri; `redis.conf` torna com'era alla fine).
+- End-to-end del collegamento guidato a Drive (WSL con systemd, root, rclone, curl e systemd veri,
+  token di Google finto): `sudo bash tests/e2e/backup-auth-e2e.sh`.
 - End-to-end dei backup (WSL, root, installa `rclone` se manca): `sudo bash tests/e2e/backup-e2e.sh`
   (rclone vero con un remote locale al posto di Drive, sito vero, giro, ripristino,
   ricreazione da archivio).
@@ -151,7 +153,11 @@ da un archivio locale (`sites/FILE`) o da Drive (`remote:dominio/file`), senza r
 WordPress. L'archivio del sito eliminato (`backups/sites/`, 30 giorni) ha lo stesso
 formato dei backup notturni; quelli fatti prima della 1.7.0 si possono solo scaricare.
 Il timer `vps-backup.timer` resta spento finché il backup non è attivato da Plancia
-(ora predefinita 04:00). Contratto in `docs/PANEL-HANDOFF.md`.
+(ora predefinita 04:00). Il collegamento a Drive non richiede rclone sul PC: `vps-backup auth-start`
+avvia `rclone authorize` sulla VPS (solo su 127.0.0.1, 15 minuti), l'utente consente su Google e
+incolla nel pannello l'indirizzo `http://127.0.0.1:53682/?state=…&code=…` che il browser non riesce
+a aprire; `auth-finish` lo controlla, lo ripete in locale e salva il token in `rclone.conf`.
+Contratto in `docs/PANEL-HANDOFF.md`.
 
 Da sapere:
 

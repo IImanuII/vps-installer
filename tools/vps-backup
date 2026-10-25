@@ -28,7 +28,7 @@ if [[ -n "${SUDO_USER:-}" || -n "${VPS_BACKUP_VIA_SYSTEMD:-}" ]]; then
   # RCLONE_*: rclone legge RCLONE_CONFIG e simili dall'ambiente; VPS_NO_CHOWN
   # spegnerebbe i chown dei file scritti da root.
   unset VPS_NO_CHOWN "${!RCLONE_@}" BK_DIR BK_BACKUPS BK_LOCK_DIR BK_CONFIG BK_STATE BK_RCLONE \
-    BK_RCLONE_CONF BK_TIME_DEFAULT BK_NOW BK_UNIT BK_PURGE_DAYS BK_RUN_DIR VPS_BACKUP_SELF BK_ERR BK_FOLDER BK_CONFIG_NEW SYSTEMD_DIR SITES_DIR SITES_WWW SITES_BACKUPS FM_RUNUSER BK_CF_PURGE BK_LOCK_WAIT REDIS_ACL_FILE REDIS_ADMIN_SECRET _BK_RC
+    BK_RCLONE_CONF BK_TIME_DEFAULT BK_NOW BK_UNIT BK_PURGE_DAYS BK_RUN_DIR VPS_BACKUP_SELF BK_ERR BK_FOLDER BK_CONFIG_NEW SYSTEMD_DIR SITES_DIR SITES_WWW SITES_BACKUPS FM_RUNUSER BK_CF_PURGE BK_LOCK_WAIT BK_AUTH_DIR BK_AUTH_EXTRA BK_AUTH_START_WAIT BK_AUTH_FINISH_WAIT BK_AUTH_FD BK_AUTH_URL BK_AUTH_EXPIRES BK_CONNECT_TIMEOUT BK_RC_TIMEOUT BK_LIST_BUDGET _BK_RCQ_TO REDIS_ACL_FILE REDIS_ADMIN_SECRET _BK_RC
   [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
   chmod 640 "$VPS_LOG"
 fi
@@ -161,6 +161,33 @@ case "${1:-}" in
     log "vps-backup: Google Drive collegato (cartella $folder)"
     json_ok --arg f "$folder" '{ok: true, folder: $f}'
     ;;
+  auth-start)
+    bk_auth_lock || json_err "un'altra operazione di collegamento è in corso, riprova"
+    # Client id e secret facoltativi: due righe corte.
+    dati="$(read_stdin_limited 1025)"
+    ((${#dati} <= 1024)) || json_err "dati troppo lunghi"
+    bk_auth_start "$dati" || json_err "$BK_ERR"
+    log "vps-backup: autorizzazione a Google Drive avviata"
+    json_ok --arg u "$BK_AUTH_URL" --arg e "$BK_AUTH_EXPIRES" '{ok: true, url: $u, expires: $e}'
+    ;;
+  auth-finish)
+    bk_auth_lock || json_err "un'altra operazione di collegamento è in corso, riprova"
+    # L'indirizzo incollato: una riga, al massimo 4 KiB. Mai nei log.
+    dati="$(read_stdin_limited 4097)"
+    ((${#dati} <= 4096)) || json_err "indirizzo troppo lungo"
+    dati="${dati%$'\r'}"
+    [[ "$dati" != *$'\n'* ]] || json_err "incolla una sola riga: l'indirizzo della barra del browser"
+    bk_auth_finish "$dati" || json_err "$BK_ERR"
+    folder="$BK_FOLDER"
+    log "vps-backup: Google Drive collegato con l'autorizzazione guidata (cartella $folder)"
+    json_ok --arg f "$folder" '{ok: true, folder: $f}'
+    ;;
+  auth-cancel)
+    bk_auth_lock || json_err "un'altra operazione di collegamento è in corso, riprova"
+    bk_auth_clean
+    log "vps-backup: autorizzazione a Google Drive annullata"
+    json_ok
+    ;;
   disconnect)
     _no_se_in_corso
     rm -f "$BK_RCLONE_CONF"
@@ -221,6 +248,6 @@ case "${1:-}" in
     json_ok
     ;;
   *)
-    json_err "uso: vps-backup status | run | connect (token da stdin) | disconnect | config (JSON da stdin) | list-local | read-local NOME | delete-local NOME | list-remote | read-remote NOME | restore DOMINIO NOME all|db|files | restore-local NOME all|db|files"
+    json_err "uso: vps-backup status | run | connect (token da stdin) | auth-start | auth-finish (indirizzo da stdin) | auth-cancel | disconnect | config (JSON da stdin) | list-local | read-local NOME | delete-local NOME | list-remote | read-remote NOME | restore DOMINIO NOME all|db|files | restore-local NOME all|db|files"
     ;;
 esac

@@ -710,7 +710,7 @@ bk_tool() {
   bk_tool_env
   bk_tool status
   [ "$status" -eq 0 ]
-  jq -e --arg f "Plancia-$(hostname -s)" '. == {ok:true,connected:false,folder:$f,enabled:false,time:"04:00",job:null,interrupted:false,interrupted_job:null,last_run:null,last_restore:null,drive:null}' <<<"$output"
+  jq -e --arg f "Plancia-$(hostname -s)" '. == {ok:true,connected:false,folder:$f,enabled:false,time:"04:00",job:null,interrupted:false,interrupted_job:null,last_run:null,last_restore:null,drive:null,auth:{pending:false,expires:null}}' <<<"$output"
   [ ! -e "$BATS_TEST_TMPDIR/rclone.calls" ]
 }
 
@@ -2783,4 +2783,621 @@ exec /usr/bin/mv "$@"'
   bk_tool list-local
   [ "$status" -eq 0 ]
   jq -e '[.items[] | select(.restorable == false and .parts == null)] | length == 3' <<<"$output"
+}
+
+# ---------------------------------------------------------------------------
+# vps-backup auth-start | auth-finish | auth-cancel (Task 12)
+# ---------------------------------------------------------------------------
+
+AUTH_STATE='Xy_9-abcDEF123456789xyz'
+AUTH_LOC='https://accounts.google.com/o/oauth2/auth?client_id=x&state=Xy_9-abcDEF123456789xyz'
+
+# auth_env — ambiente del tool con systemd-run, curl e systemctl finti. systemd-run annota
+# gli argomenti, copia il file d'ambiente dell'unità e "fa partire rclone": scrive nel file
+# degli errori la riga con l'indirizzo locale (salvo auth.nostart). curl annota argomenti e
+# stdin (la sua configurazione) e i descrittori che ha ereditato; su /auth risponde con il
+# redirect a Google (o auth.location), sull'indirizzo col code scrive in auth/out il contenuto
+# di auth.out (come farebbe rclone) e fallisce se esiste curl.fail.
+auth_env() {
+  bk_tool_env
+  # shellcheck disable=SC2016
+  make_stub systemctl 'T="$BATS_TEST_TMPDIR"
+echo "$*" >>"$T/systemctl.calls"
+if [[ "$1" == is-active ]]; then
+  if [[ "$*" == *vps-backup-auth* ]]; then
+    if [[ -f "$T/auth.active" ]]; then echo active; exit 0; fi
+    echo inactive; exit 3
+  fi
+  if [[ -f "$T/unit.active" ]]; then echo active; exit 0; fi
+  echo inactive; echo inactive; exit 3
+fi
+if [[ "$1" == stop && "$*" == *vps-backup-auth* ]]; then rm -f "$T/auth.active"; exit 0; fi
+if [[ -f "$T/fail.$1" ]]; then exit 1; fi
+exit 0'
+  # shellcheck disable=SC2016
+  make_stub systemd-run 'T="$BATS_TEST_TMPDIR"
+echo "systemd-run $*" >>"$T/calls"
+ls -l /proc/$$/fd >"$T/sdrun.fds" 2>/dev/null
+if [[ -f "$T/fail.systemd-run" ]]; then echo "boom" >&2; exit 1; fi
+for a in "$@"; do
+  case "$a" in
+    StandardError=file:*) err="${a#StandardError=file:}" ;;
+    EnvironmentFile=*) cp "${a#EnvironmentFile=}" "$T/auth.env.copy" ;;
+  esac
+done
+touch "$T/auth.active"
+if [[ -f "$T/auth.err" ]]; then cat "$T/auth.err" >>"$err"; fi
+if [[ ! -f "$T/auth.nostart" ]]; then
+  printf "<5>NOTICE: Please go to the following link: http://127.0.0.1:53682/auth?state=%s\n<5>NOTICE: Waiting for code...\n" "Xy_9-abcDEF123456789xyz" >>"$err"
+fi
+exit 0'
+  # shellcheck disable=SC2016
+  make_stub curl 'T="$BATS_TEST_TMPDIR"
+echo "curl $*" >>"$T/curl.calls"
+cat >"$T/curl.stdin"
+ls -l /proc/$$/fd >"$T/curl.fds" 2>/dev/null
+if [[ -f "$T/curl.fail" ]]; then exit 22; fi
+if grep -q "/auth?state=" "$T/curl.stdin"; then
+  loc="https://accounts.google.com/o/oauth2/auth?client_id=x&state=Xy_9-abcDEF123456789xyz"
+  [[ ! -f "$T/auth.location" ]] || loc="$(cat "$T/auth.location")"
+  printf "HTTP/1.1 307 Temporary Redirect\r\nContent-Type: text/html\r\nLocation: %s\r\nDate: x\r\n\r\n" "$loc"
+  exit 0
+fi
+if [[ -f "$T/auth.out" ]]; then cat "$T/auth.out" >>"$BK_DIR/auth/out"; fi
+printf "HTTP/1.1 200 OK\r\n\r\n"
+exit 0'
+}
+
+# bk_auth ARGS... — come bk_tool, con le attese brevi.
+bk_auth() {
+  run --separate-stderr env VPS_OPT="$VPS_OPT" VPS_LIB="$REPO_ROOT/lib" VPS_LOG="$VPS_LOG" VPS_NO_CHOWN=1 \
+    SYSTEMD_DIR="$SYSTEMD_DIR" BK_DIR="$BK_DIR" BK_LOCK_DIR="$BK_LOCK_DIR" PATH="$PATH" BATS_TEST_TMPDIR="$BATS_TEST_TMPDIR" \
+    BK_AUTH_START_WAIT=1 BK_AUTH_FINISH_WAIT=1 \
+    bash "$T_TOOL" "$@"
+}
+
+auth_out_token() {
+  printf 'Paste the following into your remote machine --->\n%s\n<---End paste\n' "$TOKEN_OK" >"$BATS_TEST_TMPDIR/auth.out"
+}
+
+AUTH_REDIRECT="http://127.0.0.1:53682/?state=$AUTH_STATE&code=4%2F0AbC_d-e.f~g&scope=https://www.googleapis.com/auth/drive.file"
+
+@test "auth-start: unità temporanea con rclone authorize drive, scope drive.file nell'ambiente, URL di Google e scadenza" {
+  auth_env
+  bk_auth auth-start </dev/null
+  [ "$status" -eq 0 ]
+  jq -e --arg u "$AUTH_LOC" '.ok == true and .url == $u and (.expires | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))' <<<"$output"
+  c="$BATS_TEST_TMPDIR/calls"
+  grep -q -- '--unit vps-backup-auth ' "$c"
+  grep -q -- '--collect' "$c"
+  grep -q -- '-p RuntimeMaxSec=900' "$c"
+  grep -q -- "-p EnvironmentFile=$BK_DIR/auth/env" "$c"
+  grep -q -- "-p StandardOutput=file:$BK_DIR/auth/out" "$c"
+  grep -q -- "-p StandardError=file:$BK_DIR/auth/err" "$c"
+  grep -q -- ' authorize drive --auth-no-open-browser$' "$c"
+  [ "$(cat "$BATS_TEST_TMPDIR/auth.env.copy")" = 'RCLONE_DRIVE_SCOPE=drive.file' ]
+  [ "$(stat -c %a "$BK_DIR/auth")" = 700 ]
+  [ "$(stat -c %a "$BK_DIR/auth/env")" = 600 ]
+  [ "$(stat -c %a "$BK_DIR/auth/out")" = 600 ]
+  # lo stato salvato è quello di rclone
+  [ "$(jq -r .state "$BK_DIR/auth/meta.json")" = "$AUTH_STATE" ]
+  # curl: indirizzo locale su stdin, mai negli argomenti
+  grep -q "^url = \"http://127.0.0.1:53682/auth?state=$AUTH_STATE\"" "$BATS_TEST_TMPDIR/curl.stdin"
+  run ! grep -q "$AUTH_STATE" "$BATS_TEST_TMPDIR/curl.calls"
+  grep -q 'curl -K -' "$BATS_TEST_TMPDIR/curl.calls"
+}
+
+@test "auth-start: client id e secret propri solo nel file d'ambiente, mai negli argomenti, nell'output o nel log" {
+  auth_env
+  bk_auth auth-start < <(printf 'mio-id.apps.googleusercontent.com\nGOCSPX-abc_DEF-123\n')
+  [ "$status" -eq 0 ]
+  grep -qxF 'RCLONE_DRIVE_SCOPE=drive.file' "$BATS_TEST_TMPDIR/auth.env.copy"
+  grep -qxF 'RCLONE_DRIVE_CLIENT_ID=mio-id.apps.googleusercontent.com' "$BATS_TEST_TMPDIR/auth.env.copy"
+  grep -qxF 'RCLONE_DRIVE_CLIENT_SECRET=GOCSPX-abc_DEF-123' "$BATS_TEST_TMPDIR/auth.env.copy"
+  run ! grep -q 'GOCSPX\|mio-id' "$BATS_TEST_TMPDIR/calls"
+  run ! grep -q 'GOCSPX' <<<"$output$stderr"
+  run ! grep -q 'GOCSPX' "$VPS_LOG"
+}
+
+@test "auth-start: client id senza secret o con caratteri strani = rifiutato, niente unità" {
+  auth_env
+  bk_auth auth-start < <(printf 'solo-id\n')
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false' <<<"$output"
+  bk_auth auth-start < <(printf 'id\nsec ret\n')
+  [ "$status" -ne 0 ]
+  bk_auth auth-start < <(printf 'id\nsec\nCOSA\n')
+  [ "$status" -ne 0 ]
+  [ ! -e "$BATS_TEST_TMPDIR/calls" ]
+  [ ! -e "$BK_DIR/auth" ]
+}
+
+@test "auth-start: un'autorizzazione precedente viene fermata prima della nuova" {
+  auth_env
+  bk_auth auth-start </dev/null
+  [ "$status" -eq 0 ]
+  : >"$BATS_TEST_TMPDIR/systemctl.calls"
+  bk_auth auth-start </dev/null
+  [ "$status" -eq 0 ]
+  grep -q 'stop vps-backup-auth' "$BATS_TEST_TMPDIR/systemctl.calls"
+  [ "$(grep -c 'systemd-run' "$BATS_TEST_TMPDIR/calls")" -eq 2 ]
+}
+
+@test "auth-start: rclone che non stampa l'indirizzo entro il limite = errore, unità fermata e file tolti" {
+  auth_env
+  touch "$BATS_TEST_TMPDIR/auth.nostart"
+  bk_auth auth-start </dev/null
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | test("non ha risposto"))' <<<"$output"
+  grep -q 'stop vps-backup-auth' "$BATS_TEST_TMPDIR/systemctl.calls"
+  [ ! -e "$BK_DIR/auth" ]
+  [ ! -e "$BATS_TEST_TMPDIR/curl.calls" ]
+}
+
+@test "auth-start: rclone che muore subito (porta occupata) = errore con il suo messaggio, niente file" {
+  auth_env
+  # l'unità risulta già finita: il messaggio di rclone sta nel file degli errori
+  printf 'Failed to start auth webserver: listen tcp 127.0.0.1:53682: bind: address already in use\n' >"$BATS_TEST_TMPDIR/auth.err"
+  # shellcheck disable=SC2016
+  make_stub systemd-run 'T="$BATS_TEST_TMPDIR"
+for a in "$@"; do case "$a" in StandardError=file:*) err="${a#StandardError=file:}";; esac; done
+cat "$T/auth.err" >>"$err"
+exit 0'
+  bk_auth auth-start </dev/null
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | test("address already in use"))' <<<"$output"
+  [ ! -e "$BK_DIR/auth" ]
+}
+
+@test "auth-start: systemd-run che fallisce = errore, niente file" {
+  auth_env
+  touch "$BATS_TEST_TMPDIR/fail.systemd-run"
+  bk_auth auth-start </dev/null
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false' <<<"$output"
+  [ ! -e "$BK_DIR/auth" ]
+}
+
+@test "auth-start: se il redirect non porta a accounts.google.com = rifiutato e tutto fermato" {
+  auth_env
+  local loc
+  for loc in 'https://evil.example/o/oauth2/auth?x=1' 'http://accounts.google.com/o/oauth2/auth' 'https://accounts.google.com.evil.it/x' 'https://accounts.google.com/x y'; do
+    printf '%s' "$loc" >"$BATS_TEST_TMPDIR/auth.location"
+    bk_auth auth-start </dev/null
+    [ "$status" -ne 0 ]
+    jq -e '.ok == false and (has("url") | not)' <<<"$output"
+    [ ! -e "$BK_DIR/auth" ]
+  done
+}
+
+@test "auth-start: rclone non installato = errore leggibile, niente unità" {
+  auth_env
+  export BK_RCLONE="rclone-che-non-esiste --config /x"
+  run --separate-stderr env VPS_OPT="$VPS_OPT" VPS_LIB="$REPO_ROOT/lib" VPS_LOG="$VPS_LOG" VPS_NO_CHOWN=1 SYSTEMD_DIR="$SYSTEMD_DIR" \
+    BK_DIR="$BK_DIR" BK_LOCK_DIR="$BK_LOCK_DIR" PATH="$PATH" BATS_TEST_TMPDIR="$BATS_TEST_TMPDIR" BK_RCLONE="$BK_RCLONE" \
+    bash "$T_TOOL" auth-start </dev/null
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | test("rclone"))' <<<"$output"
+  [ ! -e "$BATS_TEST_TMPDIR/calls" ]
+}
+
+@test "auth-start: nessun descrittore dei lock passa a systemd-run e a curl; il lock globale è libero dopo" {
+  auth_env
+  bk_auth auth-start </dev/null
+  [ "$status" -eq 0 ]
+  run ! grep -q 'vps-backup.*\.lock' "$BATS_TEST_TMPDIR/sdrun.fds"
+  run ! grep -q 'vps-backup.*\.lock' "$BATS_TEST_TMPDIR/curl.fds"
+  run ! grep -q 'vps-backup-auth.*\.lock' "$BATS_TEST_TMPDIR/curl.fds"
+  run bk_global_busy
+  [ "$status" -ne 0 ]
+}
+
+@test "auth-finish: caso buono — curl con l'indirizzo ricostruito, rclone.conf scritto, nessun token in output/log/argomenti, tutto pulito" {
+  auth_env
+  bk_auth auth-start </dev/null
+  [ "$status" -eq 0 ]
+  auth_out_token
+  : >"$BATS_TEST_TMPDIR/curl.calls"
+  bk_auth auth-finish <<<"$AUTH_REDIRECT"
+  [ "$status" -eq 0 ]
+  jq -e --arg f "Plancia-$(hostname -s)" '.ok == true and .folder == $f' <<<"$output"
+  # l'indirizzo chiamato è ricostruito da state e code (la barra obliqua codificata), senza il resto
+  grep -qxF "url = \"http://127.0.0.1:53682/?state=$AUTH_STATE&code=4%2F0AbC_d-e.f~g\"" "$BATS_TEST_TMPDIR/curl.stdin"
+  run ! grep -q 'scope' "$BATS_TEST_TMPDIR/curl.stdin"
+  # argomenti di curl: nessun code, nessun state
+  grep -qx 'curl -K -' "$BATS_TEST_TMPDIR/curl.calls"
+  c="$VPS_OPT/secrets/rclone.conf"
+  [ "$(stat -c %a "$c")" = 600 ]
+  grep -qxF 'scope = drive.file' "$c"
+  grep -q '"refresh_token":"1//SEGRETO-RINNOVO"' "$c"
+  run ! grep -q 'SEGRETO\|0AbC' <<<"$output$stderr"
+  run ! grep -q 'SEGRETO\|0AbC' "$VPS_LOG"
+  run ! grep -q 'SEGRETO\|0AbC' "$BATS_TEST_TMPDIR/calls" "$BATS_TEST_TMPDIR/rclone.calls" "$BATS_TEST_TMPDIR/systemctl.calls" "$BATS_TEST_TMPDIR/curl.calls"
+  # unità fermata, cartella delle autorizzazioni tolta (con il token dentro)
+  grep -q 'stop vps-backup-auth' "$BATS_TEST_TMPDIR/systemctl.calls"
+  [ ! -e "$BK_DIR/auth" ]
+  run ! grep -rl 'SEGRETO' "$BK_DIR"
+}
+
+@test "auth-finish: client id e secret dati all'avvio finiscono in rclone.conf" {
+  auth_env
+  bk_auth auth-start < <(printf 'mio-id.apps.googleusercontent.com\nGOCSPX-abc_DEF-123\n')
+  [ "$status" -eq 0 ]
+  auth_out_token
+  bk_auth auth-finish <<<"$AUTH_REDIRECT"
+  [ "$status" -eq 0 ]
+  c="$VPS_OPT/secrets/rclone.conf"
+  grep -qxF 'client_id = mio-id.apps.googleusercontent.com' "$c"
+  grep -qxF 'client_secret = GOCSPX-abc_DEF-123' "$c"
+  run ! grep -q 'GOCSPX' <<<"$output$stderr"
+}
+
+@test "auth-finish: forme accettate dell'indirizzo incollato (localhost, code con / grezza, spazi, frammento, ordine diverso)" {
+  auth_env
+  auth_out_token
+  local u
+  for u in \
+    "http://localhost:53682/?state=$AUTH_STATE&code=4/0AbC_d-e.f~g" \
+    "  http://127.0.0.1:53682/?code=4%2f0AbC_d-e.f~g&state=$AUTH_STATE  " \
+    "http://127.0.0.1:53682/?state=$AUTH_STATE&code=4%2F0AbC_d-e.f~g#" \
+    "HTTP://LocalHost:53682?state=$AUTH_STATE&code=4%2F0AbC_d-e.f~g&authuser=0&prompt=consent"; do
+    bk_auth auth-start </dev/null
+    [ "$status" -eq 0 ]
+    rm -f "$VPS_OPT/secrets/rclone.conf"
+    bk_auth auth-finish <<<"$u"
+    [ "$status" -eq 0 ]
+    grep -qxF "url = \"http://127.0.0.1:53682/?state=$AUTH_STATE&code=4%2F0AbC_d-e.f~g\"" "$BATS_TEST_TMPDIR/curl.stdin"
+  done
+}
+
+@test "auth-finish: indirizzi non ammessi = rifiutati senza chiamare curl, e l'autorizzazione resta in attesa" {
+  auth_env
+  bk_auth auth-start </dev/null
+  [ "$status" -eq 0 ]
+  : >"$BATS_TEST_TMPDIR/curl.calls"
+  local u
+  for u in \
+    "http://127.0.0.1:53682/?state=ALTRO&code=abc" \
+    "http://127.0.0.1:53682/?code=abc" \
+    "http://127.0.0.1:53682/?state=$AUTH_STATE" \
+    "http://127.0.0.1:53682/" \
+    "http://evil:53682/?state=$AUTH_STATE&code=abc" \
+    "http://127.0.0.1.evil.it:53682/?state=$AUTH_STATE&code=abc" \
+    "http://user@127.0.0.1:53682/?state=$AUTH_STATE&code=abc" \
+    "http://127.0.0.1:53683/?state=$AUTH_STATE&code=abc" \
+    "http://127.0.0.1/?state=$AUTH_STATE&code=abc" \
+    "https://127.0.0.1:53682/?state=$AUTH_STATE&code=abc" \
+    "ftp://127.0.0.1:53682/?state=$AUTH_STATE&code=abc" \
+    "http://127.0.0.1:53682/auth?state=$AUTH_STATE&code=abc" \
+    "http://127.0.0.1:53682/x/?state=$AUTH_STATE&code=abc" \
+    "http://127.0.0.1:53682/?state=$AUTH_STATE&code=ab c" \
+    "http://127.0.0.1:53682/?state=$AUTH_STATE&code=ab%20c" \
+    "http://127.0.0.1:53682/?state=$AUTH_STATE&code=ab%00c" \
+    "http://127.0.0.1:53682/?state=$AUTH_STATE&code=ab%3Bc" \
+    "http://127.0.0.1:53682/?state=$AUTH_STATE&code=a\$(touch x)" \
+    "http://127.0.0.1:53682/?state=$AUTH_STATE&code=a\"b" \
+    "http://127.0.0.1:53682/?state=$AUTH_STATE&code=" \
+    "http://127.0.0.1:53682/?state=$AUTH_STATE&code=abc&code=def" \
+    "http://127.0.0.1:53682/?state=$AUTH_STATE&state=$AUTH_STATE&code=abc" \
+    "http://127.0.0.1:53682/?state=$AUTH_STATE&code=$(head -c 1100 /dev/zero | tr '\0' a)" \
+    "non è un indirizzo" \
+    ""; do
+    bk_auth auth-finish <<<"$u"
+    [ "$status" -ne 0 ]
+    jq -e '.ok == false and (.error | length > 0)' <<<"$output"
+  done
+  [ ! -s "$BATS_TEST_TMPDIR/curl.calls" ]
+  [ ! -e "$VPS_OPT/secrets/rclone.conf" ]
+  [ ! -e x ]
+  # ancora in attesa: l'utente può incollare l'indirizzo giusto
+  [ -f "$BK_DIR/auth/meta.json" ]
+  bk_auth status
+  jq -e '.auth.pending == true' <<<"$output"
+}
+
+@test "auth-finish: più di 4 KiB o più righe = rifiutato" {
+  auth_env
+  bk_auth auth-start </dev/null
+  : >"$BATS_TEST_TMPDIR/curl.calls"
+  bk_auth auth-finish < <(head -c 5000 /dev/zero | tr '\0' a)
+  [ "$status" -ne 0 ]
+  bk_auth auth-finish < <(printf '%s\n%s\n' "$AUTH_REDIRECT" "$AUTH_REDIRECT")
+  [ "$status" -ne 0 ]
+  [ ! -s "$BATS_TEST_TMPDIR/curl.calls" ]
+}
+
+@test "auth-finish: error=access_denied = messaggio leggibile, nessuna chiamata a curl, tutto pulito" {
+  auth_env
+  bk_auth auth-start </dev/null
+  : >"$BATS_TEST_TMPDIR/curl.calls"
+  bk_auth auth-finish <<<"http://127.0.0.1:53682/?error=access_denied&state=$AUTH_STATE"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | test("negato"))' <<<"$output"
+  [ ! -s "$BATS_TEST_TMPDIR/curl.calls" ]
+  [ ! -e "$BK_DIR/auth" ]
+  grep -q 'stop vps-backup-auth' "$BATS_TEST_TMPDIR/systemctl.calls"
+}
+
+@test "auth-finish: error=access_denied con state sbagliato non annulla nulla" {
+  auth_env
+  bk_auth auth-start </dev/null
+  bk_auth auth-finish <<<"http://127.0.0.1:53682/?error=access_denied&state=ALTRO"
+  [ "$status" -ne 0 ]
+  [ -f "$BK_DIR/auth/meta.json" ]
+}
+
+@test "auth-finish: nessuna autorizzazione aperta = errore" {
+  auth_env
+  bk_auth auth-finish <<<"$AUTH_REDIRECT"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | test("Collega Google Drive"))' <<<"$output"
+  [ ! -e "$BATS_TEST_TMPDIR/curl.calls" ]
+}
+
+@test "auth-finish: autorizzazione scaduta = 'ricomincia', unità e file tolti, nessuna chiamata" {
+  auth_env
+  bk_auth auth-start </dev/null
+  jq -c '.expires = 1000' "$BK_DIR/auth/meta.json" >"$BK_DIR/auth/m" && mv "$BK_DIR/auth/m" "$BK_DIR/auth/meta.json"
+  : >"$BATS_TEST_TMPDIR/curl.calls"
+  bk_auth auth-finish <<<"$AUTH_REDIRECT"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | test("scadut")) and (.error | test("ricomincia"))' <<<"$output"
+  [ ! -s "$BATS_TEST_TMPDIR/curl.calls" ]
+  [ ! -e "$BK_DIR/auth" ]
+}
+
+@test "auth-finish: unità non più attiva (rclone ucciso) = 'ricomincia', nessuna chiamata" {
+  auth_env
+  bk_auth auth-start </dev/null
+  rm -f "$BATS_TEST_TMPDIR/auth.active"
+  : >"$BATS_TEST_TMPDIR/curl.calls"
+  bk_auth auth-finish <<<"$AUTH_REDIRECT"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | test("ricomincia"))' <<<"$output"
+  [ ! -s "$BATS_TEST_TMPDIR/curl.calls" ]
+  [ ! -e "$BK_DIR/auth" ]
+}
+
+@test "auth-finish: lock globale occupato = rifiutato prima di usare il code, l'autorizzazione resta" {
+  auth_env
+  bk_auth auth-start </dev/null
+  : >"$BATS_TEST_TMPDIR/curl.calls"
+  exec {gl}>>"$BK_LOCK_DIR/vps-backup.lock"
+  flock -n "$gl"
+  auth_out_token
+  bk_auth auth-finish <<<"$AUTH_REDIRECT"
+  [ "$status" -ne 0 ]
+  jq -e '.error == "backup in corso, riprova dopo"' <<<"$output"
+  [ ! -s "$BATS_TEST_TMPDIR/curl.calls" ]
+  [ -f "$BK_DIR/auth/meta.json" ]
+  exec {gl}>&-
+  bk_auth auth-finish <<<"$AUTH_REDIRECT"
+  [ "$status" -eq 0 ]
+}
+
+@test "auth-finish: nessun descrittore dei lock passa a curl" {
+  auth_env
+  bk_auth auth-start </dev/null
+  auth_out_token
+  bk_auth auth-finish <<<"$AUTH_REDIRECT"
+  [ "$status" -eq 0 ]
+  run ! grep -q 'vps-backup.*\.lock' "$BATS_TEST_TMPDIR/curl.fds"
+}
+
+@test "auth-finish: il token non arriva entro il limite = errore, tutto pulito" {
+  auth_env
+  bk_auth auth-start </dev/null
+  bk_auth auth-finish <<<"$AUTH_REDIRECT"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | test("token"))' <<<"$output"
+  [ ! -e "$BK_DIR/auth" ]
+  [ ! -e "$VPS_OPT/secrets/rclone.conf" ]
+  grep -q 'stop vps-backup-auth' "$BATS_TEST_TMPDIR/systemctl.calls"
+}
+
+@test "auth-finish: rclone fallisce (code non valido) = il suo messaggio, senza code né token" {
+  auth_env
+  bk_auth auth-start </dev/null
+  # rclone è morto dopo aver ricevuto il code: errore nel file degli errori
+  # shellcheck disable=SC2016
+  make_stub curl 'T="$BATS_TEST_TMPDIR"
+cat >"$T/curl.stdin"
+if grep -q "/auth?state=" "$T/curl.stdin"; then printf "HTTP/1.1 307\r\nLocation: https://accounts.google.com/x\r\n\r\n"; exit 0; fi
+printf "Failed to configure token: oauth2: cannot fetch token: 400 Bad Request invalid_grant 4/0AbC_d-e.f~g\n" >>"$BK_DIR/auth/err"
+rm -f "$T/auth.active"
+exit 0'
+  bk_auth auth-finish <<<"$AUTH_REDIRECT"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | test("invalid_grant"))' <<<"$output"
+  run ! grep -q '0AbC' <<<"$output$stderr"
+  run ! grep -q '0AbC' "$VPS_LOG"
+  [ ! -e "$BK_DIR/auth" ]
+}
+
+@test "auth-finish: curl che non risponde = errore, tutto pulito" {
+  auth_env
+  bk_auth auth-start </dev/null
+  touch "$BATS_TEST_TMPDIR/curl.fail"
+  bk_auth auth-finish <<<"$AUTH_REDIRECT"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false' <<<"$output"
+  [ ! -e "$BK_DIR/auth" ]
+}
+
+@test "auth-finish: token illeggibile o senza refresh_token = errore di connect, nessun rclone.conf, tutto pulito" {
+  auth_env
+  bk_auth auth-start </dev/null
+  printf 'Paste the following into your remote machine --->\n{"access_token":"ya29.SEGRETO-ACCESSO"}\n<---End paste\n' >"$BATS_TEST_TMPDIR/auth.out"
+  bk_auth auth-finish <<<"$AUTH_REDIRECT"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | test("token non valido"))' <<<"$output"
+  run ! grep -q 'SEGRETO' <<<"$output$stderr"
+  [ ! -e "$VPS_OPT/secrets/rclone.conf" ]
+  [ ! -e "$BK_DIR/auth" ]
+}
+
+@test "auth-finish: Drive rifiuta il collegamento = rclone.conf di prima, errore senza token, tutto pulito" {
+  auth_env
+  echo vecchio >"$VPS_OPT/secrets/rclone.conf"
+  chmod 600 "$VPS_OPT/secrets/rclone.conf"
+  echo mkdir >"$BATS_TEST_TMPDIR/rclone.fail"
+  echo "ERROR : Invalid token ya29.SEGRETO-ACCESSO" >"$BATS_TEST_TMPDIR/rclone.msg"
+  bk_auth auth-start </dev/null
+  auth_out_token
+  bk_auth auth-finish <<<"$AUTH_REDIRECT"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | test("Invalid token"))' <<<"$output"
+  run ! grep -q 'SEGRETO' <<<"$output$stderr"
+  [ "$(cat "$VPS_OPT/secrets/rclone.conf")" = vecchio ]
+  [ ! -e "$BK_DIR/auth" ]
+}
+
+@test "auth-cancel: ferma l'unità, toglie la cartella, risponde ok; senza autorizzazione risponde ok lo stesso" {
+  auth_env
+  bk_auth auth-start </dev/null
+  [ -d "$BK_DIR/auth" ]
+  bk_auth auth-cancel
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"ok":true}' ]
+  grep -q 'stop vps-backup-auth' "$BATS_TEST_TMPDIR/systemctl.calls"
+  [ ! -e "$BK_DIR/auth" ]
+  bk_auth auth-cancel
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"ok":true}' ]
+}
+
+@test "status: auth pending con scadenza durante l'attesa, non più dopo scadenza, unità morta o annullo" {
+  auth_env
+  bk_auth status
+  jq -e '.auth == {pending:false, expires:null}' <<<"$output"
+  bk_auth auth-start </dev/null
+  exp="$(jq -r .expires <<<"$output")"
+  bk_auth status
+  jq -e --arg e "$exp" '.auth.pending == true and .auth.expires == $e' <<<"$output"
+  rm -f "$BATS_TEST_TMPDIR/auth.active"
+  bk_auth status
+  jq -e '.auth == {pending:false, expires:null}' <<<"$output"
+  touch "$BATS_TEST_TMPDIR/auth.active"
+  jq -c '.expires = 1000' "$BK_DIR/auth/meta.json" >"$BK_DIR/auth/m" && mv "$BK_DIR/auth/m" "$BK_DIR/auth/meta.json"
+  bk_auth status
+  jq -e '.auth.pending == false' <<<"$output"
+  bk_auth auth-cancel
+  bk_auth status
+  jq -e '.auth.pending == false' <<<"$output"
+}
+
+@test "vps-backup: le variabili di auth non entrano dall'ambiente del chiamante sotto sudo" {
+  local v
+  for v in BK_AUTH_DIR BK_AUTH_EXTRA BK_AUTH_START_WAIT BK_AUTH_FINISH_WAIT BK_AUTH_FD; do
+    grep -q "$v" "$REPO_ROOT/tools/vps-backup"
+  done
+}
+
+@test "auth-start: BK_AUTH_EXTRA aggiunge righe all'ambiente dell'unità (solo per i collaudi)" {
+  auth_env
+  printf 'RCLONE_DRIVE_TOKEN_URL=http://127.0.0.1:1/token\n' >"$BATS_TEST_TMPDIR/extra.env"
+  run --separate-stderr env VPS_OPT="$VPS_OPT" VPS_LIB="$REPO_ROOT/lib" VPS_LOG="$VPS_LOG" VPS_NO_CHOWN=1 SYSTEMD_DIR="$SYSTEMD_DIR" \
+    BK_DIR="$BK_DIR" BK_LOCK_DIR="$BK_LOCK_DIR" PATH="$PATH" BATS_TEST_TMPDIR="$BATS_TEST_TMPDIR" BK_AUTH_EXTRA="$BATS_TEST_TMPDIR/extra.env" BK_AUTH_START_WAIT=1 \
+    bash "$T_TOOL" auth-start </dev/null
+  [ "$status" -eq 0 ]
+  grep -qxF 'RCLONE_DRIVE_TOKEN_URL=http://127.0.0.1:1/token' "$BATS_TEST_TMPDIR/auth.env.copy"
+}
+
+# --- tetti di tempo delle chiamate a Drive (il pannello aspetta ~125 s) ---------
+
+@test "connect: rclone che si pianta = errore 'tempo scaduto' entro il tetto, rclone.conf di prima intatto" {
+  bk_tool_env
+  export BK_CONNECT_TIMEOUT=1
+  echo vecchio >"$VPS_OPT/secrets/rclone.conf"
+  chmod 600 "$VPS_OPT/secrets/rclone.conf"
+  for sub in mkdir rcat deletefile; do
+    # shellcheck disable=SC2016
+    make_stub rclone 'for a in "$@"; do if [[ "$a" == '"$sub"' ]]; then exec sleep 20; fi; done; cat >/dev/null 2>&1 </dev/null; exit 0'
+    SECONDS=0
+    bk_tool connect <<<"$TOKEN_OK"
+    [ "$status" -ne 0 ]
+    ((SECONDS < 10))
+    jq -e '.ok == false and (.error | test("tempo scaduto"))' <<<"$output"
+    [ "$(cat "$VPS_OPT/secrets/rclone.conf")" = vecchio ]
+  done
+}
+
+@test "auth-finish: rclone che si pianta nelle prove su Drive = stesso tetto, tutto pulito" {
+  auth_env
+  export BK_CONNECT_TIMEOUT=1
+  # shellcheck disable=SC2016
+  make_stub rclone 'for a in "$@"; do if [[ "$a" == mkdir ]]; then exec sleep 20; fi; done; exit 0'
+  bk_auth auth-start </dev/null
+  auth_out_token
+  SECONDS=0
+  bk_auth auth-finish <<<"$AUTH_REDIRECT"
+  [ "$status" -ne 0 ]
+  ((SECONDS < 10))
+  jq -e '.ok == false and (.error | test("tempo scaduto"))' <<<"$output"
+  [ ! -e "$VPS_OPT/secrets/rclone.conf" ]
+  [ ! -e "$BK_DIR/auth" ]
+}
+
+# list_remote_stub — rclone finto: a.it risponde, b.it si pianta, l'elenco delle cartelle può piantarsi.
+list_remote_stub() {
+  # shellcheck disable=SC2016
+  make_stub rclone 'case "$*" in
+  *--dirs-only*) if [[ -f "$BATS_TEST_TMPDIR/hang.top" ]]; then exec sleep 20; fi; echo "[{\"Name\":\"a.it\"},{\"Name\":\"b.it\"}]" ;;
+  *"gdrive:F/a.it") echo "[{\"Name\":\"a.it-20261001-0400.tar.gz\",\"Size\":5}]" ;;
+  *"gdrive:F/b.it") exec sleep 20 ;;
+esac
+exit 0'
+}
+
+@test "list-remote: una cartella che non risponde = elenco parziale con partial:true, il resto c'è" {
+  bk_run_env
+  export BK_RC_TIMEOUT=1
+  list_remote_stub
+  SECONDS=0
+  bk_tool list-remote
+  [ "$status" -eq 0 ]
+  ((SECONDS < 10))
+  jq -e '.ok == true and .partial == true and (.sites | map(.domain)) == ["a.it"]' <<<"$output"
+}
+
+@test "list-remote: finito il budget si restituisce quanto raccolto con partial:true" {
+  bk_run_env
+  export BK_LIST_BUDGET=2
+  list_remote_stub
+  bk_tool list-remote
+  [ "$status" -eq 0 ]
+  jq -e '.ok == true and .partial == true and .sites == []' <<<"$output"
+}
+
+@test "list-remote: elenco delle cartelle che si pianta = errore, senza partial" {
+  bk_run_env
+  export BK_RC_TIMEOUT=1
+  touch "$BATS_TEST_TMPDIR/hang.top"
+  list_remote_stub
+  bk_tool list-remote
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | test("tempo scaduto"))' <<<"$output"
+}
+
+@test "list-remote: tutto risponde = nessun campo partial" {
+  bk_run_env
+  mkdir -p "$BATS_TEST_TMPDIR/drive"
+  list_remote_stub
+  # niente b.it: solo a.it
+  # shellcheck disable=SC2016
+  make_stub rclone 'case "$*" in
+  *--dirs-only*) echo "[{\"Name\":\"a.it\"}]" ;;
+  *"gdrive:F/a.it") echo "[{\"Name\":\"a.it-20261001-0400.tar.gz\",\"Size\":5}]" ;;
+esac
+exit 0'
+  bk_tool list-remote
+  [ "$status" -eq 0 ]
+  jq -e '.ok == true and (has("partial") | not) and (.sites | length) == 1' <<<"$output"
+}
+
+@test "vps-backup: i tetti di tempo non entrano dall'ambiente del chiamante sotto sudo" {
+  local v
+  for v in BK_CONNECT_TIMEOUT BK_RC_TIMEOUT BK_LIST_BUDGET _BK_RCQ_TO; do
+    grep -q "$v" "$REPO_ROOT/tools/vps-backup"
+  done
 }
