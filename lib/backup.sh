@@ -2239,8 +2239,13 @@ bk_restore_run() {
 # uid diverso da 0 di CONNETTERSI alla porta, quindi nessuno può nemmeno mandare lo state
 # sbagliato; (2) prima di ogni curl si verifica che l'unico listener sia il processo
 # principale della nostra unità (bk_auth_port_ok); (3) l'indirizzo di Google restituito si
-# controlla parametro per parametro (bk_auth_check_location). Resta possibile, a chi è
-# già su questa macchina, solo far fallire il collegamento (si ricomincia).
+# controlla parametro per parametro (bk_auth_check_location). Inoltre (4) nessuna delle
+# due chiamate locali usa curl: la connessione TCP si apre con il builtin di bash, si
+# verifica con `ss` che il socket stabilito abbia dall'altra parte il processo principale
+# dell'unità e solo allora si scrive la richiesta sullo stesso descrittore (chiude la
+# corsa tra controllo e connessione); (5) auth-start e auth-finish partono solo se la
+# regola del firewall è davvero in vigore (bk_auth_fw_live). Resta possibile, a chi è già
+# su questa macchina, solo far fallire il collegamento (si ricomincia).
 
 : "${BK_AUTH_DIR:=$BK_DIR/auth}"
 : "${BK_AUTH_START_WAIT:=20}" "${BK_AUTH_FINISH_WAIT:=30}"
@@ -2308,9 +2313,10 @@ bk_auth_port_ok() {
   out="$(_bk_nolock ss -Hltnp "sport = :$BK_AUTH_PORT" 2>/dev/null || true)"
   lines="$(grep -c . <<<"$out" || true)"
   [[ "$lines" == 1 ]] || { log "vps-backup: porta $BK_AUTH_PORT: $lines listener invece di 1"; return 1; }
-  # shellcheck disable=SC2086
-  set -- $out
-  [[ "${4:-}" == "127.0.0.1:$BK_AUTH_PORT" ]] || { log "vps-backup: porta $BK_AUTH_PORT in ascolto su ${4:-?}, non su 127.0.0.1"; return 1; }
+  local _st _rq _sq laddr _rest
+  # shellcheck disable=SC2034
+  read -r _st _rq _sq laddr _rest <<<"$out"
+  [[ "$laddr" == "127.0.0.1:$BK_AUTH_PORT" ]] || { log "vps-backup: porta $BK_AUTH_PORT in ascolto su ${laddr:-?}, non su 127.0.0.1"; return 1; }
   if [[ "$out" =~ pid=([0-9]+) ]]; then pid="${BASH_REMATCH[1]}"; else return 1; fi
   [[ "$(grep -o 'pid=' <<<"$out" | grep -c .)" == 1 ]] || return 1
   main="$(_bk_nolock systemctl show -p MainPID --value "$BK_AUTH_UNIT.service" 2>/dev/null || true)"
@@ -2325,6 +2331,91 @@ bk_auth_port_ok() {
     return 1
   fi
   BK_ERR=""
+}
+
+# bk_auth_peer_ok BIN FD — il socket stabilito sul descrittore FD (nostro, aperto verso
+# 127.0.0.1:PORTA) ha dall'altra parte il processo principale dell'unità, e il suo
+# eseguibile è BIN. Si riconosce il nostro socket dalla coppia pid/fd, il suo capo
+# opposto dalla porta locale. Ogni dubbio = rifiuto.
+bk_auth_peer_ok() {
+  local bin="$1" fd="$2" out laddr paddr proc ours="" pid="" main exe n=0 _rq _sq
+  BK_ERR="la porta $BK_AUTH_PORT è occupata da un altro processo: collegamento annullato"
+  out="$(_bk_nolock ss -Htnp state established "( sport = :$BK_AUTH_PORT or dport = :$BK_AUTH_PORT )" 2>/dev/null || true)"
+  # shellcheck disable=SC2034
+  while read -r _rq _sq laddr paddr proc; do
+    [[ "$proc" == *"pid=$BASHPID,fd=$fd)"* ]] && ours="$laddr"
+  done <<<"$out"
+  [[ -n "$ours" ]] || { log "vps-backup: socket verso la porta $BK_AUTH_PORT non riconosciuto"; return 1; }
+  # shellcheck disable=SC2034
+  while read -r _rq _sq laddr paddr proc; do
+    if [[ "$laddr" == "127.0.0.1:$BK_AUTH_PORT" && "$paddr" == "$ours" ]]; then
+      n=$((n + 1))
+      if [[ "$proc" =~ pid=([0-9]+) ]]; then pid="${BASH_REMATCH[1]}"; fi
+      [[ "$(grep -o 'pid=' <<<"$proc" | grep -c .)" == 1 ]] || { log "vps-backup: più processi sul socket della porta $BK_AUTH_PORT"; return 1; }
+    fi
+  done <<<"$out"
+  [[ "$n" == 1 && -n "$pid" ]] || { log "vps-backup: controparte del socket non trovata ($n)"; return 1; }
+  main="$(_bk_nolock systemctl show -p MainPID --value "$BK_AUTH_UNIT.service" 2>/dev/null || true)"
+  if [[ ! "$main" =~ ^[1-9][0-9]*$ || "$main" != "$pid" ]]; then
+    log "vps-backup: il socket della porta $BK_AUTH_PORT è del processo $pid, non dell'unità (pid ${main:-?})"
+    return 1
+  fi
+  exe="$(readlink -f "$BK_PROC_DIR/$pid/exe" 2>/dev/null || true)"
+  if [[ -z "$exe" || "$exe" != "$(readlink -f "$bin" 2>/dev/null)" ]]; then
+    log "vps-backup: il processo $pid sulla porta $BK_AUTH_PORT non è rclone (${exe:-?})"
+    return 1
+  fi
+  BK_ERR=""
+}
+
+# bk_auth_http BIN PERCORSO — GET locale a rclone con connessione fissata: unità viva e
+# listener giusto prima di collegarsi; poi si apre il TCP con il builtin di bash, si
+# verifica la controparte e solo allora si scrive la richiesta (PERCORSO può contenere
+# state e code: printf è un builtin, niente argomenti di processi) sullo stesso
+# descrittore; si legge la risposta con tempi massimi. Imposta _BK_HTTP_STATUS e
+# _BK_HTTP_LOC; BK_ERR e 1 se non va.
+_BK_HTTP_STATUS="" _BK_HTTP_LOC=""
+bk_auth_http() {
+  local bin="$1" path="$2" fd line="" first=1 lines=0
+  _BK_HTTP_STATUS="" _BK_HTTP_LOC=""
+  if ! bk_auth_alive; then
+    BK_ERR="l'autorizzazione non è più attiva: ricomincia da \"Collega Google Drive\""
+    return 1
+  fi
+  bk_auth_port_ok "$bin" || return 1
+  # shellcheck disable=SC2261
+  if ! { exec {fd}<>"/dev/tcp/127.0.0.1/$BK_AUTH_PORT"; } 2>/dev/null; then
+    BK_ERR="rclone non è raggiungibile: ricomincia da \"Collega Google Drive\""
+    return 1
+  fi
+  if ! bk_auth_peer_ok "$bin" "$fd"; then
+    exec {fd}>&-
+    return 1
+  fi
+  # shellcheck disable=SC2261
+  if ! { printf 'GET %s HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nConnection: close\r\n\r\n' "$path" "$BK_AUTH_PORT" >&"$fd"; } 2>/dev/null; then
+    exec {fd}>&-
+    BK_ERR="rclone non ha accettato la richiesta: ricomincia da \"Collega Google Drive\""
+    return 1
+  fi
+  while ((lines < 60)) && IFS= read -r -t 10 -u "$fd" line; do
+    lines=$((lines + 1))
+    line="${line%$'\r'}"
+    [[ -n "$line" ]] || break
+    if ((first)); then
+      first=0
+      _BK_HTTP_STATUS="${line#* }"
+      _BK_HTTP_STATUS="${_BK_HTTP_STATUS%% *}"
+    elif [[ "${line,,}" == location:* ]]; then
+      _BK_HTTP_LOC="${line#*:}"
+      _BK_HTTP_LOC="${_BK_HTTP_LOC# }"
+    fi
+  done
+  exec {fd}>&-
+  if [[ ! "$_BK_HTTP_STATUS" =~ ^[0-9]{3}$ ]]; then
+    BK_ERR="rclone non ha risposto: ricomincia da \"Collega Google Drive\""
+    return 1
+  fi
 }
 
 # bk_auth_check_location LOCATION STATE CLIENT_ID — l'indirizzo di Google dato da rclone
@@ -2358,6 +2449,26 @@ bk_auth_check_location() {
     esac
   done
   ((${#seen[@]} == 6)) || return 1
+}
+
+# Coda della regola del firewall: la stessa per la generazione (bk_firewall_install) e
+# per il controllo (bk_auth_fw_live).
+bk_fw_rule_tail() {
+  printf -- '-o lo -p tcp --dport %s -m owner ! --uid-owner 0 -j REJECT' "$BK_AUTH_PORT"
+}
+
+# bk_auth_fw_live — 0 solo se la regola che riserva la porta a root è in vigore ora:
+# iptables -C su ufw-before-output e, se la catena v6 esiste, ip6tables -C su
+# ufw6-before-output. Altrimenti BK_ERR e 1 (chiusura in caso di dubbio).
+bk_auth_fw_live() {
+  local -a tail
+  read -ra tail <<<"$(bk_fw_rule_tail)"
+  if _bk_nolock iptables -C ufw-before-output "${tail[@]}" >/dev/null 2>&1 \
+    && { ! _bk_nolock ip6tables -S ufw6-before-output >/dev/null 2>&1 || _bk_nolock ip6tables -C ufw6-before-output "${tail[@]}" >/dev/null 2>&1; }; then
+    return 0
+  fi
+  BK_ERR="regola del firewall per la porta $BK_AUTH_PORT non attiva: esegui install.sh --tools-only"
+  return 1
 }
 
 # bk_auth_alive — 0 se l'unità di rclone sta girando.
@@ -2400,7 +2511,7 @@ _bk_auth_msg() {
 # senza unità né file lasciati. Senza $(...): le variabili andrebbero perse.
 bk_auth_start() {
   local -a righe cmd
-  local id sec bin dir="$BK_AUTH_DIR" f state="" k n exp hdr loc line rc=0 t
+  local id sec bin dir="$BK_AUTH_DIR" f state="" k n exp loc t
   mapfile -t righe < <(printf '%s' "$1")
   id="${righe[0]:-}" sec="${righe[1]:-}"
   id="${id%$'\r'}" sec="${sec%$'\r'}"
@@ -2412,6 +2523,7 @@ bk_auth_start() {
     BK_ERR="client id e secret vanno indicati insieme e con caratteri validi"
     return 1
   fi
+  bk_auth_fw_live || return 1
   read -ra cmd <<<"$BK_RCLONE"
   bin="$(command -v "${BK_AUTH_RCLONE:-${cmd[0]}}" 2>/dev/null || true)"
   if [[ "$bin" != /* ]]; then
@@ -2444,7 +2556,7 @@ bk_auth_start() {
     if [[ -n "${BK_AUTH_EXTRA:-}" && -f "$BK_AUTH_EXTRA" ]]; then cat "$BK_AUTH_EXTRA"; fi
   } >"$dir/env"
   # Uscita e errori in file: così il token (stdout di rclone) non passa dal journal.
-  if ! _bk_nolock systemd-run --unit "$BK_AUTH_UNIT" --collect --quiet -p RuntimeMaxSec=900 \
+  if ! _bk_nolock systemd-run --unit "$BK_AUTH_UNIT" --collect --quiet -p RuntimeMaxSec=960 \
     -p EnvironmentFile="$dir/env" -p StandardInput=null -p "StandardOutput=file:$dir/out" -p "StandardError=file:$dir/err" \
     -p Nice=10 -p DynamicUser=yes -p NoNewPrivileges=yes -p ProtectSystem=strict -p ProtectHome=yes -p PrivateTmp=yes \
     -p CapabilityBoundingSet= -p "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX" -p TimeoutStopSec=5 \
@@ -2478,31 +2590,18 @@ bk_auth_start() {
     BK_ERR="stato dell'autorizzazione non scritto"
     return 1
   fi
-  # Prima di parlare alla porta si controlla chi ci sta in ascolto, e che l'unità viva.
-  if ! bk_auth_alive || ! bk_auth_port_ok "$bin"; then
+  # L'indirizzo locale risponde con un redirect a Google: lo si legge senza seguirlo.
+  if ! bk_auth_http "$bin" "/auth?state=$state"; then
     t="$BK_ERR"
     bk_auth_clean
     BK_ERR="${t:-la porta $BK_AUTH_PORT è occupata da un altro processo: collegamento annullato}"
     return 1
   fi
-  # L'indirizzo locale risponde con un redirect a Google: lo si legge senza seguirlo.
-  # La configurazione di curl passa da stdin (-K -).
-  hdr="$(printf '%s\n' 'silent' 'output = "/dev/null"' 'dump-header = "-"' 'max-time = 10' 'connect-timeout = 5' 'noproxy = "*"' \
-    "url = \"http://127.0.0.1:$BK_AUTH_PORT/auth?state=$state\"" | _bk_nolock curl -K - 2>/dev/null)" || rc=$?
   loc=""
-  if ((rc == 0)); then
-    while IFS= read -r line; do
-      line="${line%$'\r'}"
-      if [[ "${line,,}" == location:* ]]; then
-        loc="${line#*:}"
-        loc="${loc# }"
-        break
-      fi
-    done <<<"$hdr"
-  fi
+  if [[ "$_BK_HTTP_STATUS" =~ ^30[1-8]$ ]]; then loc="$_BK_HTTP_LOC"; fi
   if ! bk_auth_check_location "$loc" "$state" "${id:-$BK_AUTH_DEFAULT_CLIENT_ID}"; then
     bk_auth_clean
-    BK_ERR="rclone non ha dato l'indirizzo di Google atteso: collegamento annullato"
+    BK_ERR="rclone non ha dato l'indirizzo di Google atteso (una versione di rclone diversa da quella del pacchetto Debian può causarlo): collegamento annullato"
     return 1
   fi
   BK_AUTH_URL="$loc"
@@ -2603,7 +2702,7 @@ bk_auth_parse() {
 # Tempi: curl al massimo 10 s, attesa del token BK_AUTH_FINISH_WAIT (30), poi le tre
 # chiamate di bk_connect (BK_CONNECT_TIMEOUT ciascuna): dentro i ~110 s del pannello.
 _bk_auth_consume() {
-  local state="$1" code="$_BK_AU_CODE" dir="$BK_AUTH_DIR" enc k n got=0 tok="" dati line inblk=0 id="" sec="" rc=0 bin
+  local state="$1" code="$_BK_AU_CODE" dir="$BK_AUTH_DIR" enc k n got=0 tok="" dati line inblk=0 id="" sec="" bin
   bin="$(jq -r '.bin // ""' "$dir/meta.json" 2>/dev/null || true)"
   enc="${code//\//%2F}"
   if [[ -f "$dir/env" ]]; then
@@ -2614,16 +2713,13 @@ _bk_auth_consume() {
       esac
     done <"$dir/env"
   fi
-  # Il code lo si consegna solo al nostro rclone: ultima verifica di unità e porta.
-  if ! bk_auth_alive || ! bk_auth_port_ok "$bin"; then
+  # Il code lo si consegna solo al nostro rclone, sulla connessione verificata.
+  if ! bk_auth_http "$bin" "/?state=$state&code=$enc"; then
     [[ -n "$BK_ERR" ]] || BK_ERR="la porta $BK_AUTH_PORT è occupata da un altro processo: collegamento annullato"
     return 1
   fi
-  # L'indirizzo (con il code) passa da stdin di curl, mai dagli argomenti.
-  printf '%s\n' 'silent' 'fail' 'output = "/dev/null"' 'max-time = 10' 'connect-timeout = 5' 'noproxy = "*"' \
-    "url = \"http://127.0.0.1:$BK_AUTH_PORT/?state=$state&code=$enc\"" | _bk_nolock curl -K - >/dev/null 2>&1 || rc=$?
-  if ((rc != 0)); then
-    BK_ERR="l'autorizzazione non ha risposto (rclone non è raggiungibile): ricomincia da \"Collega Google Drive\""
+  if [[ ! "$_BK_HTTP_STATUS" =~ ^2 ]]; then
+    BK_ERR="rclone ha rifiutato la richiesta ($_BK_HTTP_STATUS): ricomincia da \"Collega Google Drive\""
     return 1
   fi
   n=$((BK_AUTH_FINISH_WAIT * 4))
@@ -2682,6 +2778,7 @@ bk_auth_finish() {
     BK_ERR="l'autorizzazione non è più attiva: ricomincia da \"Collega Google Drive\""
     return 1
   fi
+  bk_auth_fw_live || return 1
   bk_auth_parse "$1" "$saved" || rc=$?
   if ((rc == 2)); then
     bk_auth_clean
@@ -2693,6 +2790,12 @@ bk_auth_finish() {
   # il code, che vale una volta sola.
   if ! bk_lock_global; then
     BK_ERR="backup in corso, riprova dopo"
+    return 1
+  fi
+  # Col lock in mano il tempo è passato: servono almeno 30 s per concludere.
+  if ((exp - $(date +%s) < 30)); then
+    bk_auth_clean
+    BK_ERR="l'autorizzazione sta per scadere: ricomincia da \"Collega Google Drive\""
     return 1
   fi
   rc=0
@@ -2715,7 +2818,7 @@ bk_firewall_install() {
     grep -qF "$begin" "$BK_UFW_DIR/$f" && continue
     chain=ufw-before-output
     [[ "$f" == before6.rules ]] && chain=ufw6-before-output
-    rule="-I $chain 1 -o lo -p tcp --dport $BK_AUTH_PORT -m owner ! --uid-owner 0 -j REJECT"
+    rule="-I $chain 1 $(bk_fw_rule_tail)"
     tmp="$(mktemp "$BK_UFW_DIR/.$f.XXXXXX")" || return 1
     if ! awk -v b="$begin" -v e="$end" -v r="$rule" '/^COMMIT$/ && !done { print b; print r; print e; done = 1 } { print }' "$BK_UFW_DIR/$f" >"$tmp" \
       || ! grep -qF "$begin" "$tmp"; then
@@ -2727,8 +2830,15 @@ bk_firewall_install() {
     mv -f "$tmp" "$BK_UFW_DIR/$f" || { rm -f "$tmp"; return 1; }
     changed=1
   done
-  if ((changed)) && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-    ufw reload >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: ufw reload non riuscito dopo la regola della porta $BK_AUTH_PORT"
+  # Ricarica ufw se il file è cambiato o se il blocco c'è ma la regola non è in vigore.
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    if ((changed)) || ! bk_auth_fw_live; then
+      ufw reload >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: ufw reload non riuscito dopo la regola della porta $BK_AUTH_PORT"
+    fi
+  elif ! bk_auth_fw_live; then
+    # Non è un errore dell'installazione (ufw può essere spento di proposito), ma il
+    # collegamento guidato a Drive resta rifiutato finché la regola non c'è.
+    log "ATTENZIONE: ufw non attivo: la regola della porta $BK_AUTH_PORT non è in vigore e il collegamento guidato a Google Drive resterà rifiutato"
   fi
   return 0
 }

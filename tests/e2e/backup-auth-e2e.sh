@@ -17,6 +17,7 @@ chmod 755 "$work"
 made_rclone=
 made_ipt=
 fw_chain=
+fw6_chain=
 mock=
 
 fail() {
@@ -33,6 +34,11 @@ cleanup() {
     iptables -D OUTPUT -j ufw-before-output 2>/dev/null
     iptables -F ufw-before-output 2>/dev/null
     iptables -X ufw-before-output 2>/dev/null
+  fi
+  if [[ -n "$fw6_chain" ]]; then
+    ip6tables -D OUTPUT -j ufw6-before-output 2>/dev/null
+    ip6tables -F ufw6-before-output 2>/dev/null
+    ip6tables -X ufw6-before-output 2>/dev/null
   fi
   [[ -z "$made_ipt" ]] || DEBIAN_FRONTEND=noninteractive apt-get purge -y -q iptables >/dev/null 2>&1
   [[ -z "$made_rclone" ]] || DEBIAN_FRONTEND=noninteractive apt-get purge -y -q rclone >/dev/null 2>&1
@@ -87,6 +93,10 @@ mkdir -p "$VPS_OPT/secrets" "$BK_LOCK_DIR" "$SYSTEMD_DIR" "$BK_UFW_DIR"
 vb() { bash "$src/tools/vps-backup" "$@"; }
 
 echo "== firewall: regola generata da bk_firewall_install, controllata e applicata davvero con iptables"
+# Non si tocca un ufw vero: se la catena di ufw esiste già, ci si ferma.
+if iptables -S ufw-before-output >/dev/null 2>&1 || ip6tables -S ufw6-before-output >/dev/null 2>&1; then
+  fail "esiste già ufw-before-output: su questa macchina c'è un ufw vero, il collaudo non lo tocca"
+fi
 printf '*filter
 :ufw-before-output - [0:0]
 -A ufw-before-output -o lo -j ACCEPT
@@ -105,6 +115,22 @@ iptables-restore --test <"$BK_UFW_DIR/before.rules" || fail "iptables-restore no
 iptables-restore -n <"$BK_UFW_DIR/before.rules" || fail "iptables-restore"
 fw_chain=1
 iptables -I OUTPUT 1 -j ufw-before-output
+if command -v ip6tables-restore >/dev/null 2>&1 && ip6tables -S >/dev/null 2>&1; then
+  ip6tables-restore --test <"$BK_UFW_DIR/before6.rules" || fail "ip6tables-restore non accetta before6.rules"
+  ip6tables-restore -n <"$BK_UFW_DIR/before6.rules" || fail "ip6tables-restore"
+  fw6_chain=1
+  ip6tables -I OUTPUT 1 -j ufw6-before-output
+  echo "   (v6 applicata davvero)"
+fi
+rule="-o lo -p tcp --dport 53682 -m owner ! --uid-owner 0 -j REJECT"
+echo "== senza la regola viva auth-start rifiuta; con la regola riparte"
+# shellcheck disable=SC2086
+iptables -D ufw-before-output $rule || fail "rimozione della regola"
+res="$(vb auth-start </dev/null)" && fail "auth-start senza la regola del firewall"
+jq -e '.ok == false and (.error | test("regola del firewall"))' <<<"$res" >/dev/null || fail "messaggio: $res"
+[[ ! -e "$BK_DIR/auth" ]] || fail "cartella rimasta"
+# shellcheck disable=SC2086
+iptables -I ufw-before-output 1 $rule || fail "regola non rimessa"
 
 echo "== auth-start con client id e secret propri"
 res="$(printf 'e2e-id.apps.googleusercontent.com\nE2E-SECRET-xyz\n' | vb auth-start)" || fail "auth-start: $res"
@@ -122,7 +148,7 @@ vb status | jq -e '.auth.pending == true and (.auth.expires | test("Z$"))' >/dev
 [[ "$(stat -c %a "$BK_DIR/auth/env")" == 600 ]] || fail "permessi di env"
 if pgrep -f "[E]2E-SECRET|[e]2e-id.apps" >/dev/null; then fail "client id/secret negli argomenti di un processo"; fi
 if systemctl show vps-backup-auth.service -p Environment -p ExecStart | grep -F E2E-SECRET >/dev/null; then fail "secret nelle proprietà dell'unità"; fi
-systemctl show vps-backup-auth.service -p RuntimeMaxUSec | grep -q '15min' || fail "RuntimeMaxSec: $(systemctl show vps-backup-auth.service -p RuntimeMaxUSec)"
+systemctl show vps-backup-auth.service -p RuntimeMaxUSec | grep -q '16min' || fail "RuntimeMaxSec: $(systemctl show vps-backup-auth.service -p RuntimeMaxUSec)"
 state="$(jq -r .state "$BK_DIR/auth/meta.json")"
 mainpid="$(systemctl show -p MainPID --value vps-backup-auth.service)"
 [[ "$(ps -o user= -p "$mainpid")" != root ]] || fail "rclone gira come root: DynamicUser non attivo"
