@@ -29,6 +29,13 @@ while (my $c = $s->accept) {
   $line = '' unless defined $line;
   while (my $h = <$c>) { last if $h eq "\r\n" || $h eq "\n"; }
   append($log, $line) if length $line;
+  if (-f "$log.drip") {
+    print $c "HTTP/1.1 307 Temporary Redirect
+";
+    for (1 .. 30) { print $c "X-a: b
+"; sleep 1; }
+    exit 0;
+  }
   if ($line =~ m{^GET /auth\?state=(\S+) HTTP}) {
     my $loc = slurp($locfile);
     if ($loc eq '') {

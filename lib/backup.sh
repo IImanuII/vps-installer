@@ -2255,6 +2255,7 @@ BK_AUTH_PORT=53682
 # Google quando non se ne dà uno proprio (verificato con rclone vero).
 BK_AUTH_DEFAULT_CLIENT_ID=202264815644.apps.googleusercontent.com
 : "${BK_PROC_DIR:=/proc}"
+: "${BK_AUTH_HTTP_DEADLINE:=20}"
 : "${BK_UFW_DIR:=/etc/ufw}"
 BK_AUTH_FD=""
 export BK_AUTH_URL="" BK_AUTH_EXPIRES=""
@@ -2338,22 +2339,32 @@ bk_auth_port_ok() {
 # eseguibile è BIN. Si riconosce il nostro socket dalla coppia pid/fd, il suo capo
 # opposto dalla porta locale. Ogni dubbio = rifiuto.
 bk_auth_peer_ok() {
-  local bin="$1" fd="$2" out laddr paddr proc ours="" pid="" main exe n=0 _rq _sq
+  local bin="$1" fd="$2" out laddr paddr proc ours="" pid="" main exe n=0 _rq _sq attempt
   BK_ERR="la porta $BK_AUTH_PORT è occupata da un altro processo: collegamento annullato"
-  out="$(_bk_nolock ss -Htnp state established "( sport = :$BK_AUTH_PORT or dport = :$BK_AUTH_PORT )" 2>/dev/null || true)"
-  # shellcheck disable=SC2034
-  while read -r _rq _sq laddr paddr proc; do
-    [[ "$proc" == *"pid=$BASHPID,fd=$fd)"* ]] && ours="$laddr"
-  done <<<"$out"
-  [[ -n "$ours" ]] || { log "vps-backup: socket verso la porta $BK_AUTH_PORT non riconosciuto"; return 1; }
-  # shellcheck disable=SC2034
-  while read -r _rq _sq laddr paddr proc; do
-    if [[ "$laddr" == "127.0.0.1:$BK_AUTH_PORT" && "$paddr" == "$ours" ]]; then
-      n=$((n + 1))
-      if [[ "$proc" =~ pid=([0-9]+) ]]; then pid="${BASH_REMATCH[1]}"; fi
-      [[ "$(grep -o 'pid=' <<<"$proc" | grep -c .)" == 1 ]] || { log "vps-backup: più processi sul socket della porta $BK_AUTH_PORT"; return 1; }
+  # Un socket appena accettato può non avere ancora il processo nella lista di ss (è ancora
+  # nella coda di accept): fino a 3 tentativi a ~50 ms prima di rifiutare. Più processi
+  # sullo stesso socket = rifiuto subito.
+  for attempt in 1 2 3; do
+    ours="" pid="" n=0
+    out="$(_bk_nolock ss -Htnp state established "( sport = :$BK_AUTH_PORT or dport = :$BK_AUTH_PORT )" 2>/dev/null || true)"
+    # shellcheck disable=SC2034
+    while read -r _rq _sq laddr paddr proc; do
+      [[ "$proc" == *"pid=$BASHPID,fd=$fd)"* ]] && ours="$laddr"
+    done <<<"$out"
+    if [[ -n "$ours" ]]; then
+      # shellcheck disable=SC2034
+      while read -r _rq _sq laddr paddr proc; do
+        if [[ "$laddr" == "127.0.0.1:$BK_AUTH_PORT" && "$paddr" == "$ours" ]]; then
+          n=$((n + 1))
+          if [[ "$proc" =~ pid=([0-9]+) ]]; then pid="${BASH_REMATCH[1]}"; fi
+          [[ "$(grep -o 'pid=' <<<"$proc" | grep -c .)" -le 1 ]] || { log "vps-backup: più processi sul socket della porta $BK_AUTH_PORT"; return 1; }
+        fi
+      done <<<"$out"
+      [[ "$n" == 1 && -n "$pid" ]] && break
     fi
-  done <<<"$out"
+    ((attempt == 3)) || sleep 0.05
+  done
+  [[ -n "$ours" ]] || { log "vps-backup: socket verso la porta $BK_AUTH_PORT non riconosciuto"; return 1; }
   [[ "$n" == 1 && -n "$pid" ]] || { log "vps-backup: controparte del socket non trovata ($n)"; return 1; }
   main="$(_bk_nolock systemctl show -p MainPID --value "$BK_AUTH_UNIT.service" 2>/dev/null || true)"
   if [[ ! "$main" =~ ^[1-9][0-9]*$ || "$main" != "$pid" ]]; then
@@ -2376,7 +2387,7 @@ bk_auth_peer_ok() {
 # _BK_HTTP_LOC; BK_ERR e 1 se non va.
 _BK_HTTP_STATUS="" _BK_HTTP_LOC=""
 bk_auth_http() {
-  local bin="$1" path="$2" fd line="" first=1 lines=0
+  local bin="$1" path="$2" fd line="" first=1 lines=0 deadline left done_=0
   _BK_HTTP_STATUS="" _BK_HTTP_LOC=""
   if ! bk_auth_alive; then
     BK_ERR="l'autorizzazione non è più attiva: ricomincia da \"Collega Google Drive\""
@@ -2398,10 +2409,19 @@ bk_auth_http() {
     BK_ERR="rclone non ha accettato la richiesta: ricomincia da \"Collega Google Drive\""
     return 1
   fi
-  while ((lines < 60)) && IFS= read -r -t 10 -u "$fd" line; do
+  # Tempo totale per la risposta (non per ogni riga): chi la centellina non ci tiene qui.
+  deadline=$((SECONDS + BK_AUTH_HTTP_DEADLINE))
+  while ((lines < 60)); do
+    left=$((deadline - SECONDS))
+    ((left > 0)) || break
+    ((left <= 10)) || left=10
+    IFS= read -r -t "$left" -u "$fd" line || break
     lines=$((lines + 1))
     line="${line%$'\r'}"
-    [[ -n "$line" ]] || break
+    if [[ -z "$line" ]]; then
+      done_=1
+      break
+    fi
     if ((first)); then
       first=0
       _BK_HTTP_STATUS="${line#* }"
@@ -2412,7 +2432,7 @@ bk_auth_http() {
     fi
   done
   exec {fd}>&-
-  if [[ ! "$_BK_HTTP_STATUS" =~ ^[0-9]{3}$ ]]; then
+  if ((!done_)) || [[ ! "$_BK_HTTP_STATUS" =~ ^[0-9]{3}$ ]]; then
     BK_ERR="rclone non ha risposto: ricomincia da \"Collega Google Drive\""
     return 1
   fi

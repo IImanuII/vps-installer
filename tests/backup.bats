@@ -2812,6 +2812,8 @@ if [[ "$1" == -S ]]; then [[ ! -f "$T/ip6.nochain" ]] && exit 0; exit 1; fi
 exit 1'
 }
 
+# ATTENZIONE: i test di auth usano davvero la porta 53682 di loopback (tests/auth_mock.pl
+# fa da rclone): la porta deve essere libera e bats va lanciato in serie (niente --jobs).
 # auth_env — ambiente del tool: systemd-run finto che lancia tests/auth_mock.pl (un
 # finto `rclone authorize` vero, in ascolto su 127.0.0.1:53682), systemctl, iptables e
 # ip6tables finti, `ss` vero con riscritture opzionali (ss.pid, ss.local, ss.extra per
@@ -2832,6 +2834,13 @@ echo "ss $*" >>"$T/ss.calls"
 out="$("$SS_REAL" "$@")" || true
 if [[ " $* " == *" established "* ]]; then
   if [[ -f "$T/ss.est_pid" ]]; then out="$(sed -E "/^[0-9]+ +[0-9]+ +127\.0\.0\.1:53682 /s/pid=[0-9]+/pid=$(cat "$T/ss.est_pid")/" <<<"$out")"; fi
+  if [[ -f "$T/ss.est_empty" ]]; then
+    n="$(cat "$T/ss.est_empty")"
+    if ((n > 0)); then
+      echo $((n - 1)) >"$T/ss.est_empty"
+      out="$(sed -E "/^[0-9]+ +[0-9]+ +127\.0\.0\.1:53682 /s/ +users:.*$//" <<<"$out")"
+    fi
+  fi
 else
   if [[ -f "$T/ss.pid" ]]; then out="$(sed -E "s/pid=[0-9]+/pid=$(cat "$T/ss.pid")/" <<<"$out")"; fi
   if [[ -f "$T/ss.local" ]]; then out="$(sed -E "s/127\.0\.0\.1:53682/0.0.0.0:53682/" <<<"$out")"; fi
@@ -3787,4 +3796,35 @@ FW_MSG='regola del firewall per la porta 53682 non attiva: esegui install.sh --t
   bk_auth auth-start </dev/null
   [ "$status" -ne 0 ]
   jq -e '.error | test("versione di rclone diversa")' <<<"$output"
+}
+
+# --- ritentativi su ss e scadenza totale della risposta ---
+
+@test "auth-start: socket appena accettato senza processo in ss = si riprova (fino a 3 volte), poi rifiuta" {
+  auth_env
+  echo 2 >"$BATS_TEST_TMPDIR/ss.est_empty"
+  bk_auth auth-start </dev/null
+  [ "$status" -eq 0 ]
+  : >"$BATS_TEST_TMPDIR/mock.log"
+  echo 5 >"$BATS_TEST_TMPDIR/ss.est_empty"
+  bk_auth auth-start </dev/null
+  [ "$status" -ne 0 ]
+  jq -e --arg m "$PORT_MSG" '.error == $m' <<<"$output"
+  [ ! -s "$BATS_TEST_TMPDIR/mock.log" ]
+}
+
+@test "auth-start: una risposta centellinata supera la scadenza totale = errore, non si resta appesi" {
+  auth_env
+  export BK_AUTH_HTTP_DEADLINE=3
+  touch "$BATS_TEST_TMPDIR/mock.log.drip"
+  SECONDS=0
+  bk_auth auth-start </dev/null
+  [ "$status" -ne 0 ]
+  ((SECONDS < 12))
+  jq -e '.ok == false and (.error | test("non ha risposto"))' <<<"$output"
+  [ ! -e "$BK_DIR/auth" ]
+}
+
+@test "vps-backup: BK_AUTH_HTTP_DEADLINE non entra dall'ambiente del chiamante sotto sudo" {
+  grep -q 'BK_AUTH_HTTP_DEADLINE' "$REPO_ROOT/tools/vps-backup"
 }
