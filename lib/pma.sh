@@ -117,66 +117,26 @@ _pma_dbadmin_alter() {
   return 1
 }
 
-# _pma_as_panel CMD... — come utente panel con ambiente pulito (PD_AS_PANEL=0 solo
-# nei test). Il .env sta in una cartella del pannello: root non vi scrive mai per
-# percorso, perché panel potrebbe sostituire cartelle e file con link tra un
-# controllo e l'uso.
-_pma_as_panel() {
-  local path="${PMA_AS_PANEL_PATH:-/usr/bin:/bin}"
-  if [[ "${PD_AS_PANEL:-1}" == 0 ]]; then
-    env -i "PATH=$path" LC_ALL=C "$@" 9>&-
-  else
-    # fd 9 (lock) chiuso: un processo di panel non deve ereditare descrittori di root
-    runuser -u panel -- env -i "PATH=$path" LC_ALL=C "$@" 9>&-
-  fi
-}
-
-# _pma_env_check DIR FILE — cartella e file veri (non link), di panel:panel. Solo un
-# controllo di buon senso: la scrittura vera avviene comunque come panel.
-_pma_env_check() {
-  local want="${PD_PANEL_OWNER:-panel:panel}"
-  [[ -d "$1" && ! -L "$1" && "$(stat -c '%U:%G' "$1")" == "$want" ]] || return 1
-  [[ -f "$2" && ! -L "$2" && "$(stat -c '%U:%G' "$2")" == "$want" ]] || return 1
-}
-
 # pma_dbadmin_set PASSWORD — cambia la password di panel_dbadmin in MariaDB e
 # DBADMIN_PASS nel .env del pannello (radice dal manifest). Valore scritto grezzo,
 # come lo scrive l'installer; la riga viene aggiunta se manca. Il pannello non legge
 # DBADMIN_* (Config::CHIAVI): nessun reload di PHP-FPM necessario.
 pma_dbadmin_set() {
-  local new="$1" m root dir env old err
+  local new="$1" m root dir env old
   m="$(manifest_path)"
   [[ -f "$m" ]] || die "Manifest $m mancante: la VPS non è stata preparata da vps-installer"
   root="$(jq -r '.panel.path // empty' "$m")"
   [[ -n "$root" ]] || die "Il manifest non ha un pannello (panel.path)"
   dir="$root/config"
   env="$dir/.env"
-  _pma_env_check "$dir" "$env" \
+  panel_env_check "$dir" "$env" \
     || die "$env mancante o non sicuro (deve essere un file vero di panel:panel in una cartella vera): password non cambiata"
   # stesso lock di vps-panel-update/install, che riscrivono questo .env
   exec 9>"${PD_LOCK:-/run/vps-panel-update.lock}" || die "Lock del pannello non apribile"
   flock -w "${VPS_PMA_LOCK_WAIT:-30}" 9 || die "Un aggiornamento del pannello è in corso: riprova tra poco"
-  old="$(_pma_as_panel awk 'index($0, "DBADMIN_PASS=") == 1 { print substr($0, 14); exit }' "$env")" \
-    || die "$env non leggibile: password non cambiata"
+  old="$(env_get_as_panel "$env" DBADMIN_PASS)" || die "$env non leggibile: password non cambiata"
   _pma_dbadmin_alter "$new" || die "password di panel_dbadmin non cambiata (dettagli in $VPS_LOG)"
-  # Tutto il resto (lettura, file temporaneo, mv) è di panel. La nuova password
-  # arriva su stdin; il temporaneo, che contiene tutti i segreti, si toglie sempre.
-  if ! err="$(printf '%s\n' "$new" | _pma_as_panel sh -c '
-      umask 077
-      IFS= read -r nuova || exit 1
-      d=$1; f=$2
-      t="$(mktemp "$d/.tmp.XXXXXX")" || exit 1
-      trap "rm -f \"$t\"" EXIT
-      NUOVA=$nuova awk '\''
-        index($0, "DBADMIN_PASS=") == 1 { if (!fatto) print "DBADMIN_PASS=" ENVIRON["NUOVA"]; fatto = 1; next }
-        { print }
-        END { if (!fatto) print "DBADMIN_PASS=" ENVIRON["NUOVA"] }
-      '\'' "$f" >"$t" || exit 1
-      chmod --reference="$f" "$t" || exit 1
-      mv -f "$t" "$f" || exit 1' sh "$dir" "$env" 2>&1 >/dev/null)"; then
-    # lo stderr dei processi di panel non è mai l'fd del log di root: si registra qui
-    err="${err//"$new"/***}"
-    log "scrittura di $env non riuscita: ${err:0:300}"
+  if ! printf 'DBADMIN_PASS=%s\n' "$new" | env_merge_as_panel "$dir" "$env"; then
     # .env invariato: MariaDB torna alla password che il .env ancora contiene
     if [[ -n "$old" ]] && _pma_dbadmin_alter "$old"; then
       die "$env non scrivibile: password di panel_dbadmin rimasta quella di prima"

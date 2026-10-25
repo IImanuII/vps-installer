@@ -121,7 +121,9 @@ pd_checkout() {
 # segreti cifrati), TELEGRAM_BOT_TOKEN se TOKEN non è vuoto.
 pd_env_merge() {
   local lines="" key
-  if [[ -z "$(env_get "$PD_ENV" APP_KEY)" ]]; then
+  # Lettura e scrittura come panel (config/ è sua): root non segue percorsi suoi.
+  panel_env_check "$(dirname "$PD_ENV")" "$PD_ENV" || return 1
+  if [[ -z "$(env_get_as_panel "$PD_ENV" APP_KEY)" ]]; then
     key="$(openssl rand -base64 32)" || return 1
     [[ -n "$key" ]] || return 1
     lines+="APP_KEY=$key"$'\n'
@@ -130,7 +132,7 @@ pd_env_merge() {
     lines+="TELEGRAM_BOT_TOKEN=$1"$'\n'
   fi
   [[ -n "$lines" ]] || return 0
-  printf '%s' "$lines" | env_merge "$PD_ENV" 600 panel:panel
+  printf '%s' "$lines" | env_merge_as_panel "$(dirname "$PD_ENV")" "$PD_ENV"
 }
 
 pd_db_name() {

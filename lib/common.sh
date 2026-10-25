@@ -139,3 +139,69 @@ env_merge() {
     }' "$file")" || return 1
   printf '%s\n' "$merged" | write_file "$file" "$mode" "$owner"
 }
+
+# as_panel CMD... — come utente panel con ambiente pulito (PD_AS_PANEL=0 solo nei
+# test). Il .env sta in una cartella del pannello: root non vi legge né scrive per
+# percorso, perché panel potrebbe sostituire cartelle e file con link tra un
+# controllo e l'uso. fd 9 (lock) chiuso: panel non eredita descrittori di root.
+as_panel() {
+  local path="${PMA_AS_PANEL_PATH:-/usr/bin:/bin}"
+  if [[ "${PD_AS_PANEL:-1}" == 0 ]]; then
+    env -i "PATH=$path" LC_ALL=C "$@" 9>&-
+  else
+    runuser -u panel -- env -i "PATH=$path" LC_ALL=C "$@" 9>&-
+  fi
+}
+
+# panel_env_check DIR FILE — cartella vera (non link) di panel:panel; il file, se
+# c'è, vero e di panel:panel. Solo un controllo di buon senso: lettura e scrittura
+# vere avvengono comunque come panel.
+panel_env_check() {
+  local want="${PD_PANEL_OWNER:-panel:panel}"
+  [[ -d "$1" && ! -L "$1" && "$(stat -c '%U:%G' "$1")" == "$want" ]] || return 1
+  [[ ! -e "$2" && ! -L "$2" ]] && return 0
+  [[ -f "$2" && ! -L "$2" && "$(stat -c '%U:%G' "$2")" == "$want" ]] || return 1
+}
+
+# env_get_as_panel FILE KEY — come env_get, ma letto da panel e con un limite di
+# tempo (un FIFO al posto del file non deve bloccare root).
+env_get_as_panel() {
+  as_panel timeout 5 awk -v k="$2" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$1"
+}
+
+# env_merge_as_panel DIR FILE — righe KEY=VALUE da stdin, unite a FILE (in DIR) da
+# panel: file temporaneo nella stessa cartella + mv, permessi del file com'erano
+# (600 se nuovo). Valori solo su stdin; stderr di panel registrato da root, troncato.
+env_merge_as_panel() {
+  local err
+  panel_env_check "$1" "$2" || return 1
+  if ! err="$(as_panel timeout 30 sh -c '
+      umask 077
+      nuove="$(cat)"
+      d=$1; f=$2
+      t="$(mktemp "$d/.tmp.XXXXXX")" || exit 1
+      trap "rm -f \"$t\"" EXIT
+      if [ -e "$f" ]; then src=$f; else src=/dev/null; fi
+      NUOVE=$nuove awk '\''
+        BEGIN {
+          n = split(ENVIRON["NUOVE"], righe, "\n")
+          for (i = 1; i <= n; i++) {
+            k = righe[i]
+            if (index(k, "=") < 2) continue
+            sub(/=.*/, "", k)
+            val[k] = righe[i]; ordine[++m] = k
+          }
+        }
+        {
+          k = ""
+          if (index($0, "=") > 1) { k = $0; sub(/=.*/, "", k) }
+          if (k != "" && (k in val)) { if (!(k in fatto)) print val[k]; fatto[k] = 1 } else print
+        }
+        END { for (i = 1; i <= m; i++) if (!(ordine[i] in fatto)) { print val[ordine[i]]; fatto[ordine[i]] = 1 } }
+      '\'' "$src" >"$t" || exit 1
+      if [ -e "$f" ]; then chmod --reference="$f" "$t" || exit 1; else chmod 600 "$t" || exit 1; fi
+      mv -f "$t" "$f" || exit 1' sh "$1" "$2" 2>&1 >/dev/null)"; then
+    log "scrittura di $2 non riuscita: ${err:0:300}"
+    return 1
+  fi
+}

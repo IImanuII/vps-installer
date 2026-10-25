@@ -184,6 +184,42 @@ dev_release() {
   [ "$(cut -d' ' -f1,2 "$PD_KEY.pub")" = "$first" ]
 }
 
+@test "pd_env_merge: config/ sostituita da un link, rifiutato e bersaglio intatto" {
+  pd_load
+  mkdir "$BATS_TEST_TMPDIR/bersaglio"
+  printf 'X=1
+' >"$BATS_TEST_TMPDIR/bersaglio/.env"
+  mv "$P/config" "$P/config.vera"
+  ln -s "$BATS_TEST_TMPDIR/bersaglio" "$P/config"
+  run pd_env_merge "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  [ "$status" -ne 0 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/bersaglio/.env")" = 'X=1' ]
+  [ "$(ls -A "$BATS_TEST_TMPDIR/bersaglio" | wc -l)" = 1 ]
+}
+
+@test "pd_env_merge: .env che è un link rifiutato e bersaglio intatto" {
+  pd_load
+  printf 'X=1
+' >"$BATS_TEST_TMPDIR/vero.env"
+  rm "$PD_ENV"
+  ln -s "$BATS_TEST_TMPDIR/vero.env" "$PD_ENV"
+  run pd_env_merge "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  [ "$status" -ne 0 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/vero.env")" = 'X=1' ]
+}
+
+@test "pd_env_merge: lettura e scrittura del .env passano da runuser come panel" {
+  pd_load
+  unset PD_AS_PANEL
+  make_stub runuser 'printf "%s
+" "$*" >>"$BATS_TEST_TMPDIR/runuser.args"; [ "$1" = -u ] && [ "$3" = -- ] || exit 9; shift 3; exec "$@"'
+  pd_env_merge "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  [ "$(grep -c '^-u panel -- env -i ' "$BATS_TEST_TMPDIR/runuser.args")" -ge 2 ]
+  run ! grep -q '123456:AAAA' "$BATS_TEST_TMPDIR/runuser.args"
+  [ "$(env_get "$PD_ENV" TELEGRAM_BOT_TOKEN)" = "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" ]
+  [ "$(ls -A "$P/config" | wc -l)" = 1 ]
+}
+
 @test "pd_env_merge: se openssl fallisce niente APP_KEY vuoto" {
   make_stub openssl 'exit 1'
   pd_load

@@ -205,7 +205,7 @@ pma_web_env() {
 
 dbadmin_setup() {
   export VPS_LIB="$REPO_ROOT/lib" PD_LOCK="$BATS_TEST_TMPDIR/panel.lock"
-  # niente utente panel nei test: stesso utente, ma la scrittura passa da _pma_as_panel
+  # niente utente panel nei test: stesso utente, ma la scrittura passa da as_panel
   export PD_AS_PANEL=0 PD_PANEL_OWNER="$(id -un):$(id -gn)" PMA_AS_PANEL_PATH="$BATS_TEST_TMPDIR/bin:/usr/bin:/bin"
   PROOT="$BATS_TEST_TMPDIR/www/panel.example.com"
   mkdir -p "$PROOT/config"

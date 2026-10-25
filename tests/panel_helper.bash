@@ -9,6 +9,7 @@ pd_test_setup() {
   export PD_BACKUPS="$BATS_TEST_TMPDIR/backups" PD_CRON="$BATS_TEST_TMPDIR/cron-vps-panel"
   export PD_LOCK="$BATS_TEST_TMPDIR/update.lock" PD_KEY="$VPS_OPT/secrets/panel-deploy-key" PD_GIT_DIR="$BATS_TEST_TMPDIR/panel.git"
   export PD_PHP="$BATS_TEST_TMPDIR/bin/php" VPS_LIB="$REPO_ROOT/lib"
+  export PD_PANEL_OWNER="$(id -un):$(id -gn)"
   export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
   P="$BATS_TEST_TMPDIR/panel"
   mkdir -p "$P/config" "$P/public" "$P/logs" "$P/storage"
