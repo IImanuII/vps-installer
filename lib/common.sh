@@ -140,33 +140,49 @@ env_merge() {
   printf '%s\n' "$merged" | write_file "$file" "$mode" "$owner"
 }
 
-# as_panel CMD... — come utente panel con ambiente pulito (PD_AS_PANEL=0 solo nei
-# test). Il .env sta in una cartella del pannello: root non vi legge né scrive per
-# percorso, perché panel potrebbe sostituire cartelle e file con link tra un
-# controllo e l'uso. fd 9 (lock) chiuso: panel non eredita descrittori di root.
+# as_panel [-t SEC] CMD... — come utente panel con ambiente pulito (PD_AS_PANEL=0
+# solo nei test). Il .env sta in una cartella del pannello: root non vi legge né
+# scrive per percorso, perché panel potrebbe sostituire cartelle e file con link
+# tra un controllo e l'uso. Regole per ogni chiamante:
+#  - nessun descrittore oltre 0-2 arriva a panel (lock, log, {fd} di root): qui si
+#    chiudono tutti;
+#  - lo stdin è quello del chiamante: le letture lo reindirizzano da /dev/null;
+#  - il limite di tempo (-t) è di root, fuori dal processo di panel: `timeout -k 2`
+#    attorno a runuser, così panel non può ignorarlo.
 as_panel() {
-  local path="${PMA_AS_PANEL_PATH:-/usr/bin:/bin}"
-  if [[ "${PD_AS_PANEL:-1}" == 0 ]]; then
-    env -i "PATH=$path" LC_ALL=C "$@" 9>&-
-  else
-    runuser -u panel -- env -i "PATH=$path" LC_ALL=C "$@" 9>&-
-  fi
+  local secs="" path="${PMA_AS_PANEL_PATH:-/usr/bin:/bin}"
+  local -a cmd=()
+  if [[ "${1-}" == -t ]]; then secs="$2"; shift 2; fi
+  if [[ -n "$secs" ]]; then cmd+=(timeout -k 2 "$secs"); fi
+  if [[ "${PD_AS_PANEL:-1}" != 0 ]]; then cmd+=(runuser -u panel --); fi
+  (
+    local f n
+    for f in /proc/self/fd/*; do
+      n="${f##*/}"
+      if [[ "$n" =~ ^[0-9]+$ ]] && ((n > 2)); then eval "exec $n>&-" 2>/dev/null || true; fi
+    done
+    exec "${cmd[@]}" env -i "PATH=$path" LC_ALL=C "$@"
+  )
 }
 
 # panel_env_check DIR FILE — cartella vera (non link) di panel:panel; il file, se
 # c'è, vero e di panel:panel. Solo un controllo di buon senso: lettura e scrittura
-# vere avvengono comunque come panel.
+# vere avvengono comunque come panel. Il motivo del rifiuto va nel log.
 panel_env_check() {
   local want="${PD_PANEL_OWNER:-panel:panel}"
-  [[ -d "$1" && ! -L "$1" && "$(stat -c '%U:%G' "$1")" == "$want" ]] || return 1
-  [[ ! -e "$2" && ! -L "$2" ]] && return 0
-  [[ -f "$2" && ! -L "$2" && "$(stat -c '%U:%G' "$2")" == "$want" ]] || return 1
+  if [[ -d "$1" && ! -L "$1" && "$(stat -c '%U:%G' "$1")" == "$want" ]] \
+    && { [[ ! -e "$2" && ! -L "$2" ]] || [[ -f "$2" && ! -L "$2" && "$(stat -c '%U:%G' "$2")" == "$want" ]]; }; then
+    return 0
+  fi
+  log "ERRORE: $1 o $2 non è un vero file/cartella di panel:panel (link o altro proprietario): non lo tocco"
+  return 1
 }
 
 # env_get_as_panel FILE KEY — come env_get, ma letto da panel e con un limite di
-# tempo (un FIFO al posto del file non deve bloccare root).
+# tempo (un FIFO al posto del file non deve bloccare root). Un errore di lettura è
+# un errore: chi chiama non deve scambiarlo per "chiave assente".
 env_get_as_panel() {
-  as_panel timeout 5 awk -v k="$2" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$1"
+  as_panel -t 5 awk -v k="$2" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$1" </dev/null
 }
 
 # env_merge_as_panel DIR FILE — righe KEY=VALUE da stdin, unite a FILE (in DIR) da
@@ -175,7 +191,7 @@ env_get_as_panel() {
 env_merge_as_panel() {
   local err
   panel_env_check "$1" "$2" || return 1
-  if ! err="$(as_panel timeout 30 sh -c '
+  if ! err="$(as_panel -t 30 sh -c '
       umask 077
       nuove="$(cat)"
       d=$1; f=$2
@@ -201,6 +217,8 @@ env_merge_as_panel() {
       '\'' "$src" >"$t" || exit 1
       if [ -e "$f" ]; then chmod --reference="$f" "$t" || exit 1; else chmod 600 "$t" || exit 1; fi
       mv -f "$t" "$f" || exit 1' sh "$1" "$2" 2>&1 >/dev/null)"; then
+    # output di panel: niente a capo né caratteri di controllo (righe finte nel log)
+    err="$(printf '%s' "$err" | tr -c '[:print:]' ' ')"
     log "scrittura di $2 non riuscita: ${err:0:300}"
     return 1
   fi

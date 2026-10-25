@@ -75,9 +75,10 @@ EOT
 }
 
 install_token() {
-  local n t
+  local n t cur
   TOKEN=""
-  [[ -z "$(env_get "$PD_ENV" TELEGRAM_BOT_TOKEN)" ]] || return 0
+  cur="$(env_get_as_panel "$PD_ENV" TELEGRAM_BOT_TOKEN)" || die "$PD_ENV non leggibile"
+  [[ -z "$cur" ]] || return 0
   for n in 1 2 3; do
     ask t "Token del bot Telegram (da @BotFather): " silent
     t="$(trim "$t")" # un token non ha spazi: quelli di un copia-incolla si tolgono

@@ -465,3 +465,13 @@ _bk_panel_env() {
   [ -s "$BATS_TEST_TMPDIR/fd.list" ]
   run ! grep -e panel.lock -e test.log "$BATS_TEST_TMPDIR/fd.list"
 }
+
+@test "vps-pma-pass dbadmin: controlli e a capo dello stderr di panel non finiscono nel log" {
+  dbadmin_setup
+  make_stub mv 'printf "boom\nRIGA-FINTA\033[31m\n" >&2; exit 1'
+  run bash -c "printf '%s' 'NuovaPassword-123' | bash '$DBA' dbadmin"
+  [ "$status" -eq 1 ]
+  run ! grep -q '^RIGA-FINTA' "$VPS_LOG"
+  run ! grep -q $'\033' "$VPS_LOG"
+  grep -q 'boom' "$VPS_LOG"
+}

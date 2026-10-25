@@ -373,3 +373,39 @@ dev_release() {
   [ "$(jq -r .panel.deployed_at "$VPS_OPT/manifest.json")" != null ]
   [ "$(jq -r .panel.domain "$VPS_OPT/manifest.json")" = panel.test ]
 }
+
+@test "pd_env_merge: lettura di APP_KEY fallita = errore, mai chiave nuova" {
+  pd_load
+  mkdir -p "$BATS_TEST_TMPDIR/pbin"
+  printf '#!/bin/sh\ncase "$*" in *-v*k=*) exit 1 ;; *) exec /usr/bin/awk "$@" ;; esac\n' >"$BATS_TEST_TMPDIR/pbin/awk"
+  chmod +x "$BATS_TEST_TMPDIR/pbin/awk"
+  make_stub openssl 'echo chiamato >>"$BATS_TEST_TMPDIR/openssl.called"; echo chiave'
+  PMA_AS_PANEL_PATH="$BATS_TEST_TMPDIR/pbin:/usr/bin:/bin" run pd_env_merge ""
+  [ "$status" -ne 0 ]
+  [ ! -e "$BATS_TEST_TMPDIR/openssl.called" ]
+  run ! grep -q '^APP_KEY=' "$PD_ENV"
+}
+
+@test "as_panel: timeout dalla parte di root, stdin per le letture, nessun fd oltre 2" {
+  pd_load
+  unset PD_AS_PANEL
+  make_stub timeout 'echo "$*" >>"$BATS_TEST_TMPDIR/timeout.args"; shift 3; exec "$@"'
+  make_stub runuser 'for f in /proc/$$/fd/*; do n="${f##*/}"; [ "$n" -gt 2 ] && readlink "$f"; done >>"$BATS_TEST_TMPDIR/fd.list"; shift 3; exec "$@"'
+  exec 7>"$BATS_TEST_TMPDIR/fd7.file"
+  exec {fdx}>"$BATS_TEST_TMPDIR/fdx.file"
+  env_get_as_panel "$PD_ENV" DB_HOST
+  exec 7>&-
+  exec {fdx}>&-
+  grep -q '^-k 2 5 runuser -u panel -- env -i ' "$BATS_TEST_TMPDIR/timeout.args"
+  run ! grep -e fd7.file -e fdx.file "$BATS_TEST_TMPDIR/fd.list"
+}
+
+@test "pd_env_merge: il rifiuto dice perché; DB_PREFIX e token letti come panel" {
+  pd_load
+  mv "$P/config" "$P/config.vera"
+  ln -s "$P/config.vera" "$P/config"
+  run pd_env_merge ""
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"panel:panel"* ]]
+  run ! grep -rn 'env_get "\$PD_ENV"' "$REPO_ROOT/lib" "$REPO_ROOT/tools"
+}

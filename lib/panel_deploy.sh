@@ -120,10 +120,12 @@ pd_checkout() {
 # pd_env_merge TOKEN — APP_KEY solo se manca (cambiarla renderebbe illeggibili i
 # segreti cifrati), TELEGRAM_BOT_TOKEN se TOKEN non è vuoto.
 pd_env_merge() {
-  local lines="" key
+  local lines="" key cur
   # Lettura e scrittura come panel (config/ è sua): root non segue percorsi suoi.
   panel_env_check "$(dirname "$PD_ENV")" "$PD_ENV" || return 1
-  if [[ -z "$(env_get_as_panel "$PD_ENV" APP_KEY)" ]]; then
+  # Una lettura fallita non è "APP_KEY assente": ne nascerebbe una chiave nuova.
+  cur="$(env_get_as_panel "$PD_ENV" APP_KEY)" || return 1
+  if [[ -z "$cur" ]]; then
     key="$(openssl rand -base64 32)" || return 1
     [[ -n "$key" ]] || return 1
     lines+="APP_KEY=$key"$'\n'
@@ -226,7 +228,7 @@ pd_health() {
 pd_super_admin_exists() {
   local db prefix n
   db="$(pd_db_name)" || return 2
-  prefix="$(env_get "$PD_ENV" DB_PREFIX)"
+  prefix="$(env_get_as_panel "$PD_ENV" DB_PREFIX)" || return 2
   prefix="${prefix:-vp_}"
   [[ "$prefix" =~ ^[a-z0-9_]{0,20}$ ]] || return 2
   n="$(mariadb -N -B -e "SELECT COUNT(*) FROM \`${prefix}users\` WHERE role = 'super_admin'" "$db")" || return 2
