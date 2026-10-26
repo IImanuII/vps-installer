@@ -819,7 +819,8 @@ sent() {
   done
   [ "$n" -eq 3 ]
   [ "$(grep -cxF -- '--globoff' "$T/curl.args")" -eq 3 ]
-  grep -A1 -xF -- '--max-filesize' "$T/curl.args" | grep -qxF 2097152
+  # dai file delle singole chiamate: in curl.args le chiamate parallele si mescolano
+  cat "$T"/curl.call.* | grep -A1 -xF -- '--max-filesize' | grep -qxF 2097152
   [ "$(head -n1 "$T/curl.args")" = -q ]
 }
 
