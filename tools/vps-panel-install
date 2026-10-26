@@ -160,6 +160,7 @@ main() {
   pd_reload_php || die "Reload di PHP-FPM non riuscito"
   pd_health || die "Il pannello non risponde su /health: guarda $PANEL_ROOT/logs/ e $VPS_LOG"
   pd_manifest "$TAG"
+  opt_logrotate || log "ATTENZIONE: rotazione dei log del pannello non configurata"
   say "Plancia $TAG installata: https://$PANEL_DOMAIN/login"
 }
 

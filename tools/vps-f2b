@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# vps-f2b status|unban IP — i ban di fail2ban per jail e lo sblocco di un IP (in tutte le jail).
+# Sotto sudo l'ambiente del chiamante non deve influenzare lo script.
+if [[ -n "${SUDO_USER:-}" ]]; then
+  VPS_OPT=/opt/vps
+  VPS_LIB=$VPS_OPT/lib
+  VPS_TEMPLATES=$VPS_OPT/templates
+  VPS_LOG=/var/log/vps-tools.log
+  unset MSMTPRC_LINK HTPASSWD_PMA ALIASES_FILE PMA_DIR NGINX_SNIPPETS CF_API CF_IPS_URL PMA_BASE_URL
+  [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
+  chmod 640 "$VPS_LOG"
+fi
+: "${VPS_OPT:=/opt/vps}" "${VPS_LOG:=/var/log/vps-tools.log}"
+: "${VPS_TEMPLATES:=$VPS_OPT/templates}"
+for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
+  # shellcheck source=/dev/null
+  source "$_lib"
+done
+tool_init
+
+case "${1:-}" in
+  status)
+    [[ $# -eq 1 ]] || json_err "uso: vps-f2b status|unban IP"
+    f2b_status || json_err "fail2ban non risponde: è attivo?"
+    ;;
+  unban)
+    if [[ $# -ne 2 ]] || ! f2b_valid_ip "$2"; then
+      json_err "indirizzo IP non valido"
+    fi
+    fail2ban-client ping >/dev/null 2>&1 || json_err "fail2ban non risponde: è attivo?"
+    # `unban IP` lo toglie da tutte le jail e dice quante volte era bannato.
+    n="$(fail2ban-client unban "$2" 2>>"$VPS_LOG")" || json_err "sblocco non riuscito (dettagli in $VPS_LOG)"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    log "fail2ban: sbloccato $2 ($n)"
+    json_ok --arg ip "$2" --argjson n "$n" '{ok: true, ip: $ip, unbanned: $n}'
+    ;;
+  *)
+    json_err "uso: vps-f2b status|unban IP"
+    ;;
+esac

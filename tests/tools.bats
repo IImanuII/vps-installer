@@ -190,7 +190,7 @@ smtp_set() {
   run grep -q 'ALL$' "$f"
   [ "$status" -ne 0 ]
   grep -qxF 'Defaults:panel env_reset' "$f"
-  grep -qxF 'panel ALL=(root) NOPASSWD: /opt/vps/bin/vps-status, /opt/vps/bin/vps-cf-token, /opt/vps/bin/vps-cf-purge, /opt/vps/bin/vps-cf-ips-update, /opt/vps/bin/vps-smtp, /opt/vps/bin/vps-pma-pass, /opt/vps/bin/vps-pma-update, /opt/vps/bin/vps-site, /opt/vps/bin/vps-monitor, /opt/vps/bin/vps-files, /opt/vps/bin/vps-backup' "$f"
+  grep -qxF 'panel ALL=(root) NOPASSWD: /opt/vps/bin/vps-status, /opt/vps/bin/vps-cf-token, /opt/vps/bin/vps-cf-purge, /opt/vps/bin/vps-cf-ips-update, /opt/vps/bin/vps-smtp, /opt/vps/bin/vps-pma-pass, /opt/vps/bin/vps-pma-update, /opt/vps/bin/vps-site, /opt/vps/bin/vps-monitor, /opt/vps/bin/vps-files, /opt/vps/bin/vps-backup, /opt/vps/bin/vps-f2b' "$f"
   if command -v visudo >/dev/null 2>&1; then
     visudo -cf "$f"
   fi

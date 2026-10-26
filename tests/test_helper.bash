@@ -12,7 +12,10 @@ setup_common() {
   export VPS_TEMPLATES="$REPO_ROOT/templates"
   export VPS_SBIN="$BATS_TEST_TMPDIR/sbin"
   export VPS_NO_CHOWN=1
-  mkdir -p "$VPS_ROOT" "$VPS_OPT"
+  # Mai /etc/logrotate.d vero: un test che arriva a opt_logrotate scrive qui.
+  : "${LOGROTATE_D:=$BATS_TEST_TMPDIR/logrotate.d}"
+  export LOGROTATE_D
+  mkdir -p "$VPS_ROOT" "$VPS_OPT" "$LOGROTATE_D"
   local f
   shopt -s nullglob
   for f in "$REPO_ROOT"/lib/*.sh; do

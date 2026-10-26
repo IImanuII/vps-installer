@@ -364,3 +364,32 @@ sys_setup() {
   opt_system_files
   grep -qx pma-snippet "$BATS_TEST_TMPDIR/sys.calls"
 }
+
+@test "opt_logrotate: log di sistema e del pannello, il pannello come panel" {
+  mkdir -p "$BATS_TEST_TMPDIR/www/panel.miosito.it/logs"
+  jq -n --arg p "$BATS_TEST_TMPDIR/www/panel.miosito.it" '{panel:{domain:"panel.miosito.it", path:$p}}' >"$VPS_OPT/manifest.json"
+  opt_logrotate
+  f="$LOGROTATE_D/vps"
+  [ "$(stat -c %a "$f")" = 644 ]
+  grep -qxF '/var/log/vps-tools.log /var/log/vps-installer.log /var/log/msmtp.log {' "$f"
+  grep -qxF "$BATS_TEST_TMPDIR/www/panel.miosito.it/logs/*.log {" "$f"
+  [ "$(grep -c 'su panel panel' "$f")" = 1 ]
+  [ "$(grep -c 'rotate 8' "$f")" = 2 ]
+}
+
+@test "opt_logrotate: senza pannello, o con un percorso strano, solo i log di sistema" {
+  jq -n '{}' >"$VPS_OPT/manifest.json"
+  opt_logrotate
+  grep -qF '/var/log/vps-tools.log' "$LOGROTATE_D/vps"
+  ! grep -qF 'su panel' "$LOGROTATE_D/vps"
+  mkdir -p "$BATS_TEST_TMPDIR/a b/logs"
+  jq -n --arg p "$BATS_TEST_TMPDIR/a b" '{panel:{path:$p}}' >"$VPS_OPT/manifest.json"
+  opt_logrotate
+  ! grep -qF 'su panel' "$LOGROTATE_D/vps"
+}
+
+@test "opt_system_files scrive anche la rotazione dei log" {
+  jq -n '{}' >"$VPS_OPT/manifest.json"
+  opt_system_files
+  [ -f "$LOGROTATE_D/vps" ]
+}

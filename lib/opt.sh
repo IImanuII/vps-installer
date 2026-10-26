@@ -112,6 +112,26 @@ opt_pma_snippet() {
   fi
 }
 
+# opt_logrotate — fino alla 1.8.0 crescevano senza limite i log dell'installer e degli script
+# (vps-tools.log, vps-installer.log), di msmtp e del pannello (logs/*.log: php-error, sistema).
+# I log dei siti hanno il loro file (vps-site-<slug>). Quelli del pannello stanno in una
+# cartella di panel: logrotate ci lavora come panel, cosi' un link messo li' non gli fa
+# toccare file di root. Il file si riscrive a ogni --tools-only e da vps-panel-install.
+opt_logrotate() {
+  local m p
+  m="$(manifest_path)"
+  p="$(jq -r '.panel.path // empty' "$m" 2>/dev/null)" || p=""
+  {
+    printf '# vps-installer: file generato, non modificarlo a mano\n'
+    printf '/var/log/vps-tools.log /var/log/vps-installer.log /var/log/msmtp.log {\n'
+    printf '    weekly\n    rotate 8\n    missingok\n    notifempty\n    compress\n    delaycompress\n    copytruncate\n}\n'
+    if [[ "$p" =~ ^/[A-Za-z0-9._/-]+$ && "$p" != *..* && -d "$p/logs" ]]; then
+      printf '%s/logs/*.log {\n' "$p"
+      printf '    su panel panel\n    weekly\n    rotate 8\n    missingok\n    notifempty\n    compress\n    delaycompress\n    copytruncate\n}\n'
+    fi
+  } | write_file "$LOGROTATE_D/vps" 644 root:root
+}
+
 # opt_system_files — la parte di sistema degli script: sudoers del pannello,
 # cron, cartelle dei siti e pagina di manutenzione. La chiama anche
 # --tools-only: senza, una VPS già installata riceverebbe vps-site ma il
@@ -162,6 +182,7 @@ opt_system_files() {
   opt_panel_pool
   opt_panel_vhost
   opt_pma_snippet
+  opt_logrotate || log "ATTENZIONE: rotazione dei log di sistema e del pannello non configurata"
   # Aggiornamenti automatici: anche Nginx di nginx.org (dalla 1.5.3). Solo sulle
   # macchine che hanno gia' la configurazione dell'installer.
   if [[ -f "${APT_CONF_D:-/etc/apt/apt.conf.d}/52vps-unattended" ]]; then

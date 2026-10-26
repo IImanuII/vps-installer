@@ -81,6 +81,7 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | `/var/www/<sito>/wp-config.php` | configurazione WordPress, `root:site_<slug>` 640 (il sito non la riscrive); contiene password DB e password Redis del sito |
 | `/etc/cron.d/vps-site-<slug>` | cron di WordPress di un sito (al posto di wp-cron via web) |
 | `/etc/logrotate.d/vps-site-site_<slug>` | rotazione dei log di un sito (nota SP2a rimandata: ruota come root, i log PHP in `logs/php/` con `su`) |
+| `/etc/logrotate.d/vps` | rotazione settimanale (8 copie, compresse) di `vps-tools.log`, `vps-installer.log`, `msmtp.log` e dei log del pannello (`<radice>/logs/*.log`, come `panel`); riscritto da `--tools-only` e `vps-panel-install` (installer ≥ 1.9.0) |
 | `/var/www/_maintenance/_maintenance.html` | pagina 503 dei siti disattivati |
 | `/etc/systemd/system/vps-monitor.service` | `root:root` 644: `Type=oneshot`, `ExecStart=/opt/vps/bin/vps-monitor _run`, `TimeoutStartSec=55`, `Nice=5` |
 | `/etc/systemd/system/vps-monitor.timer` | `root:root` 644: `OnCalendar=*:*:00`, `AccuracySec=5s`, `Persistent=false`; installato spento, lo abilita/ferma `vps-monitor config` |
@@ -334,13 +335,19 @@ Come per gli altri script: JSON su stdout, errori `{"ok":false,"error":"…"}` c
 
 `vps-site create DOMINIO --from-backup NOME` (sincrono fino all'avvio, poi lavoro in background `job.op = "create"`): `NOME` è `sites/FILE` o `restore/FILE` (come in `list-local`) oppure `remote:dominio/file` (come in `list-remote`). Tipo, `www`, database e `login_path` vengono dal manifest (non si danno `--type`, `--www`, `--db` né le opzioni di WordPress: errore). Il dominio deve essere quello del manifest e del nome del file. **stdin: una riga con la password del database nuovo, solo se la copia ha un database** (stesse regole di `db-password`). Il sito si crea come una creazione normale (DNS, utente, cartelle, pool, certificato, vhost, database); per WordPress niente download né `wp core install`: utente Redis nuovo e `wp-config.php` nuovo (credenziali nuove, chiavi nuove); poi parte `vps-backup _restore` in modalità `all` (`files` senza database). Il sito resta `creating` (`job.step` `restore`) finché il ripristino non finisce; poi `active` e `job.step` `done`. Se il ripristino fallisce il sito resta **`active` e vuoto**, con `job.step` `restore` e `job.error` che spiega perché ("sito creato ma vuoto, ripristino non riuscito: …"): si può riprovare dalla pagina Backup con `restore`/`restore-local`; se invece fallisce un passo di creazione si disfa tutto come in una creazione normale (`error`, si pulisce con `delete`). `list`/`show` mostrano `from_backup: {source:"local"|"remote", name, login_path, table_prefix}` (`table_prefix` è `null` se la copia non è WordPress o il manifest non lo ha) e, per WordPress, `wordpress` con `login_path` (da `manifest`), `admin_user: null`, `cloudflare_plugin: false`. L'eliminazione di un sito scrive l'archivio finale nello stesso formato (`backups/sites/<dominio>-AAAAMMGG-HHMMSS.tar.gz`, root 600): un disco quasi pieno ferma l'eliminazione ("spazio insufficiente… niente è stato cancellato"). Il prefisso delle tabelle WordPress viene dal manifest (`table_prefix`, scritto dall'archiviazione leggendo il `wp-config.php` vivo di root, validato `^[A-Za-z0-9_]{1,20}$`, predefinito `wp_`): mai dal `wp-config.php` dell'archivio né dal dump. Il lavoro gira nell'unità `vps-site-<slug>-create` e il ripristino ne è un processo figlio: il pannello **non deve fidarsi del nome dell'unità** per capire se un ripristino è in corso, ma di `state`, `job` e di `vps-backup status`. Durante il ripristino il lock globale dei lavori di `vps-site` è libero (gli altri lavori non aspettano); se un giro di backup, un ripristino o un'altra creazione da copia è in corso `create --from-backup` risponde subito `backup o ripristino in corso, riprova più tardi` (o `un'altra creazione da copia è in corso…`); il ripristino già in coda a una creazione aspetta comunque fino a 10 minuti che un giro finisca. Un sito PHP con database ricreato riceve la password nuova solo in `db.env`: le applicazioni che tengono la configurazione dentro `public/` (restituita dall'archivio) hanno ancora la vecchia e vanno aggiornate a mano. Se il ripristino fallisce non si installa il cron di WordPress: lo mette il primo ripristino di file riuscito.
 
+Fornito dall'installer v1.9.0 (eseguito dal pannello, in sudoers):
+
+| Comando | Risposta |
+|---|---|
+| `vps-f2b status` | `{"ok":true,"jails":[{"name","currently_failed","total_banned","banned":[{"ip","until"}]}]}`: le jail attive con gli IP bannati adesso; `until` è la fine del ban (`AAAA-MM-GG HH:MM:SS`, ora del server; `9999-12-31 23:59:59` = permanente) o `null`. Errore `fail2ban non risponde: è attivo?` |
+| `vps-f2b unban IP` | `{"ok":true,"ip","unbanned":N}`: toglie l'IP da tutte le jail (`N` = in quante era). IPv4 o IPv6 singolo, niente reti; `indirizzo IP non valido` altrimenti |
+
 Previsti per il pannello (da scrivere con il pannello, stesse regole):
 
 | Script | Cosa farà |
 |---|---|
 | `vps-cache` | attiva/disattiva/svuota cache FastCGI di un sito |
 | `vps-service` | restart/reload di nginx, php-fpm, mariadb, redis (whitelist) |
-| `vps-f2b` | elenco/sblocco IP bannati |
 | `vps-user` | cambio password utente admin, gestione chiavi SSH |
 
 ## 5. Database
@@ -364,5 +371,5 @@ Convenzione: DB e utenti dei siti hanno nome `site_<slug>` (es. `site_miosito_it
 - [x] **Backup:** fatto, pagina Backup (Plancia 2.7.0): collegamento a Google Drive, pianificazione, stato e copie locali e su Drive, ripristino, siti eliminati ricreabili. Usa `vps-backup` e `vps-site create --from-backup` (installer 1.7.0).
 - [ ] **Siti:** creazione statico / PHP fatta con `vps-site` (installer 1.2); WordPress fatto con `vps-site create --type wordpress` e `vps-site wp-install` (installer 1.3); resta la cache (`vps-cache`, 2c).
 - [x] **Stato server:** fatto (Plancia 2.5.0): dashboard da `vps-status` e `vps-monitor status`, pagina Avvisi con `vps-monitor config`/`test`.
-- [ ] **Sicurezza:** IP bannati da fail2ban, sblocco. Usa `vps-f2b`.
-- [ ] **Pulizia log:** rotazione/pulizia dei log Nginx dei siti (era in `da fare.txt`).
+- [x] **Sicurezza:** fatto (Plancia 2.9.0 + installer 1.9.0): pagina Fail2ban, IP bannati e sblocco. Usa `vps-f2b`.
+- [x] **Pulizia log:** fatto lato installer: log dei siti in `vps-site-<slug>` (dalla 1.2), log di sistema e del pannello in `/etc/logrotate.d/vps` (1.9.0). Nel pannello la pagina Registri svuota i canali a mano.
