@@ -7,6 +7,8 @@
 #   files.tar.gz    public/... (letto come utente del sito) + wp-config.php (letto da root)
 #   db.sql.gz       solo se il sito ha un database
 
+# run.sh carica lib/*.sh in ordine alfabetico: qui common.sh non è ancora stato letto.
+: "${VPS_OPT:=/opt/vps}"
 : "${BK_DIR:=$VPS_OPT/backup}"
 : "${BK_BACKUPS:=$VPS_OPT/backups}"
 : "${BK_LOCK_DIR:=/run}"

@@ -64,3 +64,10 @@ setup() {
   run -127 run_steps
   grep -q "false_cmd_xyz" "$VPS_LOG"
 }
+
+@test "run.sh carica le librerie: i percorsi di vps-backup stanno sotto /opt/vps anche senza VPS_OPT" {
+  # lib/backup.sh viene prima di lib/common.sh nell'ordine alfabetico
+  run env -i PATH="$PATH" bash -c 'source "$1/run.sh"; printf "%s\n" "$BK_DIR" "$BK_BACKUPS" "$BK_CONFIG" "$BK_RCLONE_CONF"' _ "$REPO_ROOT"
+  [ "$status" -eq 0 ]
+  [ "$output" = $'/opt/vps/backup\n/opt/vps/backups\n/opt/vps/backup/config.json\n/opt/vps/secrets/rclone.conf' ]
+}
