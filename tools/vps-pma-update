@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # vps-pma-update — aggiorna phpMyAdmin all'ultima versione verificata.
+# vps-pma-update --check — solo le versioni (installata e ultima), nessuna modifica.
 # Sotto sudo l'ambiente del chiamante non deve influenzare lo script.
 if [[ -n "${SUDO_USER:-}" ]]; then
   VPS_OPT=/opt/vps
   VPS_LIB=$VPS_OPT/lib
   VPS_TEMPLATES=$VPS_OPT/templates
   VPS_LOG=/var/log/vps-tools.log
-  unset MSMTPRC_LINK HTPASSWD_PMA ALIASES_FILE PMA_DIR NGINX_SNIPPETS CF_API CF_IPS_URL PMA_BASE_URL
+  unset MSMTPRC_LINK HTPASSWD_PMA ALIASES_FILE PMA_DIR NGINX_SNIPPETS CF_API CF_IPS_URL PMA_BASE_URL PMA_UPDATE_LOCK
   [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
   chmod 640 "$VPS_LOG"
 fi
@@ -17,6 +18,25 @@ for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
   source "$_lib"
 done
 tool_init
+: "${PMA_UPDATE_LOCK:=/run/vps-pma-update.lock}"
+
+if [[ "${1:-}" == "--check" && $# -eq 1 ]]; then
+  current="$(pma_installed_version)"
+  # Senza rete l'installata si mostra lo stesso: latest null, non un errore.
+  latest="$(pma_latest_version)" || latest=""
+  json_ok --arg c "$current" --arg l "$latest" '
+    def num: split(".") | map(tonumber);
+    {ok: true,
+     installed: (if $c == "" then null else $c end),
+     latest: (if $l == "" then null else $l end),
+     update_available: ($l != "" and ($c == "" or ($l | num) > ($c | num)))}'
+  exit 0
+fi
+[[ $# -eq 0 ]] || json_err "uso: vps-pma-update [--check]"
+
+# Due clic dal pannello non devono sostituire la cartella insieme.
+exec 9>"$PMA_UPDATE_LOCK"
+flock -n 9 || json_err "aggiornamento di phpMyAdmin già in corso"
 
 latest="$(pma_latest_version)" || json_err "impossibile leggere l'ultima versione di phpMyAdmin"
 current="$(pma_installed_version)"

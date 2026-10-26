@@ -148,7 +148,7 @@ Forniti dall'installer (v1):
 | `vps-cf-ips-update` | — | scarica gli IP Cloudflare, rigenera `cloudflare-realip.conf` e regole UFW 80/443, `nginx -t` + reload. Anche da cron settimanale |
 | `vps-smtp` | `set` (config JSON da stdin) / `test <email>` / `disable` | scrive `msmtprc`, manda email di prova, aggiorna il manifest |
 | `vps-pma-pass` | `set` / `dbadmin` (password da stdin, 12-72 caratteri, una riga) | `set`: rigenera `.htpasswd-pma` (bcrypt). `dbadmin`: `ALTER USER 'panel_dbadmin'@'localhost'` come root dal socket (SQL su stdin, mai negli argomenti) e riscrive `DBADMIN_PASS=` in `<radice pannello>/config/.env` (radice dal manifest; file temporaneo + `mv`, stesso proprietario e permessi, le altre righe intatte, la riga è aggiunta se manca; lock `/run/vps-panel-update.lock`, attesa 30 s). Risposta `{"ok":true}`. `ALTER` fallito: `.env` non toccato; `.env` non scrivibile: la password MariaDB torna a quella letta prima. La password non può iniziare né finire con spazio o apice (il `.env` li taglierebbe). Plancia non legge `DBADMIN_*` (`Config::CHIAVI`): nessun reload di PHP-FPM. Errori: `password troppo lunga: massimo 72 caratteri`, `password non valida: ...`, `File .../.env mancante: password non cambiata`, `password di panel_dbadmin non cambiata`, `... non scrivibile: password di panel_dbadmin rimasta quella di prima` |
-| `vps-pma-update` | — | scarica l'ultima phpMyAdmin, verifica GPG + SHA256, sostituisce mantenendo `config.inc.php` |
+| `vps-pma-update` | `[--check]` | scarica l'ultima phpMyAdmin, verifica GPG + SHA256, sostituisce mantenendo `config.inc.php`; `{ok, updated, version, previous?}`, rifiuta se un altro aggiornamento è in corso. Con `--check` (installer ≥ 1.7.8; prima l'argomento era ignorato e lo script aggiornava) non tocca niente: `{ok, installed, latest, update_available}`, `latest` null se phpmyadmin.net non risponde |
 | `vps-status` | — | stato servizi, versioni, disco, RAM, aggiornamenti disponibili (sostituisce gli script di health check) |
 
 Forniti dall'installer v1.1, **eseguiti dall'amministratore** (non dal pannello, non in sudoers):
@@ -360,8 +360,8 @@ Convenzione: DB e utenti dei siti hanno nome `site_<slug>` (es. `site_miosito_it
 
 - [ ] **Email:** pagina di configurazione SMTP (host, porta, utente, password, mittente, destinatario avvisi), pulsante "invia email di prova", link alle guide per **Gmail app password** e **Brevo** (con nota su SPF/DKIM per mittente sul proprio dominio). Usa `vps-smtp`.
 - [x] **Cloudflare:** fatto (Plancia 2.4.0): cambio/verifica token, svuotamento cache. Usa `vps-cf-token`, `vps-cf-purge`, `vps-cf-ips-update`.
-- [ ] **phpMyAdmin:** versione installata vs ultima, aggiornamento, cambio password basic auth. Usa `vps-pma-update`, `vps-pma-pass`.
-- [ ] **Backup:** pagina Backup (Plancia 2.7.0): collegamento a Google Drive, pianificazione, stato e copie locali e su Drive, ripristino, siti eliminati ricreabili. Usa `vps-backup` e `vps-site create --from-backup` (installer 1.7.0).
+- [x] **phpMyAdmin:** fatto (Plancia 2.7.0 password, 2.7.8 versione e aggiornamento). Usa `vps-pma-update`, `vps-pma-pass`.
+- [x] **Backup:** fatto, pagina Backup (Plancia 2.7.0): collegamento a Google Drive, pianificazione, stato e copie locali e su Drive, ripristino, siti eliminati ricreabili. Usa `vps-backup` e `vps-site create --from-backup` (installer 1.7.0).
 - [ ] **Siti:** creazione statico / PHP fatta con `vps-site` (installer 1.2); WordPress fatto con `vps-site create --type wordpress` e `vps-site wp-install` (installer 1.3); resta la cache (`vps-cache`, 2c).
 - [x] **Stato server:** fatto (Plancia 2.5.0): dashboard da `vps-status` e `vps-monitor status`, pagina Avvisi con `vps-monitor config`/`test`.
 - [ ] **Sicurezza:** IP bannati da fail2ban, sblocco. Usa `vps-f2b`.

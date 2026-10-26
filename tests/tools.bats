@@ -3,7 +3,7 @@ bats_require_minimum_version 1.5.0
 setup() {
   load test_helper
   setup_common
-  export VPS_LIB="$REPO_ROOT/lib" MSMTPRC_LINK="$BATS_TEST_TMPDIR/msmtprc" ALIASES_FILE="$BATS_TEST_TMPDIR/aliases"
+  export PMA_UPDATE_LOCK="$BATS_TEST_TMPDIR/pma.lock" VPS_LIB="$REPO_ROOT/lib" MSMTPRC_LINK="$BATS_TEST_TMPDIR/msmtprc" ALIASES_FILE="$BATS_TEST_TMPDIR/aliases"
   T="$REPO_ROOT/tools"
   jq -n '{admin_user:"manu", cloudflare:{enabled:true, origin_locked:false, zone:"miosito.it"}, mail:{configured:false}, components:{phpmyadmin:"5.2.3"}}' >"$VPS_OPT/manifest.json"
 }
@@ -62,6 +62,53 @@ setup() {
   run bash "$T/vps-pma-update"
   [ "$status" -eq 0 ]
   [ "$(jq -r .updated <<<"$output")" = false ]
+}
+
+@test "vps-pma-update --check: versioni senza toccare niente" {
+  export PMA_DIR="$VPS_OPT/phpmyadmin"
+  mkdir -p "$PMA_DIR/libraries/classes"
+  printf "    public const VERSION = '5.2.3' . VERSION_SUFFIX;
+" >"$PMA_DIR/libraries/classes/Version.php"
+  make_stub curl 'echo "{\"version\":\"5.10.0\"}"'
+  run bash "$T/vps-pma-update" --check
+  [ "$status" -eq 0 ]
+  [ "$(jq -c '{installed, latest, update_available}' <<<"$output")" = '{"installed":"5.2.3","latest":"5.10.0","update_available":true}' ]
+  grep -q "5.2.3" "$PMA_DIR/libraries/classes/Version.php"
+  [ "$(jq -r .components.phpmyadmin "$VPS_OPT/manifest.json")" = 5.2.3 ]
+}
+
+@test "vps-pma-update --check: aggiornato, o senza rete (latest null, non un errore)" {
+  export PMA_DIR="$VPS_OPT/phpmyadmin"
+  mkdir -p "$PMA_DIR/libraries/classes"
+  printf "    public const VERSION = '5.2.3' . VERSION_SUFFIX;
+" >"$PMA_DIR/libraries/classes/Version.php"
+  make_stub curl 'echo "{\"version\":\"5.2.3\"}"'
+  run bash "$T/vps-pma-update" --check
+  [ "$(jq -r .update_available <<<"$output")" = false ]
+  make_stub curl 'exit 6'
+  run bash "$T/vps-pma-update" --check
+  [ "$status" -eq 0 ]
+  [ "$(jq -c '{ok, installed, latest, update_available}' <<<"$output")" = '{"ok":true,"installed":"5.2.3","latest":null,"update_available":false}' ]
+}
+
+@test "vps-pma-update: argomenti sconosciuti rifiutati, nessun download" {
+  make_stub curl 'echo chiamato >>"$BATS_TEST_TMPDIR/curl.calls"; echo "{\"version\":\"9.9.9\"}"'
+  run bash "$T/vps-pma-update" --chek
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"uso"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/curl.calls" ]
+}
+
+@test "vps-pma-update: un altro aggiornamento in corso, nessun download" {
+
+  make_stub curl 'echo chiamato >>"$BATS_TEST_TMPDIR/curl.calls"; echo "{\"version\":\"9.9.9\"}"'
+  exec 8>"$PMA_UPDATE_LOCK"
+  flock -n 8
+  run bash "$T/vps-pma-update"
+  exec 8>&-
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"in corso"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/curl.calls" ]
 }
 
 @test "il sudoers elenca solo gli script wrapper" {
