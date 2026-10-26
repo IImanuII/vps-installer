@@ -9,7 +9,9 @@ sites_test_setup() {
   export PHP_POOL_D="$BATS_TEST_TMPDIR/pool.d" LOGROTATE_D="$BATS_TEST_TMPDIR/logrotate.d"
   export VPS_SITE_SELF="$REPO_ROOT/tools/vps-site" VPS_LIB="$REPO_ROOT/lib"
   export CALLS="$BATS_TEST_TMPDIR/calls"
-  mkdir -p "$SITES_WWW" "$NGINX_CONF_D" "$PHP_POOL_D" "$LOGROTATE_D" "$VPS_OPT/secrets"
+  # lock dei siti di vps-backup: /run non è scrivibile senza root (CI)
+  export BK_LOCK_DIR="$BATS_TEST_TMPDIR/locks"
+  mkdir -p "$SITES_WWW" "$NGINX_CONF_D" "$PHP_POOL_D" "$LOGROTATE_D" "$VPS_OPT/secrets" "$BK_LOCK_DIR"
   printf 'dns_cloudflare_api_token = %s\n' "$(printf 'a%.0s' {1..40})" >"$VPS_OPT/secrets/cloudflare.ini"
   jq -n '{installer_version:"1.2.0", admin_user:"manu", ipv4:"203.0.113.10", ipv6:null,
     cloudflare:{enabled:true, zone:"miosito.it"}, components:{redis:true, redis_acl:true},
