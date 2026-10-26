@@ -1978,7 +1978,8 @@ _bk_flush_cache() {
   if grep -q "^user $slug " "$REDIS_ACL_FILE" 2>/dev/null; then
     _bk_nolock_fn site_redis_purge "$d" >/dev/null 2>&1 || log "ATTENZIONE: cache Redis di $d non svuotata"
   fi
-  zone="$(site_reg_get "$d" '.zone // ""' 2>/dev/null || true)"
+  # Nel registro la zona e' {id, name} (vps-site): a vps-cf-purge serve il nome.
+  zone="$(site_reg_get "$d" '.zone | if type == "object" then (.name // "") else (. // "") end' 2>/dev/null || true)"
   if [[ -n "$zone" && "$(jq -r '.cloudflare.enabled // false' "$(manifest_path)" 2>/dev/null || true)" == true && -x "$BK_CF_PURGE" ]]; then
     _bk_nolock "$BK_CF_PURGE" "$zone" --all >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: cache Cloudflare di $zone non svuotata"
   fi

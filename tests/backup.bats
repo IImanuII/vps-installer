@@ -1545,7 +1545,7 @@ fdb_tables() { ls "$FAKEDB/$1" 2>/dev/null | paste -sd' '; }
 rs_site() {
   local d=a.it slug root
   mk_site "$d" yes
-  site_reg_update "$d" '.zone = "miosito.it"'
+  site_reg_update "$d" '.zone = {id: "z1", name: "miosito.it"}'
   slug="$(site_reg_get "$d" .slug)"
   root="$SITES_WWW/$d"
   printf 'DB_HOST=localhost\nDB_NAME=%s\nDB_USER=%s\nDB_PASS=Password-di-prova-123\n' "$slug" "$slug" >"$root/db.env"
