@@ -567,7 +567,7 @@ wait_for_file() {
   grep -qxF 'scope = drive.file' "$c"
   grep -q '^token = {.*"refresh_token":"1//SEGRETO-RINNOVO"' "$c"
   run ! grep -q client_id "$c"
-  grep -q -- "--config $c mkdir gdrive:Plancia-" "$BATS_TEST_TMPDIR/rclone.calls"
+  grep -q -- "--config $c -vv mkdir gdrive:Plancia-" "$BATS_TEST_TMPDIR/rclone.calls"
   grep -q 'rcat gdrive:Plancia-.*/.plancia-test' "$BATS_TEST_TMPDIR/rclone.calls"
   grep -q 'deletefile gdrive:Plancia-.*/.plancia-test' "$BATS_TEST_TMPDIR/rclone.calls"
   [ -s "$BATS_TEST_TMPDIR/rcat.stdin" ]
@@ -898,6 +898,7 @@ echo "$*" >>"$T/rclone.calls"
 jq -c ".job | {step, domain}" "$BK_STATE" >>"$T/steps.log" 2>/dev/null || echo null >>"$T/steps.log"
 n=0; for f in /proc/self/fd/*; do case "$(readlink "$f" 2>/dev/null)" in *vps-*.lock) n=$((n+1));; esac; done; echo $n >>"$T/lockfds"
 [[ "$1" == --config ]] && shift 2
+[[ "$1" == -vv ]] && shift
 sub="$1"; shift
 if [[ " $(cat "$T/rclone.fail" 2>/dev/null) " == *" $sub "* ]]; then cat "$T/rclone.msg" >&2; exit 1; fi
 rem() { echo "$D/${1#gdrive:}"; }
@@ -3452,6 +3453,32 @@ exit 0'
     jq -e '.ok == false and (.error | test("tempo scaduto"))' <<<"$output"
     [ "$(cat "$VPS_OPT/secrets/rclone.conf")" = vecchio ]
   done
+}
+
+@test "connect: tempo scaduto con l'ultimo errore di rclone (rate limit), senza segreti" {
+  bk_tool_env
+  export BK_CONNECT_TIMEOUT=1
+  # shellcheck disable=SC2016
+  make_stub rclone 'for a in "$@"; do if [[ "$a" == mkdir ]]; then
+  echo "2026/10/26 14:02:12 DEBUG : pacer: low level retry 3/10 (error googleapi: Error 403: Rate Limit Exceeded, rateLimitExceeded)" >&2
+  echo "2026/10/26 14:02:13 DEBUG : pacer: Rate limited, increasing sleep to 8s ya29.SEGRETO" >&2
+  exec sleep 20; fi; done; exit 0'
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -ne 0 ]
+  jq -e '.ok == false and (.error | test("tempo scaduto")) and (.error | test("Rate Limit Exceeded"))' <<<"$output"
+  [[ "$output" != *SEGRETO* ]]
+}
+
+@test "connect: errore di rclone con -vv = la riga dell'errore, non le righe DEBUG finali" {
+  bk_tool_env
+  # shellcheck disable=SC2016
+  make_stub rclone 'for a in "$@"; do if [[ "$a" == mkdir ]]; then
+  echo "2026/10/26 14:02:12 ERROR : Attempt 1/1 failed with 1 errors and: googleapi: Error 403: Insufficient Permission" >&2
+  echo "2026/10/26 14:02:12 DEBUG : 4 go routines active" >&2
+  exit 1; fi; done; exit 0'
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -ne 0 ]
+  jq -e '.error | test("Insufficient Permission")' <<<"$output"
 }
 
 @test "auth-finish: rclone che si pianta nelle prove su Drive = stesso tetto, tutto pulito" {

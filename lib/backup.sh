@@ -596,6 +596,16 @@ bk_clean_msg() {
   printf '%s' "$m"
 }
 
+# _bk_rc_err OUTPUT — l'ultima riga d'errore dell'output di rclone -vv (senza data e
+# livello), o l'ultima riga se nessuna parla di errore; vuoto se non c'è output.
+_bk_rc_err() {
+  local l
+  l="$(printf '%s\n' "${1-}" | grep -i 'error' | tail -n1 || true)"
+  [[ -n "$l" ]] || l="$(printf '%s\n' "${1-}" | grep -v '^[[:space:]]*$' | tail -n1 || true)"
+  l="$(printf '%s' "$l" | sed -E 's#^[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9:]{8} [A-Z]+ +: ##')"
+  printf '%s' "$l"
+}
+
 # bk_drive_json — {used,total} da `rclone about`, "null" se Drive non risponde.
 # total 0 = spazio illimitato (rclone non lo riporta).
 bk_drive_json() {
@@ -711,14 +721,17 @@ bk_connect() {
   read -ra cmd <<<"$BK_RCLONE"
   # Ogni chiamata ha un tetto di tempo: il pannello aspetta il comando intero per un
   # tempo preciso (3 chiamate x BK_CONNECT_TIMEOUT, con 25 s restano ~75 s).
-  out="$(_bk_nolock timeout -k 5 "$BK_CONNECT_TIMEOUT" "${cmd[@]}" mkdir "gdrive:$folder" 2>&1 </dev/null)" || rc=$?
+  out="$(_bk_nolock timeout -k 5 "$BK_CONNECT_TIMEOUT" "${cmd[@]}" -vv mkdir "gdrive:$folder" 2>&1 </dev/null)" || rc=$?
   if ((rc == 0)); then
-    out="$(printf 'plancia' | _bk_nolock timeout -k 5 "$BK_CONNECT_TIMEOUT" "${cmd[@]}" rcat "gdrive:$folder/.plancia-test" 2>&1)" || rc=$?
+    out="$(printf 'plancia' | _bk_nolock timeout -k 5 "$BK_CONNECT_TIMEOUT" "${cmd[@]}" -vv rcat "gdrive:$folder/.plancia-test" 2>&1)" || rc=$?
   fi
   if ((rc == 0)); then
-    out="$(_bk_nolock timeout -k 5 "$BK_CONNECT_TIMEOUT" "${cmd[@]}" deletefile "gdrive:$folder/.plancia-test" 2>&1 </dev/null)" || rc=$?
+    out="$(_bk_nolock timeout -k 5 "$BK_CONNECT_TIMEOUT" "${cmd[@]}" -vv deletefile "gdrive:$folder/.plancia-test" 2>&1 </dev/null)" || rc=$?
   fi
-  if ((rc == 124 || rc == 137)); then out="tempo scaduto, Drive non risponde"; fi
+  # Con -vv rclone annota anche i tentativi (es. "Rate Limit Exceeded" del client condiviso):
+  # si tiene l'ultima riga d'errore, anche quando il tempo scade.
+  out="$(_bk_rc_err "$out")"
+  if ((rc == 124 || rc == 137)); then out="tempo scaduto, Drive non risponde${out:+ (rclone: $out)}"; fi
   if ((rc != 0)); then
     # Il collegamento non è valido: torna il file di prima, o nessun file.
     BK_ERR="Google Drive non ha accettato il collegamento: $(bk_clean_msg "$out" "$tok" "$at" "$rt" "$sec")"
