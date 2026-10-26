@@ -330,3 +330,37 @@ sys_setup() {
   opt_system_files
   grep -qx acl-siti "$BATS_TEST_TMPDIR/sys.calls"
 }
+
+@test "opt_pma_snippet: riscrive panel.d/pma.conf se il modello e' cambiato, nginx -t e reload; uguale = niente" {
+  export NGINX_SNIPPETS="$BATS_TEST_TMPDIR/snip"
+  mkdir -p "$NGINX_SNIPPETS/panel.d"
+  echo vecchio >"$NGINX_SNIPPETS/panel.d/pma.conf"
+  make_stub nginx 'echo "nginx $*" >>"$BATS_TEST_TMPDIR/ng.calls"'
+  opt_pma_snippet
+  grep -q 'limit_req zone=req_limit_per_ip burst=200 nodelay;' "$NGINX_SNIPPETS/panel.d/pma.conf"
+  grep -qxF 'nginx -t' "$BATS_TEST_TMPDIR/ng.calls"
+  grep -qxF 'reload nginx' "$BATS_TEST_TMPDIR/systemctl.calls"
+  : >"$BATS_TEST_TMPDIR/systemctl.calls"
+  opt_pma_snippet
+  [ ! -s "$BATS_TEST_TMPDIR/systemctl.calls" ]
+}
+
+@test "opt_pma_snippet: nginx -t che fallisce = file di prima; senza phpMyAdmin non crea nulla" {
+  export NGINX_SNIPPETS="$BATS_TEST_TMPDIR/snip"
+  mkdir -p "$NGINX_SNIPPETS/panel.d"
+  echo vecchio >"$NGINX_SNIPPETS/panel.d/pma.conf"
+  make_stub nginx 'exit 1'
+  opt_pma_snippet
+  [ "$(cat "$NGINX_SNIPPETS/panel.d/pma.conf")" = vecchio ]
+  grep -q 'phpMyAdmin non aggiornato' "$VPS_LOG"
+  rm "$NGINX_SNIPPETS/panel.d/pma.conf"
+  opt_pma_snippet
+  [ ! -e "$NGINX_SNIPPETS/panel.d/pma.conf" ]
+}
+
+@test "opt_system_files aggiorna il blocco nginx di phpMyAdmin" {
+  sys_setup
+  opt_pma_snippet() { echo pma-snippet >>"$BATS_TEST_TMPDIR/sys.calls"; }
+  opt_system_files
+  grep -qx pma-snippet "$BATS_TEST_TMPDIR/sys.calls"
+}

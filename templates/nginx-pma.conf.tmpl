@@ -8,6 +8,11 @@ location ^~ /pma/ {
     index index.php;
     auth_basic "Area riservata";
     auth_basic_user_file /etc/nginx/.htpasswd-pma;
+    # Al primo accesso phpMyAdmin chiede decine di immagini, script e chiamate in pochi istanti:
+    # con il burst=20 del pannello una parte tornava 429 e la pagina restava bianca. Dietro
+    # l'autenticazione HTTP, un burst largo come per i file statici di WordPress (vale anche
+    # per le location qui dentro, che non hanno un limit_req proprio).
+    limit_req zone=req_limit_per_ip burst=200 nodelay;
 
     location ~ ^/pma/(libraries|templates|vendor|sql|src|setup)/ {
         deny all;

@@ -71,6 +71,8 @@ setup() {
   render_template "$REPO_ROOT/templates/nginx-pma.conf.tmpl" "$BATS_TEST_TMPDIR/pma" 644 "$(id -un):$(id -gn)" VPS_OPT PHP_VERSION
   grep -q 'auth_basic_user_file /etc/nginx/.htpasswd-pma;' "$BATS_TEST_TMPDIR/pma"
   grep -q 'fastcgi_param SCRIPT_FILENAME $request_filename;' "$BATS_TEST_TMPDIR/pma"
+  # phpMyAdmin al primo accesso chiede decine di file: burst suo, piu' largo del pannello (20)
+  grep -q 'limit_req zone=req_limit_per_ip burst=200 nodelay;' "$BATS_TEST_TMPDIR/pma"
   grep -q "alias $VPS_OPT/phpmyadmin/;" "$BATS_TEST_TMPDIR/pma"
 }
 

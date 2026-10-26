@@ -85,6 +85,33 @@ opt_panel_vhost() {
   fi
 }
 
+# opt_pma_snippet — il blocco /pma/ del vhost del pannello segue il modello: dalla 1.7.7 ha un
+# burst suo (al primo accesso phpMyAdmin chiede decine di file e il burst=20 del pannello ne
+# respingeva con 429: pagina bianca). Si riscrive solo se diverso, nginx -t prima del reload,
+# altrimenti torna il file di prima. Senza phpMyAdmin installato non si crea niente.
+opt_pma_snippet() {
+  local f="$NGINX_SNIPPETS/panel.d/pma.conf" new bak
+  [[ -f "$f" ]] || return 0
+  new="$(mktemp)"
+  render_template "$VPS_TEMPLATES/nginx-pma.conf.tmpl" "$new" 644 root:root VPS_OPT PHP_VERSION
+  if cmp -s "$new" "$f"; then
+    rm -f "$new"
+    return 0
+  fi
+  bak="$(mktemp)"
+  cp -p "$f" "$bak"
+  install -m 644 "$new" "$f"
+  own root:root "$f"
+  rm -f "$new"
+  if nginx -t >>"$VPS_LOG" 2>&1 && systemctl reload nginx >>"$VPS_LOG" 2>&1; then
+    rm -f "$bak"
+    log "phpMyAdmin: blocco nginx aggiornato"
+  else
+    mv -f "$bak" "$f"
+    log "ATTENZIONE: blocco nginx di phpMyAdmin non aggiornato (nginx -t o reload falliti), lasciato com'era"
+  fi
+}
+
 # opt_system_files — la parte di sistema degli script: sudoers del pannello,
 # cron, cartelle dei siti e pagina di manutenzione. La chiama anche
 # --tools-only: senza, una VPS già installata riceverebbe vps-site ma il
@@ -134,6 +161,7 @@ opt_system_files() {
   opt_sites_acl
   opt_panel_pool
   opt_panel_vhost
+  opt_pma_snippet
   # Aggiornamenti automatici: anche Nginx di nginx.org (dalla 1.5.3). Solo sulle
   # macchine che hanno gia' la configurazione dell'installer.
   if [[ -f "${APT_CONF_D:-/etc/apt/apt.conf.d}/52vps-unattended" ]]; then
