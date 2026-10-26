@@ -131,6 +131,7 @@ opt_system_files() {
   fi
   opt_monitor_files
   opt_backup_files
+  opt_sites_acl
   opt_panel_pool
   opt_panel_vhost
   # Aggiornamenti automatici: anche Nginx di nginx.org (dalla 1.5.3). Solo sulle
@@ -138,6 +139,28 @@ opt_system_files() {
   if [[ -f "${APT_CONF_D:-/etc/apt/apt.conf.d}/52vps-unattended" ]]; then
     install -m 644 "$VPS_TEMPLATES/apt-52vps-unattended" "${APT_CONF_D:-/etc/apt/apt.conf.d}/52vps-unattended"
   fi
+}
+
+# opt_sites_acl — Nginx (www-data) legge public/ grazie alle ACL, ma fino alla 1.7.4 tmp/
+# non aveva la default ACL: un file caricato (nasce in tmp/, poi spostato in public/) non la
+# ereditava e l'originale di un'immagine di WordPress dava 403. Ai siti esistenti si aggiunge
+# la default ACL a tmp/ e si rimette l'ACL ai file di public/. Come utente del sito: la
+# passata ricorsiva tocca file suoi, e da root seguirebbe i suoi collegamenti. Un sito che
+# non riesce non ferma gli altri ne' l'aggiornamento.
+opt_sites_acl() {
+  local f d slug root
+  for f in "$SITES_DIR"/*.json; do
+    [[ -f "$f" ]] || continue
+    d="$(jq -r '.domain // empty' "$f" 2>/dev/null)" || continue
+    slug="$(jq -r '.slug // empty' "$f" 2>/dev/null)" || continue
+    if ! valid_domain "$d" || [[ -z "$slug" ]]; then continue; fi
+    root="$(site_root "$d")"
+    [[ -d "$root/public" && ! -L "$root/public" && -d "$root/tmp" && ! -L "$root/tmp" ]] || continue
+    if ! fm_as_site "$slug" "$root" setfacl -m d:u:www-data:rX tmp >>"$VPS_LOG" 2>&1       || ! fm_as_site "$slug" "$root" setfacl -R -m u:www-data:rX -m d:u:www-data:rX public >>"$VPS_LOG" 2>&1; then
+      log "ATTENZIONE: ACL di $d non aggiornate (le immagini caricate potrebbero dare 403)"
+    fi
+  done
+  return 0
 }
 
 # opt_monitor_files — unità systemd e cartelle di vps-monitor. Il timer resta

@@ -300,3 +300,33 @@ sys_setup() {
 @test "il passo Sistema installa rclone per le macchine nuove" {
   grep -q 'apt_install .*rclone' "$REPO_ROOT/steps/10-system.sh" || grep -A2 'apt_install sudo' "$REPO_ROOT/steps/10-system.sh" | grep -q rclone
 }
+
+@test "opt_sites_acl: default ACL su tmp/ e ACL ai file di public/, come utente del sito" {
+  mkdir -p "$SITES_DIR" "$SITES_WWW/a.it/public" "$SITES_WWW/a.it/tmp"
+  jq -n '{domain:"a.it",slug:"site_a_it",state:"active"}' >"$SITES_DIR/a.it.json"
+  # registrato ma senza cartelle (sito a meta'): saltato
+  jq -n '{domain:"via.it",slug:"site_via_it",state:"error"}' >"$SITES_DIR/via.it.json"
+  fm_as_site() { echo "$*" >>"$BATS_TEST_TMPDIR/fm.calls"; }
+  opt_sites_acl
+  grep -qxF "site_a_it $SITES_WWW/a.it setfacl -m d:u:www-data:rX tmp" "$BATS_TEST_TMPDIR/fm.calls"
+  grep -qxF "site_a_it $SITES_WWW/a.it setfacl -R -m u:www-data:rX -m d:u:www-data:rX public" "$BATS_TEST_TMPDIR/fm.calls"
+  run ! grep -q via.it "$BATS_TEST_TMPDIR/fm.calls"
+}
+
+@test "opt_sites_acl: un sito che fallisce non ferma gli altri ne' l'aggiornamento" {
+  mkdir -p "$SITES_DIR" "$SITES_WWW/a.it/public" "$SITES_WWW/a.it/tmp" "$SITES_WWW/b.it/public" "$SITES_WWW/b.it/tmp"
+  jq -n '{domain:"a.it",slug:"site_a_it"}' >"$SITES_DIR/a.it.json"
+  jq -n '{domain:"b.it",slug:"site_b_it"}' >"$SITES_DIR/b.it.json"
+  fm_as_site() { echo "$*" >>"$BATS_TEST_TMPDIR/fm.calls"; [[ "$1" != site_a_it ]]; }
+  run opt_sites_acl
+  [ "$status" -eq 0 ]
+  grep -q "^site_b_it .* public$" "$BATS_TEST_TMPDIR/fm.calls"
+  grep -q "ACL di a.it non aggiornate" "$VPS_LOG"
+}
+
+@test "opt_system_files ripara le ACL dei siti" {
+  sys_setup
+  opt_sites_acl() { echo acl-siti >>"$BATS_TEST_TMPDIR/sys.calls"; }
+  opt_system_files
+  grep -qx acl-siti "$BATS_TEST_TMPDIR/sys.calls"
+}

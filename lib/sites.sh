@@ -266,6 +266,10 @@ site_user_add() {
   install -d -m 2770 "$root/logs/php" "$root/public" "$root/tmp" || return 1
   setfacl -m u:www-data:x "$root" || return 1
   setfacl -m u:www-data:rX -m d:u:www-data:rX "$root/public" || return 1
+  # Un file caricato nasce in tmp/ (upload_tmp_dir di PHP) e viene spostato in public/: lo
+  # spostamento non eredita la default ACL, e senza questa l'originale darebbe 403. www-data
+  # non entra comunque in tmp/ (la cartella non ha ACL sua): il permesso vale solo dopo.
+  setfacl -m d:u:www-data:rX "$root/tmp" || return 1
   # I file creati da PHP restano modificabili dall'admin e viceversa.
   setfacl -m d:g::rwX "$root/public" "$root/tmp" || return 1
   # Il segnaposto lo scrive root finché public/ è ancora di root: ceduta al sito,

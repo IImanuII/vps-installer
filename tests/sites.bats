@@ -194,6 +194,8 @@ setup() {
   grep -q "^setfacl -m u:www-data:x $r\$" "$CALLS"
   grep -q "^setfacl -m u:www-data:rX -m d:u:www-data:rX $r/public" "$CALLS"
   grep -q "^setfacl -m d:g::rwX $r/public $r/tmp" "$CALLS"
+  # un file caricato nasce in tmp/ e viene spostato in public/: deve gia' avere l'ACL di www-data
+  grep -q "^setfacl -m d:u:www-data:rX $r/tmp\$" "$CALLS"
   grep -q '<h1>blog.miosito.it</h1>' "$r/public/index.html"
 }
 
