@@ -600,7 +600,10 @@ bk_clean_msg() {
 # livello), o l'ultima riga se nessuna parla di errore; vuoto se non c'è output.
 _bk_rc_err() {
   local l
-  l="$(printf '%s\n' "${1-}" | grep -i 'error' | tail -n1 || true)"
+  # googleapi stampa "Error 403: messaggio, motivo" e poi il JSON dei dettagli su più
+  # righe: la riga col codice è quella che dice cosa non va.
+  l="$(printf '%s\n' "${1-}" | grep -E 'Error [0-9]{3}:' | tail -n1 || true)"
+  [[ -n "$l" ]] || l="$(printf '%s\n' "${1-}" | grep -i 'error' | tail -n1 || true)"
   [[ -n "$l" ]] || l="$(printf '%s\n' "${1-}" | grep -v '^[[:space:]]*$' | tail -n1 || true)"
   l="$(printf '%s' "$l" | sed -E 's#^[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9:]{8} [A-Z]+ +: ##')"
   printf '%s' "$l"
@@ -719,14 +722,17 @@ bk_connect() {
   fi
 
   read -ra cmd <<<"$BK_RCLONE"
+  # Pochi tentativi: con i 10 predefiniti (e le attese crescenti) il tetto di tempo
+  # scadrebbe prima che rclone dica l'errore vero di Google.
+  local -a prova=(--retries 1 --low-level-retries 3)
   # Ogni chiamata ha un tetto di tempo: il pannello aspetta il comando intero per un
   # tempo preciso (3 chiamate x BK_CONNECT_TIMEOUT, con 25 s restano ~75 s).
-  out="$(_bk_nolock timeout -k 5 "$BK_CONNECT_TIMEOUT" "${cmd[@]}" -vv mkdir "gdrive:$folder" 2>&1 </dev/null)" || rc=$?
+  out="$(_bk_nolock timeout -k 5 "$BK_CONNECT_TIMEOUT" "${cmd[@]}" -vv mkdir "gdrive:$folder" "${prova[@]}" 2>&1 </dev/null)" || rc=$?
   if ((rc == 0)); then
-    out="$(printf 'plancia' | _bk_nolock timeout -k 5 "$BK_CONNECT_TIMEOUT" "${cmd[@]}" -vv rcat "gdrive:$folder/.plancia-test" 2>&1)" || rc=$?
+    out="$(printf 'plancia' | _bk_nolock timeout -k 5 "$BK_CONNECT_TIMEOUT" "${cmd[@]}" -vv rcat "gdrive:$folder/.plancia-test" "${prova[@]}" 2>&1)" || rc=$?
   fi
   if ((rc == 0)); then
-    out="$(_bk_nolock timeout -k 5 "$BK_CONNECT_TIMEOUT" "${cmd[@]}" -vv deletefile "gdrive:$folder/.plancia-test" 2>&1 </dev/null)" || rc=$?
+    out="$(_bk_nolock timeout -k 5 "$BK_CONNECT_TIMEOUT" "${cmd[@]}" -vv deletefile "gdrive:$folder/.plancia-test" "${prova[@]}" 2>&1 </dev/null)" || rc=$?
   fi
   # Con -vv rclone annota anche i tentativi (es. "Rate Limit Exceeded" del client condiviso):
   # si tiene l'ultima riga d'errore, anche quando il tempo scade.

@@ -643,7 +643,7 @@ wait_for_file() {
   bk_tool connect <<<"$TOKEN_OK"
   [ "$status" -eq 0 ]
   jq -e '.folder == "MieiBackup"' <<<"$output"
-  grep -q 'mkdir gdrive:MieiBackup$' "$BATS_TEST_TMPDIR/rclone.calls"
+  grep -q 'mkdir gdrive:MieiBackup --retries' "$BATS_TEST_TMPDIR/rclone.calls"
 }
 
 @test "vps-backup disconnect: toglie rclone.conf, spegne il timer, la configurazione resta ma disattivata" {
@@ -3467,6 +3467,32 @@ exit 0'
   [ "$status" -ne 0 ]
   jq -e '.ok == false and (.error | test("tempo scaduto")) and (.error | test("Rate Limit Exceeded"))' <<<"$output"
   [[ "$output" != *SEGRETO* ]]
+}
+
+@test "connect: errore di Google con i dettagli JSON su più righe = la riga 'Error 403:'" {
+  bk_tool_env
+  export BK_CONNECT_TIMEOUT=1
+  # shellcheck disable=SC2016
+  make_stub rclone 'for a in "$@"; do if [[ "$a" == mkdir ]]; then
+  echo "2026/10/26 14:40:01 DEBUG : pacer: low level retry 1/3 (error googleapi: Error 403: Drive API has not been used in project 123 before or it is disabled., accessNotConfigured" >&2
+  echo "Details:" >&2
+  echo "[" >&2
+  echo "  {" >&2
+  echo "    \"@type\": \"type.googleapis.com/google.rpc.ErrorInfo\"," >&2
+  echo "    \"reason\": \"SERVICE_DISABLED\"" >&2
+  echo "  }" >&2
+  echo "]" >&2
+  exec sleep 20; fi; done; exit 0'
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -ne 0 ]
+  jq -e '.error | test("Error 403: Drive API has not been used")' <<<"$output"
+}
+
+@test "connect: le prove su Drive girano con pochi tentativi (l'errore arriva prima del tetto)" {
+  bk_tool_env
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -eq 0 ]
+  grep -q -- "mkdir gdrive:Plancia-.* --retries 1 --low-level-retries 3" "$BATS_TEST_TMPDIR/rclone.calls"
 }
 
 @test "connect: errore di rclone con -vv = la riga dell'errore, non le righe DEBUG finali" {
