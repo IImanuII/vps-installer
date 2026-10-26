@@ -310,9 +310,9 @@ arc_from_files() {
 }
 
 @test "bk_site_lock: il lock dura quanto il processo" {
-  ( bk_site_lock site_blog && sleep 2 ) &
+  ( bk_site_lock site_blog && : >"$BATS_TEST_TMPDIR/held" && sleep 2 ) &
   local pid=$!
-  sleep 0.5
+  wait_for_file "$BATS_TEST_TMPDIR/held"
   run bk_site_locked site_blog
   [ "$status" -eq 0 ]
   wait "$pid"
@@ -543,6 +543,16 @@ bk_tool() {
   run --separate-stderr env VPS_OPT="$VPS_OPT" VPS_LIB="$REPO_ROOT/lib" VPS_LOG="$VPS_LOG" VPS_NO_CHOWN=1 \
     SYSTEMD_DIR="$SYSTEMD_DIR" BK_DIR="$BK_DIR" BK_LOCK_DIR="$BK_LOCK_DIR" PATH="$PATH" BATS_TEST_TMPDIR="$BATS_TEST_TMPDIR" \
     bash "$T_TOOL" "$@"
+}
+
+# wait_for_file FILE [DECIMI] — aspetta (al massimo DECIMI decimi di secondo, predefinito 100) che FILE esista.
+wait_for_file() {
+  local f="$1" i
+  for ((i = 0; i < ${2:-100}; i++)); do
+    [[ -e "$f" ]] && return 0
+    sleep 0.1
+  done
+  return 1
 }
 
 @test "vps-backup connect: rclone.conf 600 con scope drive.file, cartella creata, file di prova scritto e cancellato" {
@@ -1166,9 +1176,11 @@ drive_files() { ls "$DRIVE/F/$1" 2>/dev/null || true; }
   mk_site a.it no
   exec {gl}>>"$BK_LOCK_DIR/vps-backup.lock"
   flock -n "$gl"
-  bk_tool _run
+  # il giro a mano (unità vps-backup-run) non aspetta: rifiuta subito
+  BK_UNIT=vps-backup-run bk_tool _run
   [ "$status" -ne 0 ]
   [[ "$output" == *"backup in corso"* ]]
+  [ ! -s "$BK_STATE" ] || jq -e '.last_run == null' "$BK_STATE"
   bk_tool run
   [ "$status" -ne 0 ]
   jq -e '.error == "backup in corso"' <<<"$output"
@@ -1187,6 +1199,32 @@ drive_files() { ls "$DRIVE/F/$1" 2>/dev/null || true; }
   exec {gl}>&-
   bk_tool disconnect
   [ "$status" -eq 0 ]
+}
+
+@test "_run del timer: aspetta il lock globale (ripristino) e poi fa il giro" {
+  bk_run_env
+  mk_site a.it no
+  flock -x "$BK_LOCK_DIR/vps-backup.lock" bash -c ': >"$1"; sleep 2' _ "$BATS_TEST_TMPDIR/held" &
+  local bg=$!
+  wait_for_file "$BATS_TEST_TMPDIR/held"
+  BK_RUN_LOCK_WAIT=30 bk_tool _run
+  wait "$bg"
+  [ "$status" -eq 0 ]
+  jq -e '.last_run.ok == true' "$BK_STATE"
+}
+
+@test "_run del timer: lock occupato oltre l'attesa = last_run ok:false 'ripristino in corso' e avviso Telegram" {
+  bk_run_env
+  mk_site a.it no
+  exec {gl}>>"$BK_LOCK_DIR/vps-backup.lock"
+  flock -n "$gl"
+  BK_RUN_LOCK_WAIT=1 bk_tool _run
+  exec {gl}>&-
+  [ "$status" -eq 1 ]
+  jq -e '.last_run.ok == false and .last_run.panel.ok == false and .last_run.panel.error == "ripristino in corso" and .last_run.sites == [] and .last_run.alert == "sent"' "$BK_STATE"
+  grep -q "pannello: ripristino in corso" "$BATS_TEST_TMPDIR/curl.args"
+  # niente giro: Drive non toccato
+  [ -z "$(drive_files _pannello)" ]
 }
 
 @test "run: parte come unità systemd vps-backup-run e risponde subito" {
@@ -2698,6 +2736,23 @@ exec /usr/bin/mv "$@"'
   [ "$(bk_manifest "$BATS_TEST_TMPDIR/o4.tar.gz" | jq -r .table_prefix)" = null ]
 }
 
+@test "bk_manifest: legge solo il primo membro manifest.json (--occurrence=1); formato vecchio = restorable false" {
+  local w="$BATS_TEST_TMPDIR/mw"
+  mkdir -p "$w/a" "$w/b"
+  echo '{"domain":"a.it"}' >"$w/a/manifest.json"
+  echo '{"domain":"zzz"}' >"$w/b/manifest.json"
+  tar -czf "$w/d.tar.gz" -C "$w/a" manifest.json -C "$w/b" manifest.json
+  run bk_manifest "$w/d.tar.gz"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .domain <<<"$output")" = a.it ]
+  grep -c -- '--occurrence=1' "$REPO_ROOT/lib/backup.sh" | grep -qx 2
+  # formato vecchio (senza manifest): nessun manifest
+  echo x >"$w/a/file"
+  tar -czf "$w/old.tar.gz" -C "$w/a" file
+  run bk_manifest "$w/old.tar.gz"
+  [ "$status" -eq 1 ]
+}
+
 @test "bk_manifest: un manifest oltre 64 KiB è rifiutato" {
   local w="$BATS_TEST_TMPDIR/big"
   mkdir -p "$w"
@@ -2738,9 +2793,9 @@ exec /usr/bin/mv "$@"'
 @test "_restore con BK_LOCK_WAIT aspetta un giro che finisce; senza, fallisce subito" {
   rs_env
   rs_site
-  flock -x -w 5 "$BK_LOCK_DIR/vps-backup.lock" sleep 3 &
+  flock -x -w 5 "$BK_LOCK_DIR/vps-backup.lock" bash -c ': >"$1"; sleep 3' _ "$BATS_TEST_TMPDIR/held" &
   local bg=$!
-  sleep 0.5
+  wait_for_file "$BATS_TEST_TMPDIR/held"
   rs_run local a.it "$ARC_NAME" files
   [ "$status" -ne 0 ]
   [[ "$output" == *"backup in corso"* ]]
@@ -2761,6 +2816,11 @@ exec /usr/bin/mv "$@"'
   rs_run local a.it "$ARC_NAME" files
   [ "$status" -eq 0 ]
   [ -f "$CRON_D/vps-site-site_a_it" ]
+}
+
+@test "vps-site: l'elenco unset sotto sudo comprende RCLONE_* e BK_CONFIG (usa rclone via bk_remote_manifest)" {
+  grep -q '"${!RCLONE_@}"' "$REPO_ROOT/tools/vps-site"
+  sed -n '/^  unset /,/FM_RUNUSER/p' "$REPO_ROOT/tools/vps-site" | grep -qw BK_CONFIG
 }
 
 @test "vps-backup: BK_LOCK_WAIT non entra dall'ambiente del chiamante sotto sudo" {

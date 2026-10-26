@@ -27,7 +27,7 @@ if [[ -n "${SUDO_USER:-}" || -n "${VPS_SITE_VIA_SYSTEMD:-}" ]]; then
   VPS_LOG=/var/log/vps-tools.log
   # La vera difesa è `Defaults:panel env_reset` in sudoers; questo elenco è una
   # seconda linea di difesa, nel caso l'ambiente passasse comunque.
-  unset CF_API SITES_DIR SITES_WWW SITES_BACKUPS SITES_LOCK SITES_LOCK_WAIT SITES_RUN NGINX_CONF_D \
+  unset "${!RCLONE_@}" BK_CONFIG CF_API SITES_DIR SITES_WWW SITES_BACKUPS SITES_LOCK SITES_LOCK_WAIT SITES_RUN NGINX_CONF_D \
     PHP_POOL_D LOGROTATE_D VPS_SITE_SELF VPS_NO_CHOWN SITE_ERROR_FILE \
     WP_BIN REDIS_ACL_FILE REDIS_ADMIN_SECRET CRON_D BK_LOCK_DIR BK_BACKUPS BK_DIR BK_STATE BK_RCLONE \
     BK_RCLONE_CONF VPS_BACKUP_SELF FM_RUNUSER

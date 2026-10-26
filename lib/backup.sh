@@ -159,7 +159,7 @@ bk_keep_plan() {
 # Il manifest non è autenticato: si legge al massimo 64 KiB (oltre, è un errore).
 bk_manifest() {
   local m
-  m="$(tar -xzOf "${1-}" manifest.json 2>/dev/null | head -c 65537)" || true
+  m="$(tar -xzOf "${1-}" --occurrence=1 manifest.json 2>/dev/null | head -c 65537)" || true
   ((${#m} > 0 && ${#m} <= 65536)) || return 1
   printf '%s\n' "$m"
 }
@@ -1158,13 +1158,57 @@ _bk_last_json() {
     '{started: $st, finished: $fin, ok: $ok, sites: $s, panel: $p, purged: $pu, alert: $al}'
 }
 
+# _bk_state_load — azzera i dati del giro e rilegge da state.json last_run, known e
+# last_restore (quelli che ogni scrittura di state.json deve conservare).
+_bk_state_load() {
+  _BK_SITES='[]' _BK_PANEL='null' _BK_PURGED='[]' _BK_PREV_LAST='null' _BK_KNOWN='[]' _BK_LAST_RESTORE='null'
+  if [[ -f "$BK_STATE" ]]; then
+    _BK_LAST_RESTORE="$(jq -c '.last_restore // null' "$BK_STATE" 2>/dev/null)" || _BK_LAST_RESTORE='null'
+    [[ -n "$_BK_LAST_RESTORE" ]] || _BK_LAST_RESTORE='null'
+    _BK_PREV_LAST="$(jq -c '.last_run // null' "$BK_STATE" 2>/dev/null)" || _BK_PREV_LAST='null'
+    _BK_KNOWN="$(jq -c '(.known // []) | if type == "array" then map(select(type == "string")) else [] end' "$BK_STATE" 2>/dev/null)" || _BK_KNOWN='[]'
+  fi
+  [[ -n "$_BK_PREV_LAST" ]] || _BK_PREV_LAST='null'
+  [[ -n "$_BK_KNOWN" ]] || _BK_KNOWN='[]'
+}
+
+# _bk_busy_skip — il giro notturno ha aspettato il lock globale invano (un ripristino
+# lungo): niente giro, ma l'esito si scrive in last_run (ok:false) e l'avviso Telegram
+# parte come per un giro fallito. Il lock non è in mano: state.json si rilegge e si
+# riscrive subito, conservando il job di chi lo tiene.
+_bk_busy_skip() {
+  local alert last job
+  install -d -m 700 "$BK_BACKUPS" "$BK_BACKUPS/tmp"
+  BK_RUN_DIR="$(mktemp -d "$BK_BACKUPS/tmp/bk.skip.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -rf -- '$BK_RUN_DIR'" EXIT
+  _BK_STARTED="$(date -Iseconds)"
+  _bk_state_load
+  _BK_PANEL='{"ok":false,"error":"ripristino in corso","file":null}'
+  alert="$(_bk_alert)"
+  last="$(_bk_last_json "$alert")"
+  job="$(jq -c '.job // null' "$BK_STATE" 2>/dev/null)" || job=null
+  [[ -n "$job" ]] || job=null
+  _bk_state_write "$job" "$last" || log "vps-backup: state.json non scritto"
+  log "vps-backup: giro notturno saltato, ripristino in corso"
+  printf '{"ok":false,"error":"ripristino in corso"}\n'
+}
+
 # bk_run_all — il giro. Stampa il riepilogo JSON; 0 se tutto è stato salvato, 1 se un
 # sito o il pannello sono falliti (stato scritto e avviso inviato comunque) o se il
 # giro non è potuto partire.
 bk_run_all() {
-  local folder d f alert last st rc=0 drive_ok=0
+  local folder d f alert last st rc=0 drive_ok=0 lw=0
   local -a doms=()
-  if ! bk_lock_global; then
+  # Il giro notturno (timer) aspetta un ripristino o un altro giro che tiene il lock
+  # globale, invece di saltare la notte: Persistent=true non lo rilancerebbe. Il giro
+  # a mano (unità vps-backup-run, dal pannello) non aspetta mai.
+  if [[ "${BK_UNIT:-vps-backup.service}" == vps-backup.service ]]; then lw="${BK_RUN_LOCK_WAIT:-3600}"; fi
+  if ! bk_lock_global "$lw"; then
+    if ((lw > 0)); then
+      _bk_busy_skip
+      return 1
+    fi
     printf '{"ok":false,"error":"backup in corso"}\n'
     return 1
   fi
@@ -1185,15 +1229,7 @@ bk_run_all() {
   # shellcheck disable=SC2064
   trap "rm -rf -- '$BK_RUN_DIR'" EXIT
   _BK_STARTED="$(date -Iseconds)"
-  _BK_SITES='[]' _BK_PANEL='null' _BK_PURGED='[]' _BK_PREV_LAST='null' _BK_KNOWN='[]' _BK_LAST_RESTORE='null'
-  if [[ -f "$BK_STATE" ]]; then
-    _BK_LAST_RESTORE="$(jq -c '.last_restore // null' "$BK_STATE" 2>/dev/null)" || _BK_LAST_RESTORE='null'
-    [[ -n "$_BK_LAST_RESTORE" ]] || _BK_LAST_RESTORE='null'
-    _BK_PREV_LAST="$(jq -c '.last_run // null' "$BK_STATE" 2>/dev/null)" || _BK_PREV_LAST='null'
-    _BK_KNOWN="$(jq -c '(.known // []) | if type == "array" then map(select(type == "string")) else [] end' "$BK_STATE" 2>/dev/null)" || _BK_KNOWN='[]'
-  fi
-  [[ -n "$_BK_PREV_LAST" ]] || _BK_PREV_LAST='null'
-  [[ -n "$_BK_KNOWN" ]] || _BK_KNOWN='[]'
+  _bk_state_load
   _bk_progress start
 
   # Registro: i siti attivi o disattivati, in ordine.
@@ -1516,7 +1552,7 @@ bk_remote_manifest() {
   # (non autenticato) non può superare 64 KiB
   tar -tzf "$w/head" 2>/dev/null | head -n1 >"$w/first" || true
   if [[ "$(cat "$w/first")" == manifest.json ]]; then
-    tar -xzOf "$w/head" manifest.json 2>/dev/null | head -c 65537 >"$w/m.json" || true
+    tar -xzOf "$w/head" --occurrence=1 manifest.json 2>/dev/null | head -c 65537 >"$w/m.json" || true
   fi
   if [[ ! -s "$w/m.json" ]] || (($(stat -c %s "$w/m.json") > 65536)) || ! jq -e 'type == "object"' "$w/m.json" >/dev/null 2>&1; then
     BK_ERR="manifest della copia non leggibile (non è una copia nel formato nuovo?)"
