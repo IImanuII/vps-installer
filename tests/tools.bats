@@ -48,6 +48,78 @@ setup() {
   [ ! -f "$VPS_OPT/secrets/msmtprc" ]
 }
 
+# Configurazione valida per vps-smtp set; $1 = password ("" = tieni la salvata).
+smtp_set() {
+  jq -nc --arg p "$1" '{host:"smtp-relay.brevo.com", port:587, user:"9a1b2c@smtp-brevo.com", pass:$p, from:"vps@miosito.it", alert_email:"avvisi@miosito.it"}' \
+    | bash "$T/vps-smtp" set
+}
+
+@test "vps-smtp show senza configurazione: tutto null" {
+  run bash "$T/vps-smtp" show
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"ok":true,"configured":false,"host":null,"port":null,"user":null,"from":null,"alert_email":null}' ]
+}
+
+@test "vps-smtp show: i campi salvati, mai la password" {
+  run smtp_set 'Chiave-SMTP-"segreta\1'
+  [ "$status" -eq 0 ]
+  run bash "$T/vps-smtp" show
+  [ "$status" -eq 0 ]
+  [ "$(jq -c 'del(.ok)' <<<"$output")" = '{"configured":true,"host":"smtp-relay.brevo.com","port":587,"user":"9a1b2c@smtp-brevo.com","from":"vps@miosito.it","alert_email":"avvisi@miosito.it"}' ]
+  [[ "$output" != *segreta* ]]
+}
+
+@test "vps-smtp set con password vuota tiene quella salvata (anche con virgolette e backslash)" {
+  smtp_set 'Chiave-SMTP-"segreta\1' >/dev/null
+  run smtp_set ''
+  [ "$status" -eq 0 ]
+  grep -qxF 'password "Chiave-SMTP-\"segreta\\1"' "$VPS_OPT/secrets/msmtprc"
+  smtp_set 'Nuova-chiave-2' >/dev/null
+  grep -qxF 'password "Nuova-chiave-2"' "$VPS_OPT/secrets/msmtprc"
+}
+
+@test "vps-smtp set con password vuota e nessuna configurazione: rifiutato" {
+  run smtp_set ''
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"obbligatoria"* ]]
+  [ ! -f "$VPS_OPT/secrets/msmtprc" ]
+}
+
+@test "vps-smtp set: utente con spazi, password con controlli o troppo lunga rifiutati" {
+  run bash -c "jq -nc '{host:\"smtp.gmail.com\", port:587, user:\"a b\", pass:\"x\", from:\"a@b.it\", alert_email:\"a@b.it\"}' | bash '$T/vps-smtp' set"
+  [[ "$(jq -r .error <<<"$output")" == *"utente"* ]]
+  run smtp_set "$(printf 'abc\tdef')"
+  [[ "$(jq -r .error <<<"$output")" == *"password"* ]]
+  run smtp_set "$(printf 'a%.0s' {1..257})"
+  [[ "$(jq -r .error <<<"$output")" == *"password"* ]]
+  [ ! -f "$VPS_OPT/secrets/msmtprc" ]
+}
+
+@test "vps-smtp test: errore di msmtp con il motivo del server, senza prefisso" {
+  smtp_set 'Chiave-1' >/dev/null
+  make_stub msmtp 'cat >/dev/null; printf "msmtp: authentication failed (method PLAIN)\nmsmtp: server message: 535 5.7.8 Authentication failed\nmsmtp: could not send mail (account default from /etc/msmtprc)\n" >&2; exit 77'
+  run bash "$T/vps-smtp" test avvisi@miosito.it
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "invio non riuscito: 535 5.7.8 Authentication failed" ]
+  grep -qF 'could not send mail' "$VPS_LOG"
+}
+
+@test "vps-smtp test: senza risposta del server, la prima riga utile di msmtp" {
+  smtp_set 'Chiave-1' >/dev/null
+  make_stub msmtp 'cat >/dev/null; printf "msmtp: cannot connect to smtp-relay.brevo.com, port 587: Connection refused\nmsmtp: could not send mail (account default from /etc/msmtprc)\n" >&2; exit 69'
+  run bash "$T/vps-smtp" test avvisi@miosito.it
+  [ "$(jq -r .error <<<"$output")" = "invio non riuscito: cannot connect to smtp-relay.brevo.com, port 587: Connection refused" ]
+}
+
+@test "vps-smtp test riuscito: mittente dalla configurazione" {
+  smtp_set 'Chiave-1' >/dev/null
+  make_stub msmtp 'cat >"$BATS_TEST_TMPDIR/mail.txt"'
+  run bash "$T/vps-smtp" test avvisi@miosito.it
+  [ "$status" -eq 0 ]
+  grep -qxF 'From: vps@miosito.it' "$BATS_TEST_TMPDIR/mail.txt"
+  grep -qxF 'To: avvisi@miosito.it' "$BATS_TEST_TMPDIR/mail.txt"
+}
+
 @test "vps-pma-pass rifiuta password corte" {
   run bash -c "printf 'corta' | bash '$T/vps-pma-pass' set"
   [ "$status" -eq 1 ]

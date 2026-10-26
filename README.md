@@ -44,7 +44,7 @@ sudo vps-panel-update      # poi, per ogni nuovo rilascio
 Su una VPS installata con una versione precedente alla 1.1, prima:
 
 ```bash
-curl -fsSLO https://github.com/IImanuII/vps-installer/releases/download/v1.7.8/install.sh
+curl -fsSLO https://github.com/IImanuII/vps-installer/releases/download/v1.8.0/install.sh
 sudo bash install.sh --tools-only
 ```
 

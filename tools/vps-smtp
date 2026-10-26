@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# vps-smtp set|test EMAIL|disable — configurazione email (JSON da stdin per set).
-# JSON: {"host","port","user","pass","from","alert_email"}
+# vps-smtp show|set|test EMAIL|disable — configurazione email (JSON da stdin per set).
+# JSON: {"host","port","user","pass","from","alert_email"}; pass vuota = tieni quella salvata.
+# show non restituisce mai la password.
 # Sotto sudo l'ambiente del chiamante non deve influenzare lo script.
 if [[ -n "${SUDO_USER:-}" ]]; then
   VPS_OPT=/opt/vps
@@ -31,18 +32,36 @@ case "${1:-}" in
     ALERT_EMAIL="$(jq -r '.alert_email // ""' <<<"$cfg")"
     valid_domain "$SMTP_HOST" || json_err "host SMTP non valido"
     valid_smtp_port "$SMTP_PORT" || json_err "porta SMTP non valida (25, 465, 587, 2525)"
-    valid_line "$SMTP_USER" || json_err "utente SMTP non valido"
-    valid_line "$SMTP_PASS" || json_err "password SMTP non valida"
-    valid_email "$SMTP_FROM" || json_err "mittente non valido"
-    valid_email "$ALERT_EMAIL" || json_err "email degli avvisi non valida"
+    # L'utente sta senza virgolette in msmtprc: niente spazi ne' controlli.
+    [[ -n "$SMTP_USER" && ${#SMTP_USER} -le 254 && "$SMTP_USER" != *[[:space:][:cntrl:]]* ]] || json_err "utente SMTP non valido"
+    { valid_email "$SMTP_FROM" && ((${#SMTP_FROM} <= 254)); } || json_err "mittente non valido"
+    { valid_email "$ALERT_EMAIL" && ((${#ALERT_EMAIL} <= 254)); } || json_err "email degli avvisi non valida"
+    SMTP_PASS_ESC=""
+    if [[ -z "$SMTP_PASS" ]]; then
+      # Il pannello manda la password solo quando cambia.
+      SMTP_PASS_ESC="$(mail_saved_pass_esc)"
+      [[ -n "$SMTP_PASS_ESC" ]] || json_err "password SMTP obbligatoria"
+    else
+      { valid_line "$SMTP_PASS" && ((${#SMTP_PASS} <= 256)) && [[ "$SMTP_PASS" != *[[:cntrl:]]* ]]; } || json_err "password SMTP non valida"
+    fi
     mail_render_config
     manifest_set '.mail.configured = true | .mail.alert_email = $e' --arg e "$ALERT_EMAIL"
     json_ok
     ;;
+  show)
+    if [[ -f "$VPS_OPT/secrets/msmtprc" ]]; then
+      json_ok --arg h "$(mail_conf_get host)" --arg p "$(mail_conf_get port)" --arg u "$(mail_conf_get user)" \
+        --arg f "$(mail_conf_get from)" --arg e "$(jq -r '.mail.alert_email // ""' "$VPS_OPT/manifest.json" 2>/dev/null || true)" \
+        '{ok: true, configured: true, host: $h, port: ($p | tonumber? // null), user: $u, from: $f,
+          alert_email: (if $e == "" then null else $e end)}'
+    else
+      json_ok -n '{ok: true, configured: false, host: null, port: null, user: null, from: null, alert_email: null}'
+    fi
+    ;;
   test)
     valid_email "${2:-}" || json_err "uso: vps-smtp test EMAIL"
     [[ -f "$VPS_OPT/secrets/msmtprc" ]] || json_err "email non configurata"
-    mail_send_test "$2" || json_err "invio non riuscito (dettagli in /var/log/msmtp.log)"
+    mail_send_test "$2" || json_err "invio non riuscito: ${MAIL_ERR:-motivo sconosciuto}"
     json_ok
     ;;
   disable)
@@ -52,6 +71,6 @@ case "${1:-}" in
     json_ok
     ;;
   *)
-    json_err "uso: vps-smtp set|test EMAIL|disable"
+    json_err "uso: vps-smtp show|set|test EMAIL|disable"
     ;;
 esac

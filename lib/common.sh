@@ -9,7 +9,7 @@
 : "${VPS_TEMPLATES:=$VPS_ROOT/templates}"
 : "${NGINX_SNIPPETS:=/etc/nginx/snippets}"
 # shellcheck disable=SC2034  # usate dai file che includono common.sh
-VPS_INSTALLER_VERSION="1.7.8"
+VPS_INSTALLER_VERSION="1.8.0"
 # shellcheck disable=SC2034
 PHP_VERSION="8.4"
 
