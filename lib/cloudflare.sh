@@ -208,39 +208,64 @@ cf_api_error() {
 }
 
 # Errore di autenticazione/permesso: codici Cloudflare 10000 (Authentication
-# error), 9109/9106/9107 (Access non autorizzato) o messaggio equivalente.
+# error), 9109/9106/9107 (Access non autorizzato), 1001 ("Not authorized" sulle
+# API del tunnel) e 1010 (403 senza messaggio sulle API Access) o messaggio
+# equivalente.
 _cf_is_auth_error() {
   jq -e '.success == false and any(.errors[]?;
-      ([.code] | inside([10000, 9109, 9106, 9107, 10001]))
-      or ((.message // "") | test("authenticat|permission|not authorized|unauthorized|forbidden"; "i")))' \
-    >/dev/null 2>&1 <<<"$1"
+      ([.code] | inside([10000, 9109, 9106, 9107, 10001, 1001, 1010]))
+      or ((.message // "") | test("authenticat|permission|not authorized|unauthorized|forbidden"; "i")))'     >/dev/null 2>&1 <<<"$1"
+}
+
+# _cf_probe PERCORSO → 0 permesso presente, 1 permesso mancante, 2 Cloudflare
+# non risponde. Legge una RISORSA SINGOLA inesistente (UUID di zeri): con il
+# permesso la risposta è un 404 "non trovato", senza è un 401/403. Gli elenchi
+# (?per_page=1) non vanno bene: con un token senza permessi rispondono 200 con
+# lista vuota e il controllo risultava sempre positivo (trovato nel collaudo).
+_cf_probe() {
+  local resp code body
+  resp="$(cf_api_code GET "$1")" || return 2
+  code="${resp##*$'
+'}"
+  body="${resp%$'
+'*}"
+  if [[ "$code" == 401 || "$code" == 403 ]]; then return 1; fi
+  jq -e . >/dev/null 2>&1 <<<"$body" || return 2
+  if _cf_is_auth_error "$body"; then return 1; fi
+  return 0
 }
 
 # cf_check_ssh_perms ACCOUNT_ID → stampa, uno per riga, i permessi mancanti tra
 # tunnel, access, idp. 0 nessuno manca, 1 ne manca almeno uno, 2 Cloudflare non
-# risponde. Conta come mancante solo un errore di autorizzazione: gli altri
-# fallimenti (es. Zero Trust non ancora attivato) non dipendono dal token e li
-# gestisce cf_zerotrust_enabled.
+# risponde. Conta come mancante solo un 401/403 o un errore di autorizzazione:
+# gli altri fallimenti (es. 404 della risorsa finta, Zero Trust non ancora
+# attivato) non dipendono dal token e li gestisce cf_zerotrust_enabled.
 cf_check_ssh_perms() {
-  local acc="$1" missing=0 probe name path resp
-  for probe in "tunnel:/accounts/$acc/cfd_tunnel?per_page=1" \
-    "access:/accounts/$acc/access/apps?per_page=1" \
-    "idp:/accounts/$acc/access/identity_providers"; do
+  local acc="$1" missing=0 probe name rc zero=00000000-0000-0000-0000-000000000000
+  for probe in "tunnel:/accounts/$acc/cfd_tunnel/$zero"     "access:/accounts/$acc/access/policies/$zero"     "idp:/accounts/$acc/access/identity_providers/$zero"; do
     name="${probe%%:*}"
-    path="${probe#*:}"
-    resp="$(cf_api GET "$path")" || return 2
-    jq -e . >/dev/null 2>&1 <<<"$resp" || return 2
-    if _cf_is_auth_error "$resp"; then
-      printf '%s\n' "$name"
+    rc=0
+    _cf_probe "${probe#*:}" || rc=$?
+    if ((rc == 2)); then return 2; fi
+    if ((rc == 1)); then
+      printf '%s
+' "$name"
       missing=1
     fi
   done
   return "$missing"
 }
 
-# cf_zerotrust_enabled ACCOUNT_ID → 0 se l'organizzazione Zero Trust esiste.
+# cf_zerotrust_enabled ACCOUNT_ID → 0 se l'organizzazione Zero Trust esiste,
+# 1 se non c'è (o Cloudflare non risponde), 2 se al token manca il permesso di
+# leggerla: senza permesso non si può dire se Zero Trust sia attivo.
 cf_zerotrust_enabled() {
-  local resp
-  resp="$(cf_api GET "/accounts/$1/access/organizations")" || return 1
-  jq -e '.success == true' >/dev/null 2>&1 <<<"$resp"
+  local resp code body
+  resp="$(cf_api_code GET "/accounts/$1/access/organizations")" || return 1
+  code="${resp##*$'
+'}"
+  body="${resp%$'
+'*}"
+  if [[ "$code" == 401 || "$code" == 403 ]] || _cf_is_auth_error "$body"; then return 2; fi
+  jq -e '.success == true' >/dev/null 2>&1 <<<"$body"
 }

@@ -6,24 +6,34 @@ setup() {
 printf "%s\n" "$*" >>"$STUB_LOG"
 for a in "$@"; do case "$a" in @*) cat "${a#@}" >>"$STUB_HDR";; esac; done
 url="${*: -1}"
-# Permessi del token: CF_DENY="tunnel access idp" nega le chiamate corrispondenti.
-cf_stub_perm() {
-  case " ${CF_DENY:-} " in
-    *" $1 "*) echo "{\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}]}" ;;
-    *) echo "{\"success\":true,\"result\":[]}" ;;
-  esac
+# Permessi del token: CF_DENY="tunnel access idp" nega le RISORSE SINGOLE
+# (come fa Cloudflare: 401/1001, 403/10000, 403/1010); con il permesso la
+# risorsa finta dà 404. Gli elenchi rispondono sempre 200 vuoti, anche senza
+# permesso: è il falso positivo trovato nel collaudo.
+cf_deny() { case " ${CF_DENY:-} " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+cf_reply() { # CODICE CORPO — il codice HTTP segue solo se curl ha avuto -w
+  printf "%s" "$2"
+  if [ -n "$wflag" ]; then printf "
+%s" "$1"; fi
 }
+wflag=""
+for a in "$@"; do [ "$a" = "-w" ] && wflag=1; done
 case "$url" in
   *"/zones/zone123") echo "{\"success\":true,\"result\":{\"id\":\"zone123\",\"account\":{\"id\":\"acc1\"}}}" ;;
-  *"cfd_tunnel?"*) cf_stub_perm tunnel ;;
-  *"access/apps?"*) cf_stub_perm access ;;
-  *"access/identity_providers") cf_stub_perm idp ;;
+  *"cfd_tunnel/0000"*)
+    if cf_deny tunnel; then cf_reply 401 "{\"success\":false,\"errors\":[{\"code\":1001,\"message\":\"Not authorized\"}]}"
+    else cf_reply 404 "{\"success\":false,\"errors\":[{\"code\":1002,\"message\":\"Tunnel not found\"}]}"; fi ;;
+  *"access/policies/0000"*)
+    if cf_deny access; then cf_reply 403 "{\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}]}"
+    else cf_reply 404 "{\"success\":false,\"errors\":[{\"code\":12045,\"message\":\"policy not found\"}]}"; fi ;;
+  *"access/identity_providers/0000"*)
+    if cf_deny idp; then cf_reply 403 "{\"success\":false,\"errors\":[{\"code\":1010,\"message\":null}]}"
+    else cf_reply 404 "{\"success\":false,\"errors\":[{\"code\":12135,\"message\":\"not found\"}]}"; fi ;;
+  *"cfd_tunnel?"* | *"access/apps?"* | *"access/identity_providers") cf_reply 200 "{\"success\":true,\"result\":[]}" ;;
   *"access/organizations")
-    if [ -n "${CF_NO_ZT:-}" ]; then
-      echo "{\"success\":false,\"errors\":[{\"code\":7003,\"message\":\"zero trust organization not found\"}]}"
-    else
-      echo "{\"success\":true,\"result\":{\"name\":\"x\"}}"
-    fi ;;
+    if cf_deny idp; then cf_reply 403 "{\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}]}"
+    elif [ -n "${CF_NO_ZT:-}" ]; then cf_reply 404 "{\"success\":false,\"errors\":[{\"code\":7003,\"message\":\"zero trust organization not found\"}]}"
+    else cf_reply 200 "{\"success\":true,\"result\":{\"name\":\"x\"}}"; fi ;;
   *"name=panel.miosito.it&"*) echo "{\"success\":true,\"result\":[]}" ;;
   *"name=miosito.it&"*) echo "{\"success\":true,\"result\":[{\"id\":\"zone123\",\"name\":\"miosito.it\"}]}" ;;
   *"dns_records?name="*) echo "${DNS_EXISTING:-{\"success\":true,\"result\":[]\}}" ;;
@@ -186,6 +196,24 @@ esac'
   [ "$output" = "$(printf 'tunnel\nidp')" ]
 }
 
+@test "cf_check_ssh_perms: ogni permesso negato è riportato da solo" {
+  for p in tunnel access idp; do
+    CF_DENY="$p" run cf_check_ssh_perms acc1
+    [ "$status" -eq 1 ]
+    [ "$output" = "$p" ]
+  done
+}
+
+@test "cf_check_ssh_perms: non si fida degli elenchi (regressione del collaudo)" {
+  # Gli elenchi rispondono 200 vuoti anche senza permesso: se il controllo li
+  # usasse, 'tunnel' non verrebbe mai segnalato.
+  export CF_DENY=tunnel
+  run cf_check_ssh_perms acc1
+  [ "$status" -eq 1 ]
+  [ "$output" = tunnel ]
+  ! grep -qE 'per_page|identity_providers( |$)' "$STUB_LOG"
+}
+
 @test "cf_check_ssh_perms: un errore non di autorizzazione non è un permesso mancante" {
   export CF_NO_ZT=1
   run cf_check_ssh_perms acc1
@@ -204,6 +232,10 @@ esac'
   export CF_NO_ZT=1
   run cf_zerotrust_enabled acc1
   [ "$status" -eq 1 ]
+  # 404 senza errore di autenticazione: Zero Trust non attivo, non permesso
+  export CF_NO_ZT=1
+  CF_DENY=idp run cf_zerotrust_enabled acc1
+  [ "$status" -eq 2 ]
 }
 
 @test "cf_api_error toglie i caratteri di controllo" {

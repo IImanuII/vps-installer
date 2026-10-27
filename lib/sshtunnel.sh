@@ -569,10 +569,15 @@ st_enable() {
     ST_ERR="al token Cloudflare mancano dei permessi: $(paste -sd ' ' <<<"$missing")"
     return 1
   fi
-  cf_zerotrust_enabled "$ST_ACC" || {
+  rc=0
+  cf_zerotrust_enabled "$ST_ACC" || rc=$?
+  if ((rc == 2)); then
+    ST_ERR="al token Cloudflare mancano dei permessi: idp"
+    return 1
+  elif ((rc != 0)); then
     ST_ERR="Zero Trust non è attivo sull'account Cloudflare"
     return 1
-  }
+  fi
   _st_check_free "$host" || return 1
 
   # Codice via email: se l'organizzazione non ce l'ha, lo si accende.
@@ -886,7 +891,7 @@ st_disable() {
 # {ok:false, error} e 1. drift elenca i pezzi registrati ma spariti.
 st_status_json() {
   local missing rc=0 zt=false otp=false enabled=false service=missing cver="" tstatus=""
-  local host="" emails="[]" user zid did aid tid pid app_gone=0
+  local host="" emails="[]" user zid did aid tid pid app_gone=0 zrc
   local -a drift=()
   if [[ "$(_st_manifest .cloudflare.enabled)" != true ]]; then
     printf '{"ok":true,"cloudflare":false}\n'
@@ -901,7 +906,17 @@ st_status_json() {
     jq -nc '{ok: false, error: "Cloudflare non risponde"}'
     return 1
   fi
-  if cf_zerotrust_enabled "$ST_ACC"; then zt=true; fi
+  # rc 2 = al token manca il permesso di leggere l'organizzazione (lo stesso
+  # degli Identity Providers): Zero Trust non è verificabile, quindi
+  # zerotrust:false e idp tra i mancanti (senza duplicarlo).
+  zrc=0
+  cf_zerotrust_enabled "$ST_ACC" || zrc=$?
+  if ((zrc == 0)); then
+    zt=true
+  elif ((zrc == 2)) && ! grep -qx idp <<<"$missing"; then
+    missing="${missing:+$missing$'
+'}idp"
+  fi
   if _st_req GET "/accounts/$ST_ACC/access/identity_providers" \
     && jq -e 'any(.result[]?; .type == "onetimepin")' >/dev/null 2>&1 <<<"$ST_BODY"; then
     otp=true

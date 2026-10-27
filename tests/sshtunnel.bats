@@ -354,7 +354,7 @@ in_order() {
   ! grep -q "^POST" "$CFLOG"
   run st_enable ssh-altro1 "non-una-email"; [ "$status" -eq 1 ]
   run st_enable "Bad_Label" manu@x.it; [ "$status" -eq 1 ]
-  CF_DENY="GET:/accounts/acc1/cfd_tunnel" run st_enable ssh-altro1 manu@x.it; [ "$status" -eq 1 ]
+  CF_DENY="GET:/accounts/acc1/cfd_tunnel/*" run st_enable ssh-altro1 manu@x.it; [ "$status" -eq 1 ]
   ! grep -q "^POST" "$CFLOG"
 }
 
@@ -609,6 +609,21 @@ in_order() {
   CF_404="DELETE:/zones/zone123/dns_records/dns1" run st_disable
   [ "$status" -eq 0 ]
   [ ! -e "$SSHTUNNEL_STATE" ]
+}
+
+@test "st_status_json: organizzazione non leggibile → zerotrust false e idp mancante, senza duplicati" {
+  cf_enabled
+  CF_DENY="GET:/accounts/acc1/access/organizations" run --separate-stderr st_status_json
+  jq -e '.zerotrust == false and .perms == {tunnel:true, access:true, idp:false}' <<<"$output"
+  CF_DENY="GET:/accounts/acc1/access/organizations GET:/accounts/acc1/access/identity_providers/*" run --separate-stderr st_status_json
+  jq -e '.zerotrust == false and .perms.idp == false' <<<"$output"
+}
+
+@test "st_enable: organizzazione non leggibile → permesso idp mancante" {
+  cf_env
+  CF_DENY="GET:/accounts/acc1/access/organizations" run st_enable ssh-altro1 manu@x.it
+  [ "$status" -eq 1 ]
+  ! grep -q "^POST" "$CFLOG"
 }
 
 @test "st_status_json: policy mancante (404) → drift app, senza duplicati" {
