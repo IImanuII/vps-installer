@@ -193,39 +193,67 @@ wizard_dns_records() {
   fi
 }
 
+# Nome leggibile dei permessi che cf_check_ssh_perms segnala come mancanti.
+cf_perm_label() {
+  case "$1" in
+    tunnel) echo "Cloudflare Tunnel" ;;
+    access) echo "Access: Apps and Policies" ;;
+    idp) echo "Access: Organizations, Identity Providers, and Groups" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# Col pannello Cloudflare è obbligatorio: l'accesso SSH dal browser (tunnel +
+# Access) e il DNS del pannello dipendono dal token, quindi niente "salta".
 wizard_cloudflare() {
-  local zone_domain="${PANEL_DOMAIN:-}" found choice
-  ask_yesno CF_ENABLED "Usi Cloudflare per i domini di questa VPS?" yes
-  if ! is_yes "$CF_ENABLED"; then
+  local zone_domain="${PANEL_DOMAIN:-}" found choice problem rc missing acc p
+  if ! is_yes "$PANEL_ENABLED"; then
+    # shellcheck disable=SC2034
+    CF_ENABLED=no
     wizard_dns_warning
     return 0
   fi
+  # shellcheck disable=SC2034
+  CF_ENABLED=yes
   if [[ -z "$zone_domain" ]]; then
     ask_input zone_domain "Dominio principale gestito su Cloudflare (es. miosito.it):" "" valid_domain "Dominio non valido."
   fi
   while true; do
-    ask_secret CF_API_TOKEN "API token Cloudflare (un token per questa VPS)\ncon i permessi Zone > Zone > Read, Zone > DNS > Edit e Zone > Cache Purge > Purge su tutte le zone:" valid_cf_token \
+    problem=""
+    ask_secret CF_API_TOKEN "API token Cloudflare (un token per questa VPS) con questi permessi, su tutte le zone o sulla zona di $zone_domain:\n\n$CF_PERMS_TEXT" valid_cf_token \
       "Formato del token non valido."
     if found="$(CF_API_TOKEN="$CF_API_TOKEN" cf_find_zone "$zone_domain" 2>/dev/null)"; then
       # shellcheck disable=SC2034
       CF_ZONE_ID="${found%% *}"
       CF_ZONE="${found#* }"
-      break
+      # Zero Trust non attivo non blocca: si attiva dopo, serve solo all'SSH.
+      acc="$(CF_API_TOKEN="$CF_API_TOKEN" cf_account_id "$CF_ZONE_ID" 2>/dev/null)" || acc=""
+      if [[ -z "$acc" ]]; then
+        problem="Non riesco a leggere l'account Cloudflare della zona $zone_domain."
+      else
+        rc=0
+        missing="$(CF_API_TOKEN="$CF_API_TOKEN" cf_check_ssh_perms "$acc" 2>/dev/null)" || rc=$?
+        if ((rc == 0)); then
+          break
+        elif ((rc == 2)); then
+          problem="Cloudflare non risponde: non posso controllare i permessi del token."
+        else
+          problem="Al token mancano:"
+          for p in $missing; do problem+="\n - $(cf_perm_label "$p")"; done
+        fi
+      fi
+    else
+      problem="Il token non è valido oppure non ha accesso alla zona di $zone_domain."
     fi
-    ask_menu choice "Il token non è valido oppure non ha accesso alla zona di $zone_domain." retry \
+    ask_menu choice "$problem" retry \
       retry "Riprova con un altro token" \
       domain "Cambia dominio della zona" \
-      skip "Continua senza Cloudflare"
+      quit "Annulla l'installazione"
     case "$choice" in
       domain)
         ask_input zone_domain "Dominio principale gestito su Cloudflare (es. miosito.it):" "$zone_domain" valid_domain "Dominio non valido."
         ;;
-      skip)
-        # shellcheck disable=SC2034
-        CF_ENABLED=no CF_API_TOKEN="" CF_ZONE="" CF_ZONE_ID=""
-        wizard_dns_warning
-        return 0
-        ;;
+      quit) exit 1 ;;
     esac
   done
   wizard_dns_records
@@ -254,9 +282,9 @@ wizard_summary() {
   local s panel cf mail
   panel="no"
   if is_yes "$PANEL_ENABLED"; then panel="$PANEL_DOMAIN"; fi
-  cf="no"
+  cf="non usato (nessun pannello)"
   if is_yes "$CF_ENABLED"; then
-    cf="sì, zona $CF_ZONE"
+    cf="zona $CF_ZONE"
     if is_yes "$CF_LOCK_ORIGIN"; then cf+=", 80/443 solo da Cloudflare"; fi
   fi
   mail="da configurare dal pannello"
