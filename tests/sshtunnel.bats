@@ -88,3 +88,51 @@ setup() {
   [ "$(st_state_get host)" = ssh-abc123.example.it ]
   [ -z "$(st_state_get nope)" ]
 }
+
+@test "st_random_label sopravvive a set -Eeuo pipefail" {
+  run bash -c 'set -Eeuo pipefail; for f in "$REPO_ROOT"/lib/*.sh; do source "$f"; done; st_random_label'
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ ^ssh-[a-z0-9]{6}$ ]]
+}
+
+@test "st_parse_emails non espande i glob" {
+  touch "$BATS_TEST_TMPDIR/a@x.it"
+  cd "$BATS_TEST_TMPDIR"
+  run st_parse_emails "*"
+  [ "$status" -eq 1 ]
+}
+
+@test "st_sshd_apply senza principal o con utente non valido ritorna 1 senza toccare nulla" {
+  run st_sshd_apply manu "ssh-ed25519 AAAA ca"; [ "$status" -eq 1 ]
+  run st_sshd_apply manu "ssh-ed25519 AAAA ca" ""; [ "$status" -eq 1 ]
+  run st_sshd_apply "../x" "ssh-ed25519 AAAA ca" manu; [ "$status" -eq 1 ]
+  run st_sshd_remove "../x"; [ "$status" -eq 1 ]
+  [ ! -e "$SSH_CF_CA" ]
+  [ ! -e "$SSH_CF_PRINCIPALS" ]
+  [ ! -s "$CALLS" ]
+}
+
+@test "sshd -t che fallisce ripristina CA e principal preesistenti" {
+  mkdir -p "$SSH_CF_PRINCIPALS"
+  echo CA-VECCHIA >"$SSH_CF_CA"
+  echo vecchio >"$SSH_CF_PRINCIPALS/manu"
+  SSHD_FAIL=1 run st_sshd_apply manu "ssh-ed25519 AAAA ca" manu
+  [ "$status" -eq 1 ]
+  [ "$(cat "$SSH_CF_CA")" = CA-VECCHIA ]
+  [ "$(cat "$SSH_CF_PRINCIPALS/manu")" = vecchio ]
+}
+
+@test "una scrittura fallita a metà ripristina e non lascia lo snapshot" {
+  mkdir -p "$SSH_CF_PRINCIPALS" "$BATS_TEST_TMPDIR/tmp"
+  echo CA-VECCHIA >"$SSH_CF_CA"
+  echo vecchio >"$SSH_CF_PRINCIPALS/manu"
+  chmod 555 "$SSHD_CONFIG_D"
+  TMPDIR="$BATS_TEST_TMPDIR/tmp" run st_sshd_apply manu "ssh-ed25519 AAAA ca" manu
+  chmod 755 "$SSHD_CONFIG_D"
+  [ "$status" -eq 1 ]
+  [ "$(cat "$SSH_CF_CA")" = CA-VECCHIA ]
+  [ "$(cat "$SSH_CF_PRINCIPALS/manu")" = vecchio ]
+  [ ! -e "$SSHD_CONFIG_D/20-vps-cfaccess.conf" ]
+  [ -z "$(ls -A "$BATS_TEST_TMPDIR/tmp")" ]
+  ! grep -q reload "$CALLS"
+}
