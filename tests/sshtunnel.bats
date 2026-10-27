@@ -1533,6 +1533,35 @@ enable_fails() {
   [ "$(jq -r '.users[1].sudo' "$SSHTUNNEL_STATE")" = false ]
 }
 
+@test "add-user, remove-user e set-sudo con una persona sparita o non nostra → rifiutati, nulla cambia" {
+  cf_enabled
+  add_people anna
+  before="$(cat "$SSHTUNNEL_STATE")"
+  # anna cancellata a mano: lo stato la tiene ancora
+  sed -i '/^anna:/d' "$PASSWD_FAKE"
+  : >"$CALLS"
+  for cmd in "st_add_user bob@y.it false" "st_remove_user manu@x.it" "st_set_sudo manu@x.it true"; do
+    rc=0; $cmd || rc=$?
+    [ "$rc" -eq 1 ]
+    [[ "$ST_ERR" == *"usa Disattiva"* ]]
+  done
+  [ ! -s "$CFLOG" ]
+  [ "$(cat "$SSHTUNNEL_STATE")" = "$before" ]
+  ! grep -qE '^(useradd|userdel)' "$CALLS"
+  [ ! -e "$SSH_CF_PRINCIPALS/bob" ]
+}
+
+@test "st_disable con uno stato senza nomi validi toglie comunque drop-in e CA" {
+  cf_enabled
+  jq 'del(.users) | del(.emails) | del(.user)' "$SSHTUNNEL_STATE" >"$BATS_TEST_TMPDIR/s" && mv "$BATS_TEST_TMPDIR/s" "$SSHTUNNEL_STATE"
+  [ -e "$SSHD_CONFIG_D/20-vps-cfaccess.conf" ]
+  run st_disable
+  [ "$status" -eq 0 ]
+  [ ! -e "$SSHD_CONFIG_D/20-vps-cfaccess.conf" ]
+  [ ! -e "$SSH_CF_CA" ]
+  [ ! -e "$SSHTUNNEL_STATE" ]
+}
+
 @test "st_disable elimina gli utenti dello stato, non quelli estranei" {
   cf_enabled
   add_people anna

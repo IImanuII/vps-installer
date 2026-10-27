@@ -345,7 +345,6 @@ st_sshd_apply() {
 # st_sshd_remove NOME... — toglie drop-in, CA e i principal dei NOME; poi test e reload.
 st_sshd_remove() {
   local n
-  (($# >= 1)) || return 1
   for n in "$@"; do st_valid_name "$n" || return 1; done
   rm -f "$SSHD_CONFIG_D/$ST_DROPIN" "$SSH_CF_CA"
   for n in "$@"; do rm -f "$SSH_CF_PRINCIPALS/$n"; done
@@ -955,6 +954,21 @@ _st_require_state() {
   return 1
 }
 
+# _st_users_match — le persone dello stato devono essere tutte utenti nostri (GECOS)
+# sulla VPS. Se una è sparita o è di qualcun altro (cambiata a mano) i comandi che
+# riscrivono principal e sshd per tutti la ricreerebbero: si rifiuta, resta Disattiva.
+_st_users_match() {
+  local n rc
+  while IFS= read -r n; do
+    rc=0
+    st_user_ours "$n" || rc=$?
+    if ((rc != 0)); then
+      ST_ERR="le persone autorizzate non corrispondono agli utenti della VPS: usa Disattiva"
+      return 1
+    fi
+  done < <(jq -r '.users[]?.user' <<<"$ST_S")
+}
+
 # _st_users_state — richiede lo stato nuovo (con "users"): ST_S, ST_ACC_ID, ST_PID,
 # ST_HOST. Uno stato 1.10.0 (solo "emails") non si gestisce: va disattivato e riattivato.
 _st_users_state() {
@@ -963,6 +977,7 @@ _st_users_state() {
     ST_ERR="l'accesso SSH è di una versione precedente (senza utenti): disattivalo e attivalo di nuovo"
     return 1
   }
+  _st_users_match || return 1
   _st_token || return 1
   ST_ACC_ID="$(jq -r '.account_id // empty' <<<"$ST_S")"
   ST_PID="$(jq -r '.policy_id // empty' <<<"$ST_S")"
@@ -1131,6 +1146,7 @@ st_set_sudo() {
     ST_ERR="l'accesso SSH è di una versione precedente (senza utenti): disattivalo e attivalo di nuovo"
     return 1
   }
+  _st_users_match || return 1
   entry="$(jq -c --arg e "$email" '.users[] | select(.email == $e)' <<<"$ST_S")"
   [[ -n "$entry" ]] || {
     ST_ERR="$email non è tra le persone autorizzate"
@@ -1297,7 +1313,8 @@ st_disable() {
   while IFS= read -r pname; do
     if [[ -n "$pname" ]] && st_valid_name "$pname"; then names+=("$pname"); fi
   done < <(jq -r '(.user // empty), (.emails[]? | split("@")[0] | ascii_downcase)' <<<"$ST_S")
-  if ((${#names[@]})) && ! st_sshd_remove "${names[@]}"; then
+  # Anche senza nessun nome valido (stato rovinato a mano) drop-in e CA vanno via.
+  if ! st_sshd_remove "${names[@]}"; then
     ST_ERR="rimozione della configurazione di sshd non riuscita"
     return 1
   fi
