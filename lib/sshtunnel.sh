@@ -714,15 +714,18 @@ _st_person() {
 # Anche un utente con il nostro GECOS ma fuori dallo stato non è "nostro" (il GECOS
 # lo può cambiare chi ci entra con chfn): si rifiuta, mai riusarlo.
 _st_name_available() {
+  local rc=0
+  st_user_ours "$1" || rc=$?
+  if ((rc != 1)); then
+    ST_ERR="l'utente $1 esiste già sulla VPS e non è stato creato dall'accesso SSH"
+    return 1
+  fi
+  # Solo se l'utente non esiste: una cartella orfana verrebbe adottata da useradd -m
+  # e poi cancellata da userdel -r.
   if [[ -e "${HOME_BASE:?}/$1" ]]; then
     ST_ERR="la cartella $HOME_BASE/$1 esiste già sulla VPS: l'utente $1 non può essere creato"
     return 1
   fi
-  local rc=0
-  st_user_ours "$1" || rc=$?
-  if ((rc == 1)); then return 0; fi
-  ST_ERR="l'utente $1 esiste già sulla VPS e non è stato creato dall'accesso SSH"
-  return 1
 }
 
 # _st_sshd_reapply NOME... — rimette sshd con questi utenti usando la CA già

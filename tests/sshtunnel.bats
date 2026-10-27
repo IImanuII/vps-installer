@@ -1412,6 +1412,8 @@ enable_fails() {
   [ "$ST_ERR" = "c'è già una persona con il nome utente anna" ]
   # utente estraneo
   echo "root:x:0:0:root:/root:/bin/bash" >>"$PASSWD_FAKE"
+  # con una cartella in /home il messaggio resta quello dell'utente estraneo
+  mkdir -p "$HOME_BASE/root"
   rc=0; st_add_user root@x.it true || rc=$?
   [ "$rc" -eq 1 ]
   [ "$ST_ERR" = "l'utente root esiste già sulla VPS e non è stato creato dall'accesso SSH" ]
