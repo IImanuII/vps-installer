@@ -164,3 +164,71 @@ cf_create_record() {
   fi
   jq -r '.result.id' <<<"$resp"
 }
+
+# Permessi del token per l'accesso SSH dal browser (etichette come nella
+# dashboard Cloudflare, così l'elenco si può ricopiare alla lettera).
+# Quello della CA di Access verrà aggiunto dopo la verifica sulla reference API.
+# shellcheck disable=SC2034  # usata da wizard e strumenti che caricano la libreria
+CF_PERMS_TEXT="Zone › Zone › Read
+Zone › DNS › Edit
+Zone › Cache Purge › Purge
+Account › Cloudflare Tunnel › Edit
+Account › Access: Apps and Policies › Edit
+Account › Access: Organizations, Identity Providers, and Groups › Edit"
+
+# cf_account_id ZONE_ID → id dell'account proprietario della zona (1 se
+# illeggibile). Si legge dalla zona perché non serve il permesso Account Read.
+cf_account_id() {
+  local resp id
+  resp="$(cf_api GET "/zones/$1")" || return 1
+  id="$(jq -r '.result.account.id // empty' <<<"$resp" 2>/dev/null || true)"
+  [[ -n "$id" ]] || return 1
+  printf '%s\n' "$id"
+}
+
+# cf_api_error JSON → primo messaggio d'errore, senza caratteri di controllo e
+# lungo al massimo 200 caratteri (finisce in messaggi mostrati all'utente).
+cf_api_error() {
+  local msg
+  msg="$(jq -r '.errors[0].message // empty' <<<"$1" 2>/dev/null || true)"
+  msg="$(printf '%s' "$msg" | tr -d '[:cntrl:]')"
+  printf '%s\n' "${msg:0:200}"
+}
+
+# Errore di autenticazione/permesso: codici Cloudflare 10000 (Authentication
+# error), 9109/9106/9107 (Access non autorizzato) o messaggio equivalente.
+_cf_is_auth_error() {
+  jq -e '.success == false and any(.errors[]?;
+      ([.code] | inside([10000, 9109, 9106, 9107, 10001]))
+      or ((.message // "") | test("authenticat|permission|not authorized|unauthorized|forbidden"; "i")))' \
+    >/dev/null 2>&1 <<<"$1"
+}
+
+# cf_check_ssh_perms ACCOUNT_ID → stampa, uno per riga, i permessi mancanti tra
+# tunnel, access, idp. 0 nessuno manca, 1 ne manca almeno uno, 2 Cloudflare non
+# risponde. Conta come mancante solo un errore di autorizzazione: gli altri
+# fallimenti (es. Zero Trust non ancora attivato) non dipendono dal token e li
+# gestisce cf_zerotrust_enabled.
+cf_check_ssh_perms() {
+  local acc="$1" missing=0 probe name path resp
+  for probe in "tunnel:/accounts/$acc/cfd_tunnel?per_page=1" \
+    "access:/accounts/$acc/access/apps?per_page=1" \
+    "idp:/accounts/$acc/access/identity_providers"; do
+    name="${probe%%:*}"
+    path="${probe#*:}"
+    resp="$(cf_api GET "$path")" || return 2
+    jq -e . >/dev/null 2>&1 <<<"$resp" || return 2
+    if _cf_is_auth_error "$resp"; then
+      printf '%s\n' "$name"
+      missing=1
+    fi
+  done
+  return "$missing"
+}
+
+# cf_zerotrust_enabled ACCOUNT_ID → 0 se l'organizzazione Zero Trust esiste.
+cf_zerotrust_enabled() {
+  local resp
+  resp="$(cf_api GET "/accounts/$1/access/organizations")" || return 1
+  jq -e '.success == true' >/dev/null 2>&1 <<<"$resp"
+}

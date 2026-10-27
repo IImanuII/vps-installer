@@ -6,7 +6,24 @@ setup() {
 printf "%s\n" "$*" >>"$STUB_LOG"
 for a in "$@"; do case "$a" in @*) cat "${a#@}" >>"$STUB_HDR";; esac; done
 url="${*: -1}"
+# Permessi del token: CF_DENY="tunnel access idp" nega le chiamate corrispondenti.
+cf_stub_perm() {
+  case " ${CF_DENY:-} " in
+    *" $1 "*) echo "{\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}]}" ;;
+    *) echo "{\"success\":true,\"result\":[]}" ;;
+  esac
+}
 case "$url" in
+  *"/zones/zone123") echo "{\"success\":true,\"result\":{\"id\":\"zone123\",\"account\":{\"id\":\"acc1\"}}}" ;;
+  *"cfd_tunnel?"*) cf_stub_perm tunnel ;;
+  *"access/apps?"*) cf_stub_perm access ;;
+  *"access/identity_providers") cf_stub_perm idp ;;
+  *"access/organizations")
+    if [ -n "${CF_NO_ZT:-}" ]; then
+      echo "{\"success\":false,\"errors\":[{\"code\":7003,\"message\":\"zero trust organization not found\"}]}"
+    else
+      echo "{\"success\":true,\"result\":{\"name\":\"x\"}}"
+    fi ;;
   *"name=panel.miosito.it&"*) echo "{\"success\":true,\"result\":[]}" ;;
   *"name=miosito.it&"*) echo "{\"success\":true,\"result\":[{\"id\":\"zone123\",\"name\":\"miosito.it\"}]}" ;;
   *"dns_records?name="*) echo "${DNS_EXISTING:-{\"success\":true,\"result\":[]\}}" ;;
@@ -143,4 +160,61 @@ esac'
   grep -q -- "-X DELETE.*dns_records/q1" "$STUB_LOG"
   run grep -q "dns_records/a1" "$STUB_LOG"
   [ "$status" -ne 0 ]
+}
+
+@test "cf_account_id legge l'id account dalla zona" {
+  run cf_account_id zone123
+  [ "$status" -eq 0 ]
+  [ "$output" = "acc1" ]
+}
+
+@test "cf_account_id fallisce se la zona non è leggibile" {
+  run cf_account_id zonaignota
+  [ "$status" -eq 1 ]
+}
+
+@test "cf_check_ssh_perms: tutto permesso, nessun output" {
+  run cf_check_ssh_perms acc1
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "cf_check_ssh_perms elenca i permessi mancanti" {
+  export CF_DENY="tunnel idp"
+  run cf_check_ssh_perms acc1
+  [ "$status" -eq 1 ]
+  [ "$output" = "$(printf 'tunnel\nidp')" ]
+}
+
+@test "cf_check_ssh_perms: un errore non di autorizzazione non è un permesso mancante" {
+  export CF_NO_ZT=1
+  run cf_check_ssh_perms acc1
+  [ "$status" -eq 0 ]
+}
+
+@test "cf_check_ssh_perms: Cloudflare irraggiungibile dà 2" {
+  make_stub curl 'exit 7'
+  run cf_check_ssh_perms acc1
+  [ "$status" -eq 2 ]
+}
+
+@test "cf_zerotrust_enabled dipende da access/organizations" {
+  run cf_zerotrust_enabled acc1
+  [ "$status" -eq 0 ]
+  export CF_NO_ZT=1
+  run cf_zerotrust_enabled acc1
+  [ "$status" -eq 1 ]
+}
+
+@test "cf_api_error toglie i caratteri di controllo" {
+  run cf_api_error '{"errors":[{"message":"a\u001b[31mb"}]}'
+  [ "$output" = "a[31mb" ]
+  run cf_api_error 'non json'
+  [ -z "$output" ]
+}
+
+@test "CF_PERMS_TEXT elenca i permessi" {
+  [[ "$CF_PERMS_TEXT" == *"Cloudflare Tunnel"* ]]
+  [[ "$CF_PERMS_TEXT" == *"Identity Providers"* ]]
+  [[ "$CF_PERMS_TEXT" == *"Cache Purge"* ]]
 }
