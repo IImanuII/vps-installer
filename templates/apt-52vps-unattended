@@ -1,9 +1,10 @@
-// vps-installer: pacchetti Debian e Nginx di nginx.org, riavvio automatico alle 04:00 se serve.
+// vps-installer: pacchetti Debian, Nginx di nginx.org e cloudflared, riavvio automatico alle 04:00 se serve.
 Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename},label=Debian";
         "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
         "origin=Debian,codename=${distro_codename}-updates";
         "origin=nginx,codename=${distro_codename}";
+        "origin=cloudflared,codename=any";
 };
 Unattended-Upgrade::Automatic-Reboot "true";
 Unattended-Upgrade::Automatic-Reboot-Time "04:00";

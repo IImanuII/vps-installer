@@ -44,7 +44,7 @@ sudo vps-panel-update      # poi, per ogni nuovo rilascio
 Su una VPS installata con una versione precedente alla 1.1, prima:
 
 ```bash
-curl -fsSLO https://github.com/IImanuII/vps-installer/releases/download/v1.9.0/install.sh
+curl -fsSLO https://github.com/IImanuII/vps-installer/releases/download/v1.10.0/install.sh
 sudo bash install.sh --tools-only
 ```
 
@@ -58,7 +58,7 @@ Se attivi Cloudflare serve **un token per VPS**, con accesso a tutte le zone che
 
 1. Cloudflare -> **My Profile -> API Tokens -> Create Token -> Create Custom Token**.
 2. Nome: `VPS <nome> sistema`.
-3. Permessi: **Zone > Zone > Read**, **Zone > DNS > Edit**, **Zone > Cache Purge > Purge**.
+3. Permessi: **Zone > Zone > Read**, **Zone > DNS > Edit**, **Zone > Cache Purge > Purge**. Per l'accesso SSH dal browser servono anche: **Account > Cloudflare Tunnel > Edit**, **Account > Access: Apps and Policies > Edit**, **Account > Access: Organizations, Identity Providers, and Groups > Edit** (e Zero Trust attivato sull'account, piano Free).
 4. Zone Resources: **Include -> All zones**.
 
 Mai la Global API Key. Per sostituire il token: pagina Cloudflare di Plancia, oppure
