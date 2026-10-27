@@ -88,6 +88,7 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | `/etc/ssh/vps-cf-ca.pub` | chiave pubblica della CA di Access (`TrustedUserCAKeys`) |
 | `/etc/ssh/vps-cf-principals/` | un file per utente con i principal ammessi (la parte prima della `@` delle email) |
 | `/etc/systemd/system/vps-cloudflared.service` | servizio di `cloudflared` (tunnel verso `ssh://localhost`) |
+| `/etc/apt/apt.conf.d/90vps-cloudflared` | hook apt (`DPkg::Post-Invoke`): riavvia `vps-cloudflared` dopo ogni aggiornamento del pacchetto; tolto con la disattivazione |
 | apt source di `cloudflared` (repository `pkg.cloudflare.com`, suite `any`) | installato con l'accesso SSH; origine aggiunta agli aggiornamenti automatici (`52vps-unattended`) |
 | `/var/www/_maintenance/_maintenance.html` | pagina 503 dei siti disattivati |
 | `/etc/systemd/system/vps-monitor.service` | `root:root` 644: `Type=oneshot`, `ExecStart=/opt/vps/bin/vps-monitor _run`, `TimeoutStartSec=55`, `Nice=5` |

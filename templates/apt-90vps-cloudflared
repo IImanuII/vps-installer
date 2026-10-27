@@ -1,0 +1,2 @@
+// Dopo un aggiornamento di cloudflared riavvia il tunnel (installato da vps-ssh-tunnel).
+DPkg::Post-Invoke { "if [ -d /run/systemd/system ]; then systemctl try-restart vps-cloudflared.service >/dev/null 2>&1 || true; fi"; };

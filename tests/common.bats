@@ -81,3 +81,14 @@ setup() {
   printf 'A=2\n' | env_merge "$f" 600 "$(id -un):$(id -gn)"
   [ "$(cat "$f")" = $'A=2\nB=x' ]
 }
+
+@test "write_file: cat che fallisce → rc 1, file di destinazione intatto, nessun temporaneo" {
+  printf 'vecchio\n' >"$BATS_TEST_TMPDIR/f"
+  cat() { return 1; }
+  rc=0
+  printf 'nuovo\n' | write_file "$BATS_TEST_TMPDIR/f" 600 "$(id -un):$(id -gn)" || rc=$?
+  unset -f cat
+  [ "$rc" -eq 1 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/f")" = "vecchio" ]
+  [ -z "$(find "$BATS_TEST_TMPDIR" -name '.tmp.*')" ]
+}

@@ -13,7 +13,10 @@ setup() {
   # shellcheck disable=SC2016
   make_stub sshd 'echo "sshd $*" >>"$CALLS"; [ "${SSHD_FAIL:-0}" = 1 ] && exit 1; exit 0'
   # shellcheck disable=SC2016
-  make_stub systemctl 'echo "systemctl $*" >>"$CALLS"; exit 0'
+  make_stub systemctl 'echo "systemctl $*" >>"$CALLS"
+[ "${RELOAD_FAIL:-0}" = 1 ] && [ "$1 $2" = "reload ssh" ] && exit 1
+[ "${ACTIVE_FAIL:-0}" = 1 ] && [ "$1" = is-active ] && exit 3
+exit 0'
 }
 
 @test "st_valid_label accetta e rifiuta" {
@@ -155,6 +158,8 @@ cf_env() {
   export SYSTEMD_DIR="$BATS_TEST_TMPDIR/systemd"
   export SSHTUNNEL_ENV="$VPS_OPT/secrets/cf-tunnel.env"
   export APT_SOURCES_D="$BATS_TEST_TMPDIR/apt"
+  export APT_CONF_D="$BATS_TEST_TMPDIR/apt.conf.d"
+  export CLOUDFLARED_BIN="$BATS_TEST_TMPDIR/bin/cloudflared"
   export CLOUDFLARED_KEYRING="$BATS_TEST_TMPDIR/keyrings/cloudflare-main.gpg"
   export SITES_DIR="$VPS_OPT/sites"
   mkdir -p "$SYSTEMD_DIR" "$VPS_OPT/secrets" "$SITES_DIR"
@@ -798,4 +803,131 @@ cli_env() {
   t="$REPO_ROOT/tools/vps-ssh-tunnel"
   grep -q 'systemd-run --wait --pipe' "$t"
   grep -q '/opt/vps/bin/vps-ssh-tunnel "\$@"' "$t"
+}
+
+@test "st_sshd_apply: reload che fallisce dopo sshd -t ripristina i file di prima, rc 1" {
+  mkdir -p "$SSH_CF_PRINCIPALS"
+  echo CA-VECCHIA >"$SSH_CF_CA"
+  echo vecchio >"$SSH_CF_PRINCIPALS/manu"
+  RELOAD_FAIL=1 run st_sshd_apply manu "ssh-ed25519 AAAA ca" manu
+  [ "$status" -eq 1 ]
+  [ "$(cat "$SSH_CF_CA")" = CA-VECCHIA ]
+  [ "$(cat "$SSH_CF_PRINCIPALS/manu")" = vecchio ]
+  [ ! -e "$SSHD_CONFIG_D/20-vps-cfaccess.conf" ]
+  # un secondo tentativo di reload con la configurazione di prima
+  [ "$(grep -c "systemctl reload ssh" "$CALLS")" -eq 2 ]
+}
+
+@test "st_sshd_apply: snapshot che fallisce → rc 1 senza scrivere nulla" {
+  mkdir -p "$SSH_CF_PRINCIPALS"
+  echo CA-VECCHIA >"$SSH_CF_CA"
+  cp() { return 1; }
+  run st_sshd_apply manu "ssh-ed25519 AAAA ca" manu
+  unset -f cp
+  [ "$status" -eq 1 ]
+  [ "$(cat "$SSH_CF_CA")" = CA-VECCHIA ]
+  [ ! -e "$SSHD_CONFIG_D/20-vps-cfaccess.conf" ]
+  [ ! -s "$CALLS" ]
+}
+
+@test "st_enable: reload di sshd fallito → annullamento completo, messaggio veritiero" {
+  cf_env
+  rc=0
+  RELOAD_FAIL=1 st_enable ssh-k3f9x2 manu@x.it || rc=$?
+  [ "$rc" -eq 1 ]
+  [[ "$ST_ERR" == *"sshd è rimasto com'era"* ]]
+  [ ! -e "$SSHD_CONFIG_D/20-vps-cfaccess.conf" ]
+  [ ! -e "$SSH_CF_CA" ]
+  [ ! -e "$SSHTUNNEL_STATE" ]
+  grep -qx "DELETE /accounts/acc1/cfd_tunnel/tun1" "$CFLOG"
+}
+
+@test "st_set_emails: policy non ripristinata → il messaggio non dice che è tutto com'era" {
+  cf_enabled
+  # il secondo PUT (ripristino) fallisce: lo si simula con un contatore sul log
+  _st_put_policy() { n=$((${n:-0} + 1)); [ "$n" -eq 1 ]; }
+  export SSHD_FAIL=1
+  rc=0
+  st_set_emails altro@y.it || rc=$?
+  [ "$rc" -eq 1 ]
+  [[ "$ST_ERR" == *"non è stata ripristinata"* ]]
+  [[ "$ST_ERR" != *"email e sshd rimasti"* ]]
+}
+
+@test "_st_rollback: un passo che fallisce lo dice in ST_ERR" {
+  cf_env
+  rc=0
+  CF_FAIL="POST:*/ca DELETE:/accounts/acc1/access/apps/app1" st_enable ssh-k3f9x2 manu@x.it || rc=$?
+  [ "$rc" -eq 1 ]
+  [[ "$ST_ERR" == *"annullamento incompleto: controlla Cloudflare"* ]]
+}
+
+@test "_st_rollback: tutto ok → ST_ERR senza avviso di annullamento incompleto" {
+  cf_env
+  rc=0
+  CF_FAIL="POST:*/ca" st_enable ssh-k3f9x2 manu@x.it || rc=$?
+  [ "$rc" -eq 1 ]
+  [[ "$ST_ERR" != *"annullamento incompleto"* ]]
+}
+
+@test "hook apt di cloudflared: installato con l'unità, tolto da st_disable" {
+  cf_enabled
+  h="$APT_CONF_D/90vps-cloudflared"
+  [ -f "$h" ]
+  grep -q 'try-restart vps-cloudflared.service' "$h"
+  grep -q 'DPkg::Post-Invoke' "$h"
+  run st_disable
+  [ "$status" -eq 0 ]
+  [ ! -e "$h" ]
+}
+
+@test "unità vps-cloudflared: Type=exec e hook apt documentato nel handoff" {
+  grep -qx 'Type=exec' "$REPO_ROOT/templates/vps-cloudflared.service"
+  grep -q '90vps-cloudflared' "$REPO_ROOT/docs/PANEL-HANDOFF.md"
+}
+
+@test "st_enable: servizio non attivo dopo enable → errore e annullamento" {
+  cf_env
+  rc=0
+  ACTIVE_FAIL=1 st_enable ssh-k3f9x2 manu@x.it || rc=$?
+  [ "$rc" -eq 1 ]
+  [[ "$ST_ERR" == *cloudflared* ]]
+  [ ! -e "$SYSTEMD_DIR/vps-cloudflared.service" ]
+  [ ! -e "$APT_CONF_D/90vps-cloudflared" ]
+  [ ! -e "$SSHTUNNEL_STATE" ]
+  grep -qx "DELETE /accounts/acc1/cfd_tunnel/tun1" "$CFLOG"
+}
+
+@test "st_cloudflared_install: serve il binario nel percorso fisso, non basta il PATH" {
+  cf_env
+  rm -f "$CLOUDFLARED_BIN"
+  export CLOUDFLARED_BIN="$BATS_TEST_TMPDIR/assente/cloudflared"
+  make_stub curl 'exit 22'
+  rc=0
+  st_cloudflared_install || rc=$?
+  [ "$rc" -eq 1 ]
+}
+
+@test "st_set_host: porta mancante nel manifest → errore, nessuna chiamata API" {
+  cf_enabled
+  jq '.ssh_port = ""' "$VPS_OPT/manifest.json" >"$BATS_TEST_TMPDIR/m" && mv "$BATS_TEST_TMPDIR/m" "$VPS_OPT/manifest.json"
+  rc=0
+  st_set_host ssh-nuovo1 || rc=$?
+  [ "$rc" -eq 1 ]
+  [[ "$ST_ERR" == *ssh_port* ]]
+  [ ! -s "$CFLOG" ]
+}
+
+@test "st_set_host: Cloudflare spento o zona vuota → errore, nessuna chiamata API" {
+  cf_enabled
+  jq '.cloudflare.zone = ""' "$VPS_OPT/manifest.json" >"$BATS_TEST_TMPDIR/m" && mv "$BATS_TEST_TMPDIR/m" "$VPS_OPT/manifest.json"
+  rc=0
+  st_set_host ssh-nuovo1 || rc=$?
+  [ "$rc" -eq 1 ]
+  [ ! -s "$CFLOG" ]
+  jq '.cloudflare.zone = "example.it" | .cloudflare.enabled = false' "$VPS_OPT/manifest.json" >"$BATS_TEST_TMPDIR/m" && mv "$BATS_TEST_TMPDIR/m" "$VPS_OPT/manifest.json"
+  rc=0
+  st_set_host ssh-nuovo1 || rc=$?
+  [ "$rc" -eq 1 ]
+  [ ! -s "$CFLOG" ]
 }

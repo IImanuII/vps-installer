@@ -69,11 +69,13 @@ own() {
 # write_file PATH MODE OWNER:GROUP — contenuto da stdin, sostituzione atomica.
 write_file() {
   local path="$1" mode="$2" owner="$3" tmp
-  tmp="$(mktemp "$(dirname "$path")/.tmp.XXXXXX")"
-  cat >"$tmp"
-  chmod "$mode" "$tmp"
-  own "$owner" "$tmp"
-  mv -f "$tmp" "$path"
+  tmp="$(mktemp "$(dirname "$path")/.tmp.XXXXXX")" || return 1
+  # Un errore a metà (disco pieno, chown) non deve lasciare il temporaneo né
+  # sostituire il file vero con un contenuto parziale.
+  if ! { cat >"$tmp" && chmod "$mode" "$tmp" && own "$owner" "$tmp" && mv -f "$tmp" "$path"; }; then
+    rm -f "$tmp"
+    return 1
+  fi
 }
 
 is_yes() {

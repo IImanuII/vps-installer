@@ -4,6 +4,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# exec: se il binario non parte, "systemctl start" fallisce subito.
+Type=exec
 # Il token del tunnel sta solo in questo file (600 root) e arriva a cloudflared
 # come TUNNEL_TOKEN nell'ambiente: tra gli argomenti sarebbe visibile in ps.
 EnvironmentFile=/opt/vps/secrets/cf-tunnel.env

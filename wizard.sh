@@ -240,6 +240,10 @@ wizard_cloudflare() {
         else
           problem="Al token mancano:"
           for p in $missing; do problem+="\n - $(cf_perm_label "$p")"; done
+          # Senza Zero Trust l'API risponde "non autorizzato" come per un permesso mancante.
+          case " ${missing//$'\n'/ } " in
+            *" access "* | *" idp "*) problem+="\n\nSe Zero Trust non è ancora attivo sull'account Cloudflare (piano Free), attivalo dal dashboard e poi riprova." ;;
+          esac
         fi
       fi
     else

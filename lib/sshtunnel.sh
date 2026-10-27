@@ -95,7 +95,8 @@ st_sshd_files() {
 st_sshd_snapshot() {
   local dir="$1" f i=0
   while IFS= read -r f; do
-    if [[ -e "$f" ]]; then cp -p "$f" "$dir/$i"; else : >"$dir/$i.none"; fi
+    # Senza una copia fedele il ripristino non sarebbe possibile: meglio fermarsi.
+    if [[ -e "$f" ]]; then cp -p "$f" "$dir/$i" || return 1; else : >"$dir/$i.none" || return 1; fi
     i=$((i + 1))
   done < <(st_sshd_files "$2")
 }
@@ -124,7 +125,13 @@ st_sshd_apply() {
   for p in "$@"; do [[ -n "$p" ]] && n=$((n + 1)); done
   ((n >= 1)) || return 1
   snap="$(mktemp -d)" || return 1
-  st_sshd_snapshot "$snap" "$user"
+  # Prima di scrivere qualunque cosa: se lo snapshot non è completo si esce
+  # senza aver toccato sshd.
+  if ! st_sshd_snapshot "$snap" "$user"; then
+    rm -rf "$snap"
+    log "snapshot della configurazione di sshd non riuscito: nulla è stato modificato."
+    return 1
+  fi
   # Gruppo in un "if": un'unica scrittura fallita porta al ripristino, non a
   # un'uscita a metà per "set -e" con file mezzi scritti e snapshot orfano.
   # sshd legge i file come root, ma la cartella deve essere attraversabile.
@@ -135,9 +142,17 @@ st_sshd_apply() {
       printf '%s\n' "$@" | write_file "$SSH_CF_PRINCIPALS/$user" 644 root:root &&
       write_file "$SSHD_CONFIG_D/$ST_DROPIN" 644 root:root <"$VPS_TEMPLATES/sshd-20-vps-cfaccess.conf"
   } && st_sshd_test; then
+    if systemctl reload ssh; then
+      rm -rf "$snap"
+      return 0
+    fi
+    # sshd -t era a posto ma il reload no: i file nuovi non devono restare su
+    # disco (al prossimo riavvio sshd partirebbe con una configurazione mai provata).
+    st_sshd_restore "$snap" "$user"
     rm -rf "$snap"
-    systemctl reload ssh
-    return
+    systemctl reload ssh || log "ripristino: anche il reload di sshd con la configurazione di prima è fallito"
+    log "reload di sshd fallito: ripristinata la configurazione di prima."
+    return 1
   fi
   st_sshd_restore "$snap" "$user"
   rm -rf "$snap"
@@ -199,7 +214,12 @@ st_sshd_remove() {
 : "${SYSTEMD_DIR:=/etc/systemd/system}"
 : "${APT_SOURCES_D:=/etc/apt/sources.list.d}"
 : "${CLOUDFLARED_KEYRING:=/usr/share/keyrings/cloudflare-main.gpg}"
+# Hook di apt: dopo ogni aggiornamento di cloudflared (anche automatico) il
+# servizio riparte, altrimenti resterebbe in memoria il binario vecchio.
+: "${APT_CONF_D:=/etc/apt/apt.conf.d}"
+: "${CLOUDFLARED_BIN:=/usr/bin/cloudflared}"
 ST_UNIT="vps-cloudflared"
+ST_APT_HOOK="90vps-cloudflared"
 CLOUDFLARED_KEY_FPRS=(CC94B39C77AE7342A68B89628A682D308D4E5E73)
 ST_UNDO=()
 
@@ -213,6 +233,25 @@ _st_token() {
   [[ -n "${CF_API_TOKEN:-}" ]] || CF_API_TOKEN="$(cf_token_from_ini 2>/dev/null || true)"
   [[ -n "${CF_API_TOKEN:-}" ]] || {
     ST_ERR="token Cloudflare mancante"
+    return 1
+  }
+}
+
+# _st_manifest_ctx — Cloudflare attivo, zona e porta SSH dal manifest, senza
+# chiamate di rete: ST_ZONE, ST_PORT. Usato da set-host prima di toccare Cloudflare.
+_st_manifest_ctx() {
+  [[ "$(_st_manifest .cloudflare.enabled)" == true ]] || {
+    ST_ERR="Cloudflare non è attivo su questa VPS"
+    return 1
+  }
+  ST_ZONE="$(_st_manifest .cloudflare.zone)"
+  [[ -n "$ST_ZONE" ]] || {
+    ST_ERR="zona Cloudflare assente nel manifest"
+    return 1
+  }
+  ST_PORT="$(_st_manifest .ssh_port)"
+  [[ "$ST_PORT" =~ ^[0-9]+$ ]] || {
+    ST_ERR="manifest incompleto (ssh_port)"
     return 1
   }
 }
@@ -286,12 +325,18 @@ _st_undo_push() {
 }
 
 _st_rollback() {
-  local i a
+  local i a failed=0
   for ((i = ${#ST_UNDO[@]} - 1; i >= 0; i--)); do
     read -ra a <<<"${ST_UNDO[i]}"
-    "${a[@]}" || log "accesso SSH: annullamento non riuscito: ${ST_UNDO[i]}"
+    "${a[@]}" || {
+      failed=1
+      log "accesso SSH: annullamento non riuscito: ${ST_UNDO[i]}"
+    }
   done
   ST_UNDO=()
+  # L'utente deve sapere che su Cloudflare può essere rimasto qualcosa.
+  if ((failed)); then ST_ERR+=" (annullamento incompleto: controlla Cloudflare, dettagli nel log)"; fi
+  return 0
 }
 
 _st_rm_dns() {
@@ -387,14 +432,18 @@ _st_service_install() {
     printf 'TUNNEL_TOKEN=%s\n' "$ST_TUNNEL_TOKEN" | write_file "$SSHTUNNEL_ENV" 600 root:root &&
     mkdir -p "$SYSTEMD_DIR" &&
     write_file "$SYSTEMD_DIR/$ST_UNIT.service" 644 root:root <"$VPS_TEMPLATES/vps-cloudflared.service" &&
+    mkdir -p "$APT_CONF_D" &&
+    write_file "$APT_CONF_D/$ST_APT_HOOK" 644 root:root <"$VPS_TEMPLATES/apt-90vps-cloudflared" &&
     systemctl daemon-reload >>"$VPS_LOG" 2>&1 &&
-    systemctl enable --now "$ST_UNIT" >>"$VPS_LOG" 2>&1
+    systemctl enable --now "$ST_UNIT" >>"$VPS_LOG" 2>&1 &&
+    # Un servizio che parte e subito cade (token rifiutato, rete) non è un successo.
+    systemctl is-active --quiet "$ST_UNIT" >>"$VPS_LOG" 2>&1
 }
 
 # _st_service_remove — ferma e toglie unità e token; il pacchetto resta.
 _st_service_remove() {
   systemctl disable --now "$ST_UNIT" >>"$VPS_LOG" 2>&1 || true
-  rm -f "${SYSTEMD_DIR:?}/${ST_UNIT:?}.service" "${SSHTUNNEL_ENV:?}"
+  rm -f "${SYSTEMD_DIR:?}/${ST_UNIT:?}.service" "${SSHTUNNEL_ENV:?}" "${APT_CONF_D:?}/${ST_APT_HOOK:?}"
   systemctl daemon-reload >>"$VPS_LOG" 2>&1 || true
 }
 
@@ -402,7 +451,8 @@ _st_service_remove() {
 # chiave verificata sul fingerprint fissato. 1 con ST_ERR se non riesce.
 st_cloudflared_install() {
   local tmp list="$APT_SOURCES_D/cloudflared.list"
-  command -v cloudflared >/dev/null 2>&1 && return 0
+  # Il file unit usa il percorso fisso: un cloudflared altrove nel PATH non basta.
+  [[ -x "$CLOUDFLARED_BIN" ]] && return 0
   log "accesso SSH: installo cloudflared dal repository di Cloudflare"
   tmp="$(mktemp)"
   if ! curl -fsS --max-time 30 -o "$tmp" https://pkg.cloudflare.com/cloudflare-main.gpg >>"$VPS_LOG" 2>&1; then
@@ -424,7 +474,7 @@ st_cloudflared_install() {
   printf 'deb [signed-by=%s] https://pkg.cloudflare.com/cloudflared any main\n' "$CLOUDFLARED_KEYRING" \
     | write_file "$list" 644 root:root
   if apt-get update -q -o DPkg::Lock::Timeout=300 >>"$VPS_LOG" 2>&1 \
-    && apt_install cloudflared && command -v cloudflared >/dev/null 2>&1; then
+    && apt_install cloudflared && [[ -x "$CLOUDFLARED_BIN" ]]; then
     return 0
   fi
   # Un repository che non funziona romperebbe ogni "apt-get update" successivo.
@@ -689,9 +739,13 @@ st_set_emails() {
   }
   mapfile -t principals < <(st_principals "${ST_EMAILS[@]}")
   if ! st_sshd_apply "$user" "$ca" "${principals[@]}"; then
-    ST_ERR="configurazione di sshd non riuscita: email e sshd rimasti com'erano"
+    # sshd si è già rimesso a posto da solo (st_sshd_apply); resta la policy.
+    if _st_put_policy "$acc" "$pid" "$host" "${old[@]}"; then
+      ST_ERR="configurazione di sshd non riuscita: email e sshd rimasti com'erano"
+    else
+      ST_ERR="configurazione di sshd non riuscita (sshd è rimasto com'era) e la policy Access non è stata ripristinata: controlla le email su Cloudflare"
+    fi
     log "accesso SSH: $ST_ERR"
-    _st_put_policy "$acc" "$pid" "$host" "${old[@]}" || log "accesso SSH: policy Access non ripristinata"
     return 1
   fi
   st_state_write "$(jq '.emails = $ARGS.positional' --args "${ST_EMAILS[@]}" <<<"$ST_S")" || {
@@ -713,9 +767,9 @@ st_set_host() {
     return 1
   }
   _st_require_state || return 1
+  _st_manifest_ctx || return 1
   _st_token || return 1
-  ST_ZONE="$(_st_manifest .cloudflare.zone)"
-  port="$(_st_manifest .ssh_port)"
+  port="$ST_PORT"
   acc="$(jq -r .account_id <<<"$ST_S")"
   tid="$(jq -r .tunnel_id <<<"$ST_S")"
   aid="$(jq -r .app_id <<<"$ST_S")"

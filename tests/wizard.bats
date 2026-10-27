@@ -133,3 +133,32 @@ exit 1'
   SSH_CLIENT= wizard_defaults
   [ "$SSH_IGNORE_IP" = "" ]
 }
+
+@test "wizard_cloudflare: permessi access/idp mancanti → il menu ricorda di attivare Zero Trust" {
+  source "$REPO_ROOT/wizard.sh"
+  make_stub whiptail '
+for a in "$@"; do
+  case "$a" in
+    --yesno) exit 0 ;;
+    --passwordbox) echo "abcdefghijklmnopqrstuvwxyz0123456789ABCD" >&2; exit 0 ;;
+    --menu) printf "%s
+" "$@" >"$BATS_TEST_TMPDIR/menu"; echo quit >&2; exit 0 ;;
+    --msgbox) exit 0 ;;
+  esac
+done
+exit 1'
+  cf_find_zone() { echo "zone1 example.com"; }
+  cf_account_id() { echo acc1; }
+  cf_check_ssh_perms() { printf '%s
+' "$MISSING"; return 1; }
+  server_ipv4() { return 1; }
+  wizard_defaults
+  PANEL_ENABLED=yes PANEL_DOMAIN=panel.example.com
+  MISSING=access run wizard_cloudflare
+  [ "$status" -eq 1 ]
+  grep -q "Zero Trust non è ancora attivo" "$BATS_TEST_TMPDIR/menu"
+  rm -f "$BATS_TEST_TMPDIR/menu"
+  MISSING=tunnel run wizard_cloudflare
+  [ "$status" -eq 1 ]
+  ! grep -q "Zero Trust non è ancora attivo" "$BATS_TEST_TMPDIR/menu"
+}
