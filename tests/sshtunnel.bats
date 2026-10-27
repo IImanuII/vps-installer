@@ -10,13 +10,14 @@ setup() {
   export SUDOERS_D="$BATS_TEST_TMPDIR/sudoers.d"
   export PASSWD_FAKE="$BATS_TEST_TMPDIR/passwd"
   export LINGER_D="$BATS_TEST_TMPDIR/linger"
+  export HOME_BASE="$BATS_TEST_TMPDIR/home"
   export CALLS="$BATS_TEST_TMPDIR/calls"
-  mkdir -p "$SSHD_CONFIG_D" "$BATS_TEST_TMPDIR/ssh" "$SUDOERS_D"
+  mkdir -p "$SSHD_CONFIG_D" "$BATS_TEST_TMPDIR/ssh" "$SUDOERS_D" "$HOME_BASE"
   : >"$PASSWD_FAKE"
   : >"$CALLS"
   # getent legge un passwd finto: "nome:x:1000:1000:GECOS:/home/nome:/bin/bash".
   # shellcheck disable=SC2016
-  make_stub getent '[ "$1" = passwd ] || exit 2; grep "^$2:" "$PASSWD_FAKE" || exit 2'
+  make_stub getent '[ "$1" = passwd ] || exit 2; awk -F: -v u="$2" '"'"'$1 == u { print; f = 1 } END { exit !f }'"'"' "$PASSWD_FAKE" || exit 2'
   # shellcheck disable=SC2016
   make_stub sshd 'echo "sshd $*" >>"$CALLS"; [ "${SSHD_FAIL:-0}" = 1 ] && exit 1; exit 0'
   # shellcheck disable=SC2016
@@ -1589,4 +1590,64 @@ enable_fails() {
   echo "manu:x:1000:1000:vps-ssh-tunnel:/home/manu:/bin/bash" >"$PASSWD_FAKE"
   run --separate-stderr st_status_json
   jq -e '.drift == []' <<<"$output"
+}
+
+@test "st_user_delete di un account estraneo: toglie il nostro sudoers e principal, non tocca l'account" {
+  user_stubs
+  echo "anna:x:1002:1002:Anna:/home/anna:/bin/bash" >>"$PASSWD_FAKE"
+  echo "anna ALL=(ALL) NOPASSWD:ALL" >"$SUDOERS_D/vps-ssh-anna"
+  mkdir -p "$SSH_CF_PRINCIPALS"
+  echo anna >"$SSH_CF_PRINCIPALS/anna"
+  run st_user_delete anna
+  [ "$status" -eq 2 ]
+  [ ! -e "$SUDOERS_D/vps-ssh-anna" ]
+  [ ! -e "$SSH_CF_PRINCIPALS/anna" ]
+  grep -q '^anna:' "$PASSWD_FAKE"
+  ! grep -qE '^(userdel|pkill|loginctl|crontab|find|atrm|usermod)' "$CALLS"
+}
+
+@test "st_disable con un account estraneo omonimo: lo lascia, ma il nostro sudoers non sopravvive" {
+  cf_enabled
+  add_people anna
+  echo "anna ALL=(ALL) NOPASSWD:ALL" >"$SUDOERS_D/vps-ssh-anna"
+  sed -i 's/^anna:x:1001:1001:vps-ssh-tunnel/anna:x:1001:1001:Anna/' "$PASSWD_FAKE"
+  run st_disable
+  [ "$status" -eq 0 ]
+  grep -q '^anna:' "$PASSWD_FAKE"
+  ! grep -qx "userdel -r anna" "$CALLS"
+  [ ! -e "$SUDOERS_D/vps-ssh-anna" ]
+  [ ! -e "$SSHTUNNEL_STATE" ]
+}
+
+@test "st_user_create e add-user: una /home/<nome> già presente → rifiutato, nessuna chiamata" {
+  user_stubs
+  mkdir -p "$HOME_BASE/mario"
+  run st_user_create mario
+  [ "$status" -eq 1 ]
+  ! grep -q '^useradd' "$CALLS"
+  [ -d "$HOME_BASE/mario" ]
+  cf_enabled
+  mkdir -p "$HOME_BASE/anna"
+  rc=0; st_add_user anna@y.it false || rc=$?
+  [ "$rc" -eq 1 ]
+  [[ "$ST_ERR" == *"esiste già sulla VPS"* ]]
+  ! grep -q '^useradd' "$CALLS"
+  [ -d "$HOME_BASE/anna" ]
+}
+
+@test "il rilancio in systemd-run e il lucchetto coprono tutti i comandi che modificano" {
+  t="$REPO_ROOT/tools/vps-ssh-tunnel"
+  grep -qE '^  enable \| add-user \| remove-user \| set-sudo \| set-host \| disable\)' "$t"
+  local c
+  for c in enable add-user remove-user set-sudo set-host disable; do
+    # ogni ramo del case finale prende il lucchetto prima di leggere o agire
+    awk -v c="$c" '$0 ~ "^  " c "\)" { f = 1; next } f && /^    ;;/ { exit } f && /lock_or_die/ { ok = 1 } END { exit !ok }' "$t"
+  done
+}
+
+@test "_st_rollback: l'avviso di annullamento incompleto non parla solo di Cloudflare" {
+  cf_env
+  rc=0
+  CF_FAIL="POST:*/ca DELETE:/accounts/acc1/access/apps/app1" st_enable ssh-k3f9x2 manu@x.it true || rc=$?
+  [[ "$ST_ERR" == *"controlla Cloudflare e la VPS"* ]]
 }

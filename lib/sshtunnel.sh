@@ -16,6 +16,7 @@
 : "${SSH_CF_PRINCIPALS:=/etc/ssh/vps-cf-principals}"
 : "${SUDOERS_D:=/etc/sudoers.d}"
 : "${LINGER_D:=/var/lib/systemd/linger}"
+: "${HOME_BASE:=/home}"
 : "${SSHTUNNEL_STATE:=$VPS_OPT/ssh-tunnel.json}"
 : "${SSHTUNNEL_ENV:=$VPS_OPT/secrets/cf-tunnel.env}"
 
@@ -100,6 +101,12 @@ st_user_create() {
   local rc=0
   st_user_ours "$1" || rc=$?
   ((rc == 1)) || return 1
+  # Una home già presente (di un account tolto a mano) non è nostra: useradd -m
+  # la adotterebbe con un avviso e userdel -r poi la cancellerebbe.
+  if [[ -e "${HOME_BASE:?}/$1" ]]; then
+    log "la cartella $HOME_BASE/$1 esiste già: utente $1 non creato"
+    return 1
+  fi
   if ! useradd -m -s /bin/bash -c vps-ssh-tunnel "$1"; then
     # useradd può uscire con errore dopo aver scritto l'account (es. home non
     # creabile): se ora esiste con il nostro GECOS l'abbiamo creato noi, va tolto.
@@ -126,7 +133,12 @@ st_user_delete() {
   st_valid_name "$name" || return 1
   st_user_ours "$name" || rc=$?
   case "$rc" in
-    2) return 2 ;;
+    2)
+      # L'account non è nostro e non lo tocchiamo, ma un nostro sudoers NOPASSWD
+      # rimasto darebbe sudo a chi ha quel nome: i file con il nostro prefisso vanno.
+      rm -f "${SUDOERS_D:?}/vps-ssh-$name" "$SSH_CF_PRINCIPALS/$name"
+      return 2
+      ;;
     1)
       rm -f "${SUDOERS_D:?}/vps-ssh-$name" "$SSH_CF_PRINCIPALS/$name"
       return 0
@@ -509,7 +521,7 @@ _st_rollback() {
   done
   ST_UNDO=()
   # L'utente deve sapere che su Cloudflare può essere rimasto qualcosa.
-  if ((failed)); then ST_ERR+=" (annullamento incompleto: controlla Cloudflare, dettagli nel log)"; fi
+  if ((failed)); then ST_ERR+=" (annullamento incompleto: controlla Cloudflare e la VPS, dettagli nel log)"; fi
   return 0
 }
 
@@ -702,6 +714,10 @@ _st_person() {
 # Anche un utente con il nostro GECOS ma fuori dallo stato non è "nostro" (il GECOS
 # lo può cambiare chi ci entra con chfn): si rifiuta, mai riusarlo.
 _st_name_available() {
+  if [[ -e "${HOME_BASE:?}/$1" ]]; then
+    ST_ERR="la cartella $HOME_BASE/$1 esiste già sulla VPS: l'utente $1 non può essere creato"
+    return 1
+  fi
   local rc=0
   st_user_ours "$1" || rc=$?
   if ((rc == 1)); then return 0; fi
@@ -1008,7 +1024,9 @@ st_add_user() {
     return 1
   fi
   _st_undo_push _st_sshd_reapply "${names[@]}"
-  # Per ultima: da qui Cloudflare lascia entrare l'email.
+  # Per ultima: da qui Cloudflare lascia entrare l'email. Limite noto: se Cloudflare
+  # applica il PUT ma la risposta si perde, l'annullamento toglie l'utente e l'email
+  # resta nella policy (innocua, senza account; il prossimo PUT la riallinea).
   if ! _st_put_policy "$ST_ACC_ID" "$ST_PID" "$ST_HOST" "${emails[@]}" "$email"; then
     _st_fail "aggiornamento della policy Access non riuscito"
     _st_rollback
@@ -1062,6 +1080,8 @@ st_remove_user() {
   mapfile -t keep_emails < <(jq -r --arg e "$email" '.users[] | select(.email != $e) | .email' <<<"$ST_S")
   mapfile -t keep_names < <(jq -r --arg e "$email" '.users[] | select(.email != $e) | .user' <<<"$ST_S")
 
+  # Stesso limite in senso opposto: un PUT riuscito ma senza risposta lascia l'email
+  # già tolta mentre il messaggio dice "nulla modificato"; riprovare è sicuro.
   if ! _st_put_policy "$ST_ACC_ID" "$ST_PID" "$ST_HOST" "${keep_emails[@]}"; then
     _st_fail "aggiornamento della policy Access non riuscito: nulla è stato modificato"
     return 1
