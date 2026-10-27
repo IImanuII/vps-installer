@@ -6,7 +6,7 @@ if [[ -n "${SUDO_USER:-}" ]]; then
   VPS_LIB=$VPS_OPT/lib
   VPS_TEMPLATES=$VPS_OPT/templates
   VPS_LOG=/var/log/vps-tools.log
-  unset MSMTPRC_LINK HTPASSWD_PMA ALIASES_FILE PMA_DIR NGINX_SNIPPETS CF_API CF_IPS_URL PMA_BASE_URL SITES_DIR
+  unset MSMTPRC_LINK HTPASSWD_PMA ALIASES_FILE PMA_DIR NGINX_SNIPPETS CF_API CF_IPS_URL PMA_BASE_URL SITES_DIR SSHTUNNEL_STATE
   [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
   chmod 640 "$VPS_LOG"
 fi
@@ -44,6 +44,19 @@ case "${1:-}" in
     CF_API_TOKEN="$token" cf_find_zone "$zone" >/dev/null || json_err "il token non ha accesso alla zona $zone"
     mancanti="$(CF_API_TOKEN="$token" cf_missing_zones)" || json_err "il token non è valido o Cloudflare non risponde"
     [[ -z "$mancanti" ]] || json_err "il token non vede le zone: $mancanti"
+    # Con l'accesso SSH attivo il nuovo token deve gestirne tunnel e app: se non li
+    # vede, il pannello non potrebbe più cambiarlo né disattivarlo. Un 404 (risorsa
+    # cancellata a mano) non è un permesso mancante: la disattivazione lo gestisce.
+    if [[ -f "$SSHTUNNEL_STATE" ]]; then
+      acc="$(jq -r '.account_id // empty' "$SSHTUNNEL_STATE")"
+      tid="$(jq -r '.tunnel_id // empty' "$SSHTUNNEL_STATE")"
+      aid="$(jq -r '.app_id // empty' "$SSHTUNNEL_STATE")"
+      for p in "/accounts/$acc/cfd_tunnel/$tid" "/accounts/$acc/access/apps/$aid"; do
+        if ! CF_API_TOKEN="$token" _st_req GET "$p" && ! _st_gone; then
+          json_err "l'accesso SSH è attivo: il nuovo token deve poterlo gestire, oppure disattivalo prima"
+        fi
+      done
+    fi
     cf_write_ini "$token"
     log "vps-cf-token: token di sistema sostituito"
     json_ok

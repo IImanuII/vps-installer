@@ -1,6 +1,12 @@
 # shellcheck shell=bash
 # Libreria dell'accesso SSH dal browser: validazione, stato e configurazione di sshd.
 # Richiede lib/common.sh e lib/validate.sh.
+#
+# ATTENZIONE per chi chiama st_enable / st_set_host / st_set_emails / st_disable:
+# vanno SEMPRE usate in un condizionale (`if ! st_x ...; then json_err "$ST_ERR"; fi`).
+# Fuori da un `if`, errexit o la trap ERR del chiamante interromperebbero la
+# funzione a metà, saltando l'annullamento (_st_rollback) e lasciando risorse
+# su Cloudflare o file di sshd senza stato che le descriva.
 
 # run.sh carica lib/*.sh in ordine alfabetico: qui common.sh non è ancora stato letto.
 : "${VPS_OPT:=/opt/vps}"
@@ -292,6 +298,22 @@ _st_rm_dns() {
   _st_del "/zones/$1/dns_records/$2"
 }
 
+# _st_rm_dns_orphans ZONE HOST TUNNEL — se la creazione del CNAME è fallita ma
+# Cloudflare l'aveva registrata (risposta persa), il nome punterebbe a un tunnel
+# che sta per sparire: si tolgono i record di HOST che portano a quel tunnel,
+# e solo quelli.
+_st_rm_dns_orphans() {
+  local resp id
+  resp="$(cf_list_records "$1" "$2")" || {
+    log "accesso SSH: impossibile cercare record DNS residui di $2"
+    return 0
+  }
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    _st_rm_dns "$1" "$id" || log "ATTENZIONE: accesso SSH: record DNS $id di $2 non cancellato"
+  done < <(jq -r --arg c "$3.cfargotunnel.com" '.result[]? | select(.content == $c) | .id' <<<"$resp")
+}
+
 # _st_rm_app ACC APP — prima la CA (non serve più a niente), poi l'app.
 _st_rm_app() {
   _st_del "/accounts/$1/access/apps/$2/ca" || log "accesso SSH: CA dell'app $2 non cancellata"
@@ -523,7 +545,7 @@ st_enable() {
 
   # Tunnel gestito da Cloudflare: il suo token resta solo in memoria e nel file env.
   _st_req POST "/accounts/$ST_ACC/cfd_tunnel" \
-    "$(jq -nc --arg n "vps-$(hostname -s 2>/dev/null || hostname)" '{name: $n, config_src: "cloudflare"}')" || {
+    "$(jq -nc --arg n "vps-$(hostname -s 2>/dev/null || hostname)-$label" '{name: $n, config_src: "cloudflare"}')" || {
     _st_fail "creazione del tunnel non riuscita"
     return 1
   }
@@ -567,6 +589,11 @@ st_enable() {
     return 1
   fi
   pid="$(jq -r '.result.id // empty' <<<"$ST_BODY")"
+  if [[ -z "$pid" ]]; then
+    ST_ERR="Cloudflare non ha restituito l'id della policy Access"
+    _st_rollback
+    return 1
+  fi
   _st_undo_push _st_rm_policy "$ST_ACC" "$pid"
   if ! _st_req POST "/accounts/$ST_ACC/access/apps" "$(_st_app_body "$host" "$otp" "$pid")"; then
     _st_fail "creazione dell'app Access non riuscita"
@@ -574,6 +601,11 @@ st_enable() {
     return 1
   fi
   aid="$(jq -r '.result.id // empty' <<<"$ST_BODY")"
+  if [[ -z "$aid" ]]; then
+    ST_ERR="Cloudflare non ha restituito l'id dell'app Access"
+    _st_rollback
+    return 1
+  fi
   _st_undo_push _st_rm_app "$ST_ACC" "$aid"
 
   # CA dell'app e sshd che se ne fida per l'utente dell'installazione.
@@ -595,10 +627,17 @@ st_enable() {
   # Solo ora il nome entra nel DNS.
   if ! _st_req POST "/zones/$ST_ZONE_ID/dns_records" "$(_st_cname_body "$host" "$tid")"; then
     _st_fail "creazione del record DNS di $host non riuscita"
+    _st_rm_dns_orphans "$ST_ZONE_ID" "$host" "$tid"
     _st_rollback
     return 1
   fi
   did="$(jq -r '.result.id // empty' <<<"$ST_BODY")"
+  if [[ -z "$did" ]]; then
+    ST_ERR="Cloudflare non ha restituito l'id del record DNS"
+    _st_rm_dns_orphans "$ST_ZONE_ID" "$host" "$tid"
+    _st_rollback
+    return 1
+  fi
   _st_undo_push _st_rm_dns "$ST_ZONE_ID" "$did"
 
   state="$(jq -n --arg host "$host" --arg label "$label" --arg acc "$ST_ACC" --arg zone "$ST_ZONE_ID" \
@@ -710,12 +749,23 @@ st_set_host() {
     return 1
   fi
   did="$(jq -r '.result.id // empty' <<<"$ST_BODY")"
+  if [[ -z "$did" ]]; then
+    ST_ERR="Cloudflare non ha restituito l'id del record DNS"
+    _st_rm_dns_orphans "$zid" "$new" "$tid"
+    _st_rollback
+    return 1
+  fi
   ST_UNDO=()
-  # Il vecchio record ormai porta al 404 del tunnel: se non si cancella, lo si
-  # segnala e basta.
-  _st_rm_dns "$zid" "$old_did" || log "ATTENZIONE: accesso SSH: record DNS di $old non cancellato, va tolto a mano"
-  st_state_write "$(jq --arg h "$new" --arg l "$label" --arg d "$did" \
-    '.host = $h | .label = $l | .dns_id = $d' <<<"$ST_S")" || {
+  # Il vecchio record ormai porta al 404 del tunnel: se non si cancella, il suo
+  # id resta nello stato (stale_dns_ids) e st_disable lo toglie.
+  if _st_rm_dns "$zid" "$old_did"; then
+    old_did=""
+  else
+    log "ATTENZIONE: accesso SSH: record DNS di $old non cancellato, sarà tolto alla disattivazione"
+  fi
+  st_state_write "$(jq --arg h "$new" --arg l "$label" --arg d "$did" --arg o "$old_did" \
+    '.host = $h | .label = $l | .dns_id = $d
+     | .stale_dns_ids = ((.stale_dns_ids // []) + (if $o == "" then [] else [$o] end))' <<<"$ST_S")" || {
     ST_ERR="impossibile aggiornare lo stato dell'accesso SSH"
     return 1
   }
@@ -746,6 +796,14 @@ st_disable() {
     _st_fail "cancellazione del record DNS non riuscita"
     return 1
   fi
+  # CNAME di nomi precedenti che set-host non era riuscito a cancellare.
+  while IFS= read -r did; do
+    [[ -n "$did" ]] || continue
+    if ! _st_rm_dns "$zid" "$did"; then
+      _st_fail "cancellazione di un record DNS precedente non riuscita"
+      return 1
+    fi
+  done < <(jq -r '.stale_dns_ids[]?' <<<"$ST_S")
   if [[ -n "$aid" ]] && ! _st_rm_app "$acc" "$aid"; then
     _st_fail "cancellazione dell'app Access non riuscita"
     return 1
@@ -772,7 +830,7 @@ st_disable() {
 # {ok:false, error} e 1. drift elenca i pezzi registrati ma spariti.
 st_status_json() {
   local missing rc=0 zt=false otp=false enabled=false service=missing cver="" tstatus=""
-  local host="" emails="[]" user zid did aid tid
+  local host="" emails="[]" user zid did aid tid pid app_gone=0
   local -a drift=()
   if [[ "$(_st_manifest .cloudflare.enabled)" != true ]]; then
     printf '{"ok":true,"cloudflare":false}\n'
@@ -809,9 +867,13 @@ st_status_json() {
     did="$(jq -r '.dns_id // empty' <<<"$ST_S")"
     aid="$(jq -r '.app_id // empty' <<<"$ST_S")"
     tid="$(jq -r '.tunnel_id // empty' <<<"$ST_S")"
+    pid="$(jq -r '.policy_id // empty' <<<"$ST_S")"
     # Solo un 404 vuol dire "sparito": un errore di permesso non dice nulla.
     if ! _st_req GET "/zones/$zid/dns_records/$did" && _st_gone; then drift+=(dns); fi
-    if ! _st_req GET "/accounts/$ST_ACC/access/apps/$aid" && _st_gone; then drift+=(app); fi
+    # App o policy sparite: per la Plancia è lo stesso guasto ("app").
+    if ! _st_req GET "/accounts/$ST_ACC/access/apps/$aid" && _st_gone; then app_gone=1; fi
+    if ! _st_req GET "/accounts/$ST_ACC/access/policies/$pid" && _st_gone; then app_gone=1; fi
+    if ((app_gone)); then drift+=(app); fi
     if _st_req GET "/accounts/$ST_ACC/cfd_tunnel/$tid"; then
       if jq -e '.result.deleted_at // empty' >/dev/null 2>&1 <<<"$ST_BODY"; then
         drift+=(tunnel)

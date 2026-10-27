@@ -30,7 +30,7 @@ if [[ -n "${SUDO_USER:-}" || -n "${VPS_SITE_VIA_SYSTEMD:-}" ]]; then
   unset "${!RCLONE_@}" BK_CONFIG CF_API SITES_DIR SITES_WWW SITES_BACKUPS SITES_LOCK SITES_LOCK_WAIT SITES_RUN NGINX_CONF_D \
     PHP_POOL_D LOGROTATE_D VPS_SITE_SELF VPS_NO_CHOWN SITE_ERROR_FILE \
     WP_BIN REDIS_ACL_FILE REDIS_ADMIN_SECRET CRON_D BK_LOCK_DIR BK_BACKUPS BK_DIR BK_STATE BK_RCLONE \
-    BK_RCLONE_CONF VPS_BACKUP_SELF FM_RUNUSER
+    BK_RCLONE_CONF VPS_BACKUP_SELF FM_RUNUSER SSHTUNNEL_STATE
   [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
   chmod 640 "$VPS_LOG"
 fi
@@ -228,6 +228,11 @@ case "$cmd" in
         *) usage ;;
       esac
     done
+    # Il nome dell'accesso SSH dal browser ha un record DNS e un'app Access sua:
+    # un sito con lo stesso nome lo scavalcherebbe. Prima di ogni altro lavoro.
+    if [[ -n "$d" && "$d" == "$(st_state_get host)" ]]; then
+      json_err "nome usato dall'accesso SSH"
+    fi
     if [[ -n "$fb" ]]; then
       # ricreato da una copia: tipo, www e database vengono dal manifest, WordPress non
       # si installa (i file e il database arrivano dal ripristino)

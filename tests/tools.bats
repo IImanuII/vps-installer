@@ -190,7 +190,7 @@ smtp_set() {
   run grep -q 'ALL$' "$f"
   [ "$status" -ne 0 ]
   grep -qxF 'Defaults:panel env_reset' "$f"
-  grep -qxF 'panel ALL=(root) NOPASSWD: /opt/vps/bin/vps-status, /opt/vps/bin/vps-cf-token, /opt/vps/bin/vps-cf-purge, /opt/vps/bin/vps-cf-ips-update, /opt/vps/bin/vps-smtp, /opt/vps/bin/vps-pma-pass, /opt/vps/bin/vps-pma-update, /opt/vps/bin/vps-site, /opt/vps/bin/vps-monitor, /opt/vps/bin/vps-files, /opt/vps/bin/vps-backup, /opt/vps/bin/vps-f2b' "$f"
+  grep -qxF 'panel ALL=(root) NOPASSWD: /opt/vps/bin/vps-status, /opt/vps/bin/vps-cf-token, /opt/vps/bin/vps-cf-purge, /opt/vps/bin/vps-cf-ips-update, /opt/vps/bin/vps-smtp, /opt/vps/bin/vps-pma-pass, /opt/vps/bin/vps-pma-update, /opt/vps/bin/vps-site, /opt/vps/bin/vps-monitor, /opt/vps/bin/vps-files, /opt/vps/bin/vps-backup, /opt/vps/bin/vps-f2b, /opt/vps/bin/vps-ssh-tunnel' "$f"
   if command -v visudo >/dev/null 2>&1; then
     visudo -cf "$f"
   fi
@@ -361,4 +361,60 @@ _cf_sito() {
   run bash "$T/vps-cf-token" test
   [ "$status" -eq 1 ]
   [ "$(jq -r .error <<<"$output")" = "il token non vede le zone: terzo.it" ]
+}
+
+# curl finto per vps-cf-token con l'accesso SSH attivo: il token SSHT_DENY_TOKEN non
+# vede la risorsa che finisce con $SSHT_DENY (403); il token si legge dal file -H @…
+_cf_curl_ssh() {
+  printf '%s\n' miosito.it >"$BATS_TEST_TMPDIR/zones"
+  make_stub curl '
+args=("$@"); last="${args[${#args[@]}-1]}"; hdr=""; w=0
+for ((i = 0; i < ${#args[@]}; i++)); do
+  [[ "${args[i]}" == -H && "${args[i+1]}" == @* ]] && hdr="${args[i+1]#@}"
+  [[ "${args[i]}" == -w ]] && w=1
+done
+echo "$last" >>"$BATS_TEST_TMPDIR/curl.urls"
+code=200
+case "$last" in
+  *"/zones?status=active&per_page=50&page=1") body="{\"success\":true,\"result\":[{\"name\":\"miosito.it\"}],\"result_info\":{\"total_pages\":1}}" ;;
+  *"/zones?name="*) body="{\"success\":true,\"result\":[{\"id\":\"z1\"}]}" ;;
+  *"/accounts/acc1/cfd_tunnel/tun1" | *"/accounts/acc1/access/apps/app1")
+    body="{\"success\":true,\"result\":{\"id\":\"x\"}}"
+    if grep -q "$SSHT_DENY_TOKEN" "$hdr" && [[ "$last" == *"${SSHT_DENY:-nulla}" ]]; then
+      code=403; body="{\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}]}"
+    fi ;;
+  *) body="{\"success\":false}" ;;
+esac
+printf "%s" "$body"
+((w)) && printf "\n%s" "$code"
+exit 0'
+}
+
+@test "vps-cf-token set con l'accesso SSH attivo: token che non vede il tunnel o l'app → rifiutato" {
+  _cf_ini; _cf_curl_ssh
+  export SSHTUNNEL_STATE="$VPS_OPT/ssh-tunnel.json"
+  echo '{"host":"ssh-a.miosito.it","account_id":"acc1","tunnel_id":"tun1","app_id":"app1"}' >"$SSHTUNNEL_STATE"
+  tok="$(printf 'n%.0s' {1..40})"
+  export SSHT_DENY_TOKEN="$tok"
+  for d in cfd_tunnel/tun1 access/apps/app1; do
+    SSHT_DENY="$d" run bash -c "printf '%s' '$tok' | bash '$T/vps-cf-token' set"
+    [ "$status" -eq 1 ]
+    [ "$(jq -r .error <<<"$output")" = "l'accesso SSH è attivo: il nuovo token deve poterlo gestire, oppure disattivalo prima" ]
+    grep -qxF "dns_cloudflare_api_token = $CF_TOK" "$VPS_OPT/secrets/cloudflare.ini"
+    [[ "$output" != *"$tok"* ]]
+  done
+  # un token che li vede viene accettato
+  SSHT_DENY=nulla run bash -c "printf '%s' '$tok' | bash '$T/vps-cf-token' set"
+  [ "$status" -eq 0 ]
+  grep -qxF "dns_cloudflare_api_token = $tok" "$VPS_OPT/secrets/cloudflare.ini"
+}
+
+@test "vps-cf-token set senza stato dell'accesso SSH: nessuna verifica del tunnel" {
+  _cf_ini; _cf_curl_ssh
+  export SSHTUNNEL_STATE="$VPS_OPT/non-esiste.json"
+  tok="$(printf 'n%.0s' {1..40})"
+  export SSHT_DENY_TOKEN="$tok" SSHT_DENY=cfd_tunnel/tun1
+  run bash -c "printf '%s' '$tok' | bash '$T/vps-cf-token' set"
+  [ "$status" -eq 0 ]
+  ! grep -q cfd_tunnel "$BATS_TEST_TMPDIR/curl.urls"
 }

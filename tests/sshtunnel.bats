@@ -148,6 +148,8 @@ setup() {
 #   CF_DENY="GET:…"             → 403 di autorizzazione (permesso mancante)
 #   CF_OTP=1                    → One-time PIN già presente
 #   CF_DNS_EXISTS=1             → la zona ha già un record con quel nome
+#   CF_NOID="POST:…"            → successo ma senza id nel risultato
+#   CF_DNS_ORPHAN=1             → dopo un POST sui DNS, l'elenco mostra il CNAME del tunnel
 cf_env() {
   export CFLOG="$BATS_TEST_TMPDIR/cflog"
   export SYSTEMD_DIR="$BATS_TEST_TMPDIR/systemd"
@@ -192,7 +194,8 @@ if [[ $code == 200 ]]; then
     GET:/zones) body="{\"success\":true,\"result\":[{\"id\":\"zone123\"}]}" ;;
     GET:/zones/zone123) body="{\"success\":true,\"result\":{\"id\":\"zone123\",\"account\":{\"id\":\"acc1\"}}}" ;;
     GET:/zones/zone123/dns_records)
-      if [[ -n "${CF_DNS_EXISTS:-}" ]]; then body="{\"success\":true,\"result\":[{\"id\":\"x\",\"type\":\"A\"}]}"
+      if [[ -n "${CF_DNS_ORPHAN:-}" ]] && grep -q "^POST /zones/zone123/dns_records" "$CFLOG"; then body="{\"success\":true,\"result\":[{\"id\":\"orphan9\",\"type\":\"CNAME\",\"content\":\"tun1.cfargotunnel.com\"},{\"id\":\"altrui\",\"type\":\"CNAME\",\"content\":\"altro.cfargotunnel.com\"}]}"
+      elif [[ -n "${CF_DNS_EXISTS:-}" ]]; then body="{\"success\":true,\"result\":[{\"id\":\"x\",\"type\":\"A\"}]}"
       else body="{\"success\":true,\"result\":[]}"; fi ;;
     POST:/zones/zone123/dns_records)
       if [[ "$data" == *ssh-nuovo1* ]]; then body="{\"success\":true,\"result\":{\"id\":\"dns2\"}}"
@@ -209,6 +212,9 @@ if [[ $code == 200 ]]; then
     POST:/accounts/acc1/access/apps/app1/ca) body="{\"success\":true,\"result\":{\"id\":\"ca1\",\"public_key\":\"ecdsa-sha2-nistp256 AAAACAKEY open-ssh-ca@cloudflareaccess.org\"}}" ;;
   esac
 fi
+for pat in ${CF_NOID:-}; do
+  if [[ "$key" == $pat ]]; then body="{\"success\":true,\"result\":{}}"; fi
+done
 printf "%s" "$body"
 if ((wcode)); then printf "\n%s" "$code"; fi
 exit 0'
@@ -308,9 +314,9 @@ in_order() {
   [ -n "$ST_ERR" ]
   [[ "$ST_ERR" != *TOKEN* ]]
   ! grep -q "POST /zones/zone123/dns_records" "$CFLOG"
-  grep -q "DELETE /accounts/acc1/access/apps/app1" "$CFLOG"
-  grep -q "DELETE /accounts/acc1/access/policies/pol1" "$CFLOG"
-  grep -q "DELETE /accounts/acc1/cfd_tunnel/tun1" "$CFLOG"
+  grep -qx "DELETE /accounts/acc1/access/apps/app1" "$CFLOG"
+  grep -qx "DELETE /accounts/acc1/access/policies/pol1" "$CFLOG"
+  grep -qx "DELETE /accounts/acc1/cfd_tunnel/tun1" "$CFLOG"
   grep -q "systemctl disable --now vps-cloudflared" "$CALLS"
   [ ! -e "$SYSTEMD_DIR/vps-cloudflared.service" ]
   [ ! -e "$SSHTUNNEL_ENV" ]
@@ -534,4 +540,236 @@ in_order() {
   run --separate-stderr st_status_json
   [ "$status" -eq 1 ]
   jq -e '.ok == false and (.error | length > 0)' <<<"$output"
+}
+
+# ---------------------------------------------------------------------------
+# Correzioni della revisione del Task 4
+
+@test "st_enable: nome del tunnel unico per VPS e etichetta" {
+  cf_env
+  CF_OTP=1 st_enable ssh-k3f9x2 manu@x.it
+  grep -- '--data' "$CALLS" | grep -q "\"name\":\"vps-$(hostname -s)-ssh-k3f9x2\""
+}
+
+@test "st_enable: id mancante in una risposta di successo → errore e annullamento" {
+  local what
+  for what in "POST:/accounts/acc1/access/policies" "POST:/accounts/acc1/access/apps" "POST:/zones/zone123/dns_records"; do
+    cf_env
+    rm -f "$SSHTUNNEL_STATE"
+    rc=0
+    CF_OTP=1 CF_NOID="$what" st_enable ssh-k3f9x2 manu@x.it || rc=$?
+    [ "$rc" -eq 1 ]
+    [ -n "$ST_ERR" ]
+    [ ! -e "$SSHTUNNEL_STATE" ]
+    grep -qx "DELETE /accounts/acc1/cfd_tunnel/tun1" "$CFLOG"
+    [ ! -e "$SSHD_CONFIG_D/20-vps-cfaccess.conf" ]
+  done
+}
+
+@test "st_enable: DNS fallito → cancella il CNAME del tunnel rimasto, non gli altri" {
+  cf_env
+  CF_OTP=1 CF_DNS_ORPHAN=1 CF_FAIL="POST:/zones/zone123/dns_records" run st_enable ssh-k3f9x2 manu@x.it
+  [ "$status" -eq 1 ]
+  grep -qx "DELETE /zones/zone123/dns_records/orphan9" "$CFLOG"
+  ! grep -q "DELETE /zones/zone123/dns_records/altrui" "$CFLOG"
+  in_order "$CFLOG" "DELETE /zones/zone123/dns_records/orphan9" "DELETE /accounts/acc1/access/apps/app1"
+}
+
+@test "st_set_host: vecchio CNAME non cancellato → resta in stale_dns_ids e disable lo toglie" {
+  cf_enabled
+  CF_FAIL="DELETE:/zones/zone123/dns_records/dns1" run st_set_host ssh-nuovo1
+  [ "$status" -eq 0 ]
+  [ "$(jq -c .stale_dns_ids "$SSHTUNNEL_STATE")" = '["dns1"]' ]
+  [ "$(jq -r .dns_id "$SSHTUNNEL_STATE")" = dns2 ]
+  : >"$CFLOG"
+  run st_disable
+  [ "$status" -eq 0 ]
+  grep -qx "DELETE /zones/zone123/dns_records/dns1" "$CFLOG"
+  grep -qx "DELETE /zones/zone123/dns_records/dns2" "$CFLOG"
+  [ ! -e "$SSHTUNNEL_STATE" ]
+}
+
+@test "st_disable: id vecchio già assente (404) non blocca" {
+  cf_enabled
+  CF_FAIL="DELETE:/zones/zone123/dns_records/dns1" st_set_host ssh-nuovo1
+  CF_404="DELETE:/zones/zone123/dns_records/dns1" run st_disable
+  [ "$status" -eq 0 ]
+  [ ! -e "$SSHTUNNEL_STATE" ]
+}
+
+@test "st_status_json: policy mancante (404) → drift app, senza duplicati" {
+  cf_enabled
+  CF_404="GET:/accounts/acc1/access/policies/pol1" run --separate-stderr st_status_json
+  jq -e '.drift == ["app"]' <<<"$output"
+  CF_404="GET:/accounts/acc1/access/policies/pol1 GET:/accounts/acc1/access/apps/app1" run --separate-stderr st_status_json
+  jq -e '.drift == ["app"]' <<<"$output"
+  CF_DENY="GET:/accounts/acc1/access/policies/pol1" run --separate-stderr st_status_json
+  jq -e '.drift == []' <<<"$output"
+}
+
+# ---------------------------------------------------------------------------
+# Strumento vps-ssh-tunnel (contratto con la Plancia)
+
+# st: lo strumento, solo stdout (i log vanno su stderr).
+st() {
+  run --separate-stderr bash "$REPO_ROOT/tools/vps-ssh-tunnel" "$@"
+}
+
+# st_in JSON ARGOMENTI... — come st, con il JSON su stdin.
+st_in() {
+  local json="$1"
+  shift
+  run --separate-stderr bash -c 'printf "%s" "$1" | bash "$2" "${@:3}"' _ "$json" "$REPO_ROOT/tools/vps-ssh-tunnel" "$@"
+}
+
+cli_env() {
+  cf_env
+  export VPS_LIB="$REPO_ROOT/lib" SSHTUNNEL_LOCK="$BATS_TEST_TMPDIR/ssht.lock"
+}
+
+@test "vps-ssh-tunnel: argomenti sconosciuti o mancanti → uso:" {
+  cli_env
+  st boh
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == uso:* ]]
+  st
+  [[ "$(jq -r .error <<<"$output")" == uso:* ]]
+  st check-host
+  [[ "$(jq -r .error <<<"$output")" == uso:* ]]
+  st status extra
+  [[ "$(jq -r .error <<<"$output")" == uso:* ]]
+  st disable extra
+  [[ "$(jq -r .error <<<"$output")" == uso:* ]]
+  [ ! -s "$CFLOG" ]
+}
+
+@test "vps-ssh-tunnel status: Cloudflare spento → {ok:true,cloudflare:false}" {
+  cli_env
+  jq -n '{admin_user:"manu", cloudflare:{enabled:false}}' >"$VPS_OPT/manifest.json"
+  st status
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"ok":true,"cloudflare":false}' ]
+}
+
+@test "vps-ssh-tunnel status: attivo, app sparita su Cloudflare → drift app" {
+  cli_env
+  cf_enabled
+  CF_404="GET:/accounts/acc1/access/apps/app1" st status
+  [ "$status" -eq 0 ]
+  jq -e '.ok and .enabled and .host == "ssh-k3f9x2.example.it" and (.drift | index("app"))' <<<"$output"
+  [[ "$output" != *TOKEN* ]]
+}
+
+@test "vps-ssh-tunnel status: Cloudflare che non risponde → ok:false" {
+  cli_env
+  make_stub curl 'exit 7'
+  st status
+  [ "$status" -eq 1 ]
+  jq -e '.ok == false and (.error | length > 0)' <<<"$output"
+}
+
+@test "vps-ssh-tunnel random" {
+  cli_env
+  st random
+  [ "$status" -eq 0 ]
+  jq -e '.ok and (.label | test("^ssh-[a-z0-9]{6}$"))' <<<"$output"
+}
+
+@test "vps-ssh-tunnel check-host: libero, sito registrato, record DNS, nome non valido" {
+  cli_env
+  st check-host ssh-abc123
+  [ "$status" -eq 0 ]
+  jq -e '.ok and .host == "ssh-abc123.example.it" and .free == true and .reason == null' <<<"$output"
+  echo '{"domain":"ssh-abc123.example.it","www":false}' >"$SITES_DIR/ssh-abc123.example.it.json"
+  st check-host ssh-abc123
+  jq -e '.free == false and .reason == "usato da un sito"' <<<"$output"
+  rm -f "${SITES_DIR:?}/ssh-abc123.example.it.json"
+  CF_DNS_EXISTS=1 st check-host ssh-abc123
+  jq -e '.free == false and .reason == "esiste già un record DNS"' <<<"$output"
+  st check-host "Bad_Label"
+  [ "$status" -eq 0 ]
+  jq -e '.ok and .free == false and .reason == "nome non valido"' <<<"$output"
+}
+
+@test "vps-ssh-tunnel enable: email non valide → errore e nessuna chiamata a curl" {
+  cli_env
+  st_in '{"label":"ssh-k3f9x2","emails":"non-una-email"}' enable
+  [ "$status" -eq 1 ]
+  jq -e '.ok == false and (.error | length > 0)' <<<"$output"
+  [ ! -s "$CFLOG" ]
+  ! grep -q '^curl' "$CALLS"
+}
+
+@test "vps-ssh-tunnel enable: JSON non valido → errore" {
+  cli_env
+  st_in 'non json' enable
+  [ "$status" -eq 1 ]
+  jq -e '.ok == false' <<<"$output"
+  [ ! -s "$CFLOG" ]
+}
+
+@test "vps-ssh-tunnel: lock occupato → un'altra operazione in corso" {
+  cli_env
+  exec 8>"$SSHTUNNEL_LOCK"
+  flock -n 8
+  st_in '{"label":"ssh-k3f9x2","emails":"manu@x.it"}' enable
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"in corso"* ]]
+  st disable
+  [[ "$(jq -r .error <<<"$output")" == *"in corso"* ]]
+  [ ! -s "$CFLOG" ]
+  # status non prende il lock: si può sempre leggere.
+  st status
+  [ "$status" -eq 0 ]
+  exec 8>&-
+}
+
+@test "vps-ssh-tunnel: enable, set-emails, set-host, disable; nessun segreto in output" {
+  cli_env
+  export CF_OTP=1
+  st_in '{"label":"ssh-k3f9x2","emails":"Manu@x.it, altro@y.it"}' enable
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"ok":true,"host":"ssh-k3f9x2.example.it"}' ]
+  [[ "$stderr" != *TUNNELTOKEN* && "$stderr" != *SYSTOKEN* ]]
+  [ -f "$SSHTUNNEL_STATE" ]
+
+  st_in '{"emails":"nuovo@z.it"}' set-emails
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"ok":true,"emails":["nuovo@z.it"]}' ]
+
+  st set-host ssh-nuovo1
+  [ "$status" -eq 0 ]
+  jq -e '.ok and .from == "ssh-k3f9x2.example.it" and .host == "ssh-nuovo1.example.it"' <<<"$output"
+
+  st disable
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"ok":true}' ]
+  [ ! -e "$SSHTUNNEL_STATE" ]
+  for f in "$VPS_LOG" "$CALLS"; do
+    ! grep -q TUNNELTOKEN "$f"
+    ! grep -q SYSTOKEN "$f"
+  done
+}
+
+@test "vps-ssh-tunnel: un errore di enable arriva come json_err senza segreti" {
+  cli_env
+  CF_OTP=1 CF_FAIL="POST:*/ca" st_in '{"label":"ssh-k3f9x2","emails":"manu@x.it"}' enable
+  [ "$status" -eq 1 ]
+  jq -e '.ok == false and (.error | length > 0)' <<<"$output"
+  [[ "$output" != *TOKEN* ]]
+  [ ! -e "$SSHTUNNEL_STATE" ]
+  grep -qx "DELETE /accounts/acc1/cfd_tunnel/tun1" "$CFLOG"
+}
+
+@test "vps-ssh-tunnel sotto sudo azzera i percorsi dell'ambiente" {
+  t="$REPO_ROOT/tools/vps-ssh-tunnel"
+  grep -q 'SSHD_CONFIG_D SSH_CF_CA SSH_CF_PRINCIPALS SSHTUNNEL_STATE SSHTUNNEL_ENV SSHTUNNEL_LOCK' "$t"
+  for v in SYSTEMD_DIR APT_SOURCES_D CLOUDFLARED_KEYRING CF_API_TOKEN SITES_DIR CF_API; do
+    grep -q "$v" "$t"
+  done
+}
+
+@test "sudoers consente vps-ssh-tunnel; jail sshd non banna localhost" {
+  grep -qF '/opt/vps/bin/vps-ssh-tunnel' "$REPO_ROOT/templates/sudoers-vps-panel"
+  grep -qE '^ignoreip = 127\.0\.0\.1/8 ::1( |$)' "$REPO_ROOT/templates/jail-sshd.local.tmpl"
 }

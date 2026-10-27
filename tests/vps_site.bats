@@ -773,3 +773,18 @@ wp_opts=(--title "Il blog" --admin-user gestore --admin-email io@miosito.it --lo
   [ "$(tail -n1 "$BATS_TEST_TMPDIR/nginx.lock")" = preso ]
   [ "$(sort -u "$BATS_TEST_TMPDIR/nginx.lock")" = preso ]
 }
+
+@test "create: il nome dell'accesso SSH è riservato, anche con --from-backup" {
+  export SSHTUNNEL_STATE="$VPS_OPT/ssh-tunnel.json"
+  echo '{"host":"ssh-abc123.miosito.it"}' >"$SSHTUNNEL_STATE"
+  vs create ssh-abc123.miosito.it --type static
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == "nome usato dall'accesso SSH" ]]
+  vs create ssh-abc123.miosito.it --from-backup /nonesiste.tar
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == "nome usato dall'accesso SSH" ]]
+  [ ! -e "$SITES_DIR/ssh-abc123.miosito.it.json" ]
+  # un altro nome passa il controllo
+  vs create blog.miosito.it --type static
+  [ "$status" -eq 0 ]
+}

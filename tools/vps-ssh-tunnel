@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# vps-ssh-tunnel — accesso SSH dal browser (Cloudflare Tunnel + Access):
+#   status | random | check-host LABEL | enable | set-emails | set-host LABEL | disable
+# enable e set-emails leggono un JSON da stdin. Contratto in docs/PANEL-HANDOFF.md.
+usage="uso: vps-ssh-tunnel status|random|check-host LABEL|enable|set-emails|set-host LABEL|disable (JSON da stdin per enable e set-emails)"
+
+# I comandi che cambiano la macchina scrivono in /etc (sshd, unità systemd, apt):
+# PHP-FPM gira con ProtectSystem=full, dove /etc è in sola lettura, e sudo ne
+# eredita lo spazio dei mount. Ci si rilancia allora in un'unità systemd nuova
+# (come vps-site): stdin, stdout e codice d'uscita passano intatti. Il percorso
+# è assoluto e fisso, mai preso dall'ambiente.
+case "${1:-}" in
+  enable | set-emails | set-host | disable)
+    if [[ -n "${SUDO_USER:-}" && -z "${VPS_SSHT_VIA_SYSTEMD:-}" ]]; then
+      exec systemd-run --wait --pipe --collect --quiet --service-type=exec \
+        --setenv=VPS_SSHT_VIA_SYSTEMD=1 /opt/vps/bin/vps-ssh-tunnel "$@"
+    fi
+    ;;
+esac
+# Sotto sudo l'ambiente del chiamante non deve influenzare lo script.
+if [[ -n "${SUDO_USER:-}" || -n "${VPS_SSHT_VIA_SYSTEMD:-}" ]]; then
+  VPS_OPT=/opt/vps
+  VPS_LIB=$VPS_OPT/lib
+  VPS_TEMPLATES=$VPS_OPT/templates
+  VPS_LOG=/var/log/vps-tools.log
+  unset SSHD_CONFIG_D SSH_CF_CA SSH_CF_PRINCIPALS SSHTUNNEL_STATE SSHTUNNEL_ENV SSHTUNNEL_LOCK \
+    SYSTEMD_DIR APT_SOURCES_D CLOUDFLARED_KEYRING CF_API_TOKEN CF_API SITES_DIR \
+    MSMTPRC_LINK HTPASSWD_PMA ALIASES_FILE PMA_DIR NGINX_SNIPPETS CF_IPS_URL PMA_BASE_URL
+  [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
+  chmod 640 "$VPS_LOG"
+fi
+export LC_ALL=C
+: "${VPS_OPT:=/opt/vps}" "${VPS_LOG:=/var/log/vps-tools.log}"
+: "${VPS_TEMPLATES:=$VPS_OPT/templates}"
+for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
+  # shellcheck source=/dev/null
+  source "$_lib"
+done
+tool_init
+: "${SSHTUNNEL_LOCK:=/run/vps-ssh-tunnel.lock}"
+
+# Le funzioni st_* che cambiano qualcosa si chiamano SOLO dentro un `if`: fuori,
+# errexit e la trap ERR interromperebbero l'annullamento a metà. Il loro stdout
+# (se mai ne avessero) va su stderr: su stdout c'è solo il nostro JSON.
+
+# lock_or_die — due operazioni insieme (due clic, due schede) non devono incrociarsi.
+lock_or_die() {
+  exec 9>"$SSHTUNNEL_LOCK"
+  flock -n 9 || json_err "un'altra operazione sull'accesso SSH è in corso"
+}
+
+# stdin_field CAMPO — campo del JSON letto da stdin (già in $dati); stringa o elenco.
+stdin_field() {
+  jq -r --arg k "$1" '.[$k] // "" | if type == "array" then join(",") else tostring end' <<<"$dati"
+}
+
+# read_json — il JSON da stdin in $dati (oggetto, al massimo 4 KB).
+read_json() {
+  dati="$(read_stdin_limited 4097)"
+  ((${#dati} <= 4096)) || json_err "dati troppo lunghi"
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$dati" || json_err "dati non validi: serve un oggetto JSON"
+}
+
+case "${1:-}" in
+  status)
+    [[ $# -eq 1 ]] || json_err "$usage"
+    # st_status_json stampa già il proprio JSON (anche ok:false) e ritorna 1 se Cloudflare non risponde.
+    if st_status_json; then exit 0; else exit 1; fi
+    ;;
+  random)
+    [[ $# -eq 1 ]] || json_err "$usage"
+    json_ok --arg l "$(st_random_label)" '{ok: true, label: $l}'
+    ;;
+  check-host)
+    [[ $# -eq 2 ]] || json_err "$usage"
+    label="$2"
+    if ! st_valid_label "$label"; then
+      json_ok '{ok: true, host: null, free: false, reason: "nome non valido"}'
+      exit 0
+    fi
+    zone="$(jq -r '.cloudflare.zone // empty' "$(manifest_path)")"
+    [[ -n "$zone" ]] || json_err "Cloudflare non è attivo su questa VPS"
+    host="$label.$zone"
+    rc=0
+    st_host_free "$host" >&2 || rc=$?
+    if ((rc == 2)); then json_err "${ST_ERR:-Cloudflare non risponde}"; fi
+    if ((rc == 0)); then
+      json_ok --arg h "$host" '{ok: true, host: $h, free: true, reason: null}'
+    else
+      json_ok --arg h "$host" --arg r "$ST_REASON" '{ok: true, host: $h, free: false, reason: $r}'
+    fi
+    ;;
+  enable)
+    [[ $# -eq 1 ]] || json_err "$usage"
+    lock_or_die
+    read_json
+    label="$(stdin_field label)"
+    [[ -n "$label" ]] || label="$(st_random_label)"
+    emails="$(stdin_field emails)"
+    if ! st_enable "$label" "$emails" >&2; then json_err "$ST_ERR"; fi
+    json_ok --arg h "$(st_state_get host)" '{ok: true, host: $h}'
+    ;;
+  set-emails)
+    [[ $# -eq 1 ]] || json_err "$usage"
+    lock_or_die
+    read_json
+    emails="$(stdin_field emails)"
+    if ! st_set_emails "$emails" >&2; then json_err "$ST_ERR"; fi
+    json_ok --argjson e "$(jq -c '.emails // []' "$SSHTUNNEL_STATE")" '{ok: true, emails: $e}'
+    ;;
+  set-host)
+    [[ $# -eq 2 ]] || json_err "$usage"
+    lock_or_die
+    from="$(st_state_get host)"
+    if ! st_set_host "$2" >&2; then json_err "$ST_ERR"; fi
+    json_ok --arg f "$from" --arg h "$(st_state_get host)" '{ok: true, from: $f, host: $h}'
+    ;;
+  disable)
+    [[ $# -eq 1 ]] || json_err "$usage"
+    lock_or_die
+    if ! st_disable >&2; then json_err "$ST_ERR"; fi
+    json_ok
+    ;;
+  *)
+    json_err "$usage"
+    ;;
+esac
