@@ -210,11 +210,14 @@ cf_api_error() {
 # Errore di autenticazione/permesso: codici Cloudflare 10000 (Authentication
 # error), 9109/9106/9107 (Access non autorizzato), 1001 ("Not authorized" sulle
 # API del tunnel) e 1010 (403 senza messaggio sulle API Access) o messaggio
-# equivalente.
+# equivalente. 1001 e 1010 sono codici generici (1010 è anche il blocco WAF):
+# qui vanno bene perché la usano solo _cf_probe e cf_zerotrust_enabled, dopo
+# aver già escluso i 404; se la si riusa altrove, rivalutarli.
 _cf_is_auth_error() {
   jq -e '.success == false and any(.errors[]?;
       ([.code] | inside([10000, 9109, 9106, 9107, 10001, 1001, 1010]))
-      or ((.message // "") | test("authenticat|permission|not authorized|unauthorized|forbidden"; "i")))'     >/dev/null 2>&1 <<<"$1"
+      or ((.message // "") | test("authenticat|permission|not authorized|unauthorized|forbidden"; "i")))' \
+    >/dev/null 2>&1 <<<"$1"
 }
 
 # _cf_probe PERCORSO → 0 permesso presente, 1 permesso mancante, 2 Cloudflare
@@ -222,14 +225,24 @@ _cf_is_auth_error() {
 # permesso la risposta è un 404 "non trovato", senza è un 401/403. Gli elenchi
 # (?per_page=1) non vanno bene: con un token senza permessi rispondono 200 con
 # lista vuota e il controllo risultava sempre positivo (trovato nel collaudo).
+# Un 404 vale sempre "permesso presente", qualunque sia il messaggio (il testo
+# varia da risorsa a risorsa); 429 e 5xx non dicono nulla sul token.
 _cf_probe() {
   local resp code body
   resp="$(cf_api_code GET "$1")" || return 2
-  code="${resp##*$'
-'}"
-  body="${resp%$'
-'*}"
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
   if [[ "$code" == 401 || "$code" == 403 ]]; then return 1; fi
+  if [[ "$code" == 404 ]]; then
+    jq -e . >/dev/null 2>&1 <<<"$body" || return 2
+    return 0
+  fi
+  if [[ ! "$code" =~ ^2[0-9][0-9]$ ]]; then
+    # Altri codici: un errore di autorizzazione nel corpo resta "mancante",
+    # il resto (429, 5xx, ...) è Cloudflare che non risponde.
+    if jq -e . >/dev/null 2>&1 <<<"$body" && _cf_is_auth_error "$body"; then return 1; fi
+    return 2
+  fi
   jq -e . >/dev/null 2>&1 <<<"$body" || return 2
   if _cf_is_auth_error "$body"; then return 1; fi
   return 0
@@ -242,14 +255,15 @@ _cf_probe() {
 # attivato) non dipendono dal token e li gestisce cf_zerotrust_enabled.
 cf_check_ssh_perms() {
   local acc="$1" missing=0 probe name rc zero=00000000-0000-0000-0000-000000000000
-  for probe in "tunnel:/accounts/$acc/cfd_tunnel/$zero"     "access:/accounts/$acc/access/policies/$zero"     "idp:/accounts/$acc/access/identity_providers/$zero"; do
+  for probe in "tunnel:/accounts/$acc/cfd_tunnel/$zero" \
+    "access:/accounts/$acc/access/policies/$zero" \
+    "idp:/accounts/$acc/access/identity_providers/$zero"; do
     name="${probe%%:*}"
     rc=0
     _cf_probe "${probe#*:}" || rc=$?
     if ((rc == 2)); then return 2; fi
     if ((rc == 1)); then
-      printf '%s
-' "$name"
+      printf '%s\n' "$name"
       missing=1
     fi
   done
@@ -262,10 +276,8 @@ cf_check_ssh_perms() {
 cf_zerotrust_enabled() {
   local resp code body
   resp="$(cf_api_code GET "/accounts/$1/access/organizations")" || return 1
-  code="${resp##*$'
-'}"
-  body="${resp%$'
-'*}"
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
   if [[ "$code" == 401 || "$code" == 403 ]] || _cf_is_auth_error "$body"; then return 2; fi
   jq -e '.success == true' >/dev/null 2>&1 <<<"$body"
 }

@@ -611,7 +611,7 @@ in_order() {
   [ ! -e "$SSHTUNNEL_STATE" ]
 }
 
-@test "st_status_json: organizzazione non leggibile → zerotrust false e idp mancante, senza duplicati" {
+@test "st_status_json: organizzazione non leggibile → zerotrust false e idp mancante" {
   cf_enabled
   CF_DENY="GET:/accounts/acc1/access/organizations" run --separate-stderr st_status_json
   jq -e '.zerotrust == false and .perms == {tunnel:true, access:true, idp:false}' <<<"$output"

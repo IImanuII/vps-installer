@@ -914,8 +914,7 @@ st_status_json() {
   if ((zrc == 0)); then
     zt=true
   elif ((zrc == 2)) && ! grep -qx idp <<<"$missing"; then
-    missing="${missing:+$missing$'
-'}idp"
+    missing="${missing:+$missing$'\n'}idp"
   fi
   if _st_req GET "/accounts/$ST_ACC/access/identity_providers" \
     && jq -e 'any(.result[]?; .type == "onetimepin")' >/dev/null 2>&1 <<<"$ST_BODY"; then

@@ -13,11 +13,26 @@ url="${*: -1}"
 cf_deny() { case " ${CF_DENY:-} " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 cf_reply() { # CODICE CORPO — il codice HTTP segue solo se curl ha avuto -w
   printf "%s" "$2"
-  if [ -n "$wflag" ]; then printf "
-%s" "$1"; fi
+  if [ -n "$wflag" ]; then printf "\n%s" "$1"; fi
 }
 wflag=""
 for a in "$@"; do [ "$a" = "-w" ] && wflag=1; done
+# CF_PROBE_MODE: risposte anomale sulle risorse singole e su organizations.
+#   404msg  → 404 il cui messaggio contiene "permission" (resta: permesso presente)
+#   429/500 → Cloudflare in difficoltà (JSON non di autorizzazione)
+#   500html → 500 con corpo non JSON
+#   403html → 403 con corpo non JSON (resta: permesso mancante)
+if [ -n "${CF_PROBE_MODE:-}" ]; then
+  case "$url" in
+    *"cfd_tunnel/0000"* | *"access/policies/0000"* | *"access/identity_providers/0000"* | *"access/organizations")
+      case "$CF_PROBE_MODE" in
+        404msg) cf_reply 404 "{\"success\":false,\"errors\":[{\"code\":12135,\"message\":\"does not exist or you do not have permission\"}]}"; exit 0 ;;
+        429 | 500) cf_reply "$CF_PROBE_MODE" "{\"success\":false,\"errors\":[{\"code\":7000,\"message\":\"errore temporaneo\"}]}"; exit 0 ;;
+        500html) cf_reply 500 "<html>bad gateway</html>"; exit 0 ;;
+        403html) cf_reply 403 "<html>forbidden</html>"; exit 0 ;;
+      esac ;;
+  esac
+fi
 case "$url" in
   *"/zones/zone123") echo "{\"success\":true,\"result\":{\"id\":\"zone123\",\"account\":{\"id\":\"acc1\"}}}" ;;
   *"cfd_tunnel/0000"*)
@@ -214,10 +229,25 @@ esac'
   ! grep -qE 'per_page|identity_providers( |$)' "$STUB_LOG"
 }
 
-@test "cf_check_ssh_perms: un errore non di autorizzazione non è un permesso mancante" {
-  export CF_NO_ZT=1
+@test "cf_check_ssh_perms: un 404 non è mai un permesso mancante, qualunque sia il messaggio" {
+  export CF_PROBE_MODE=404msg
   run cf_check_ssh_perms acc1
   [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "cf_check_ssh_perms: 429 e 5xx (anche non JSON) non dicono nulla sul token: dà 2" {
+  for m in 429 500 500html; do
+    CF_PROBE_MODE="$m" run cf_check_ssh_perms acc1
+    [ "$status" -eq 2 ]
+  done
+}
+
+@test "cf_check_ssh_perms: 403 con corpo non JSON è un permesso mancante" {
+  export CF_PROBE_MODE=403html
+  run cf_check_ssh_perms acc1
+  [ "$status" -eq 1 ]
+  [ "$output" = "$(printf 'tunnel\naccess\nidp')" ]
 }
 
 @test "cf_check_ssh_perms: Cloudflare irraggiungibile dà 2" {
@@ -226,16 +256,22 @@ esac'
   [ "$status" -eq 2 ]
 }
 
-@test "cf_zerotrust_enabled dipende da access/organizations" {
+@test "cf_zerotrust_enabled: 0 attivo, 1 non attivo (404), 2 permesso mancante" {
   run cf_zerotrust_enabled acc1
   [ "$status" -eq 0 ]
-  export CF_NO_ZT=1
+  CF_NO_ZT=1 run cf_zerotrust_enabled acc1
+  [ "$status" -eq 1 ]
+  # Il permesso mancante prevale su "non attivo": senza permesso non si può dire.
+  CF_NO_ZT=1 CF_DENY=idp run cf_zerotrust_enabled acc1
+  [ "$status" -eq 2 ]
+  CF_PROBE_MODE=403html run cf_zerotrust_enabled acc1
+  [ "$status" -eq 2 ]
+}
+
+@test "cf_zerotrust_enabled: Cloudflare irraggiungibile dà 1" {
+  make_stub curl 'exit 7'
   run cf_zerotrust_enabled acc1
   [ "$status" -eq 1 ]
-  # 404 senza errore di autenticazione: Zero Trust non attivo, non permesso
-  export CF_NO_ZT=1
-  CF_DENY=idp run cf_zerotrust_enabled acc1
-  [ "$status" -eq 2 ]
 }
 
 @test "cf_api_error toglie i caratteri di controllo" {
