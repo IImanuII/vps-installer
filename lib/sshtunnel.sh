@@ -745,6 +745,8 @@ st_set_host() {
   _st_undo_push _st_put_app "$acc" "$aid" "$old" "$otp" "$pid"
   if ! _st_req POST "/zones/$zid/dns_records" "$(_st_cname_body "$new" "$tid")"; then
     _st_fail "creazione del record DNS di $new non riuscita"
+    # La risposta può essersi persa con il record già creato: toglierlo prima che il tunnel resti com'era.
+    _st_rm_dns_orphans "$zid" "$new" "$tid"
     _st_rollback
     return 1
   fi

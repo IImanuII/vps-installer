@@ -95,7 +95,8 @@ case "${1:-}" in
     lock_or_die
     read_json
     label="$(stdin_field label)"
-    [[ -n "$label" ]] || label="$(st_random_label)"
+    # Il pannello chiama prima "random": niente generazione silenziosa qui.
+    [[ -n "$label" ]] || json_err "nome mancante"
     emails="$(stdin_field emails)"
     if ! st_enable "$label" "$emails" >&2; then json_err "$ST_ERR"; fi
     json_ok --arg h "$(st_state_get host)" '{ok: true, host: $h}'

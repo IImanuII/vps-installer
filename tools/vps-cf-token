@@ -51,6 +51,10 @@ case "${1:-}" in
       acc="$(jq -r '.account_id // empty' "$SSHTUNNEL_STATE")"
       tid="$(jq -r '.tunnel_id // empty' "$SSHTUNNEL_STATE")"
       aid="$(jq -r '.app_id // empty' "$SSHTUNNEL_STATE")"
+      # Uno stato incompleto darebbe percorsi tipo /accounts//...: meglio rifiutare.
+      if [[ -z "$acc" || -z "$tid" || -z "$aid" ]]; then
+        json_err "l'accesso SSH è attivo: il nuovo token deve poterlo gestire, oppure disattivalo prima"
+      fi
       for p in "/accounts/$acc/cfd_tunnel/$tid" "/accounts/$acc/access/apps/$aid"; do
         if ! CF_API_TOKEN="$token" _st_req GET "$p" && ! _st_gone; then
           json_err "l'accesso SSH è attivo: il nuovo token deve poterlo gestire, oppure disattivalo prima"

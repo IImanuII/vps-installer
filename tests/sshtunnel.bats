@@ -414,6 +414,15 @@ in_order() {
   [ "$(jq -r .host "$SSHTUNNEL_STATE")" = ssh-k3f9x2.example.it ]
 }
 
+@test "st_set_host: DNS nuovo fallito → cancella il CNAME del tunnel rimasto, non gli altri" {
+  cf_enabled
+  CF_DNS_ORPHAN=1 CF_FAIL="POST:/zones/zone123/dns_records" run st_set_host ssh-nuovo1
+  [ "$status" -eq 1 ]
+  grep -qx "DELETE /zones/zone123/dns_records/orphan9" "$CFLOG"
+  ! grep -q "DELETE /zones/zone123/dns_records/altrui" "$CFLOG"
+  ! grep -q "DELETE /zones/zone123/dns_records/dns1" "$CFLOG"
+}
+
 @test "st_disable con l'app già cancellata (404) completa" {
   cf_enabled
   CF_404="DELETE:/accounts/acc1/access/apps/app1 DELETE:/accounts/acc1/access/apps/app1/ca" run st_disable
@@ -772,4 +781,21 @@ cli_env() {
 @test "sudoers consente vps-ssh-tunnel; jail sshd non banna localhost" {
   grep -qF '/opt/vps/bin/vps-ssh-tunnel' "$REPO_ROOT/templates/sudoers-vps-panel"
   grep -qE '^ignoreip = 127\.0\.0\.1/8 ::1( |$)' "$REPO_ROOT/templates/jail-sshd.local.tmpl"
+}
+
+@test "vps-ssh-tunnel enable: l'etichetta è obbligatoria, niente generazione silenziosa" {
+  cli_env
+  st_in '{"emails":"manu@x.it"}' enable
+  [ "$status" -eq 1 ]
+  jq -e '.ok == false' <<<"$output"
+  st_in '{"label":"","emails":"manu@x.it"}' enable
+  [ "$status" -eq 1 ]
+  [ ! -s "$CFLOG" ]
+  [ ! -e "$SSHTUNNEL_STATE" ]
+}
+
+@test "vps-ssh-tunnel: il rilancio in unità systemd usa il percorso assoluto fisso" {
+  t="$REPO_ROOT/tools/vps-ssh-tunnel"
+  grep -q 'systemd-run --wait --pipe' "$t"
+  grep -q '/opt/vps/bin/vps-ssh-tunnel "\$@"' "$t"
 }

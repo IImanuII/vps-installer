@@ -409,6 +409,19 @@ exit 0'
   grep -qxF "dns_cloudflare_api_token = $tok" "$VPS_OPT/secrets/cloudflare.ini"
 }
 
+@test "vps-cf-token set con stato dell'accesso SSH incompleto → rifiutato, nessun percorso senza id" {
+  _cf_ini; _cf_curl_ssh
+  export SSHTUNNEL_STATE="$VPS_OPT/ssh-tunnel.json"
+  tok="$(printf 'n%.0s' {1..40})"
+  for st in '{"host":"a"}' '{"account_id":"acc1","tunnel_id":"tun1"}' '{"account_id":"acc1","app_id":"app1"}' '{"tunnel_id":"tun1","app_id":"app1"}'; do
+    echo "$st" >"$SSHTUNNEL_STATE"
+    run bash -c "printf '%s' '$tok' | bash '$T/vps-cf-token' set"
+    [ "$status" -eq 1 ]
+    [ "$(jq -r .error <<<"$output")" = "l'accesso SSH è attivo: il nuovo token deve poterlo gestire, oppure disattivalo prima" ]
+    grep -qxF "dns_cloudflare_api_token = $CF_TOK" "$VPS_OPT/secrets/cloudflare.ini"
+  done
+}
+
 @test "vps-cf-token set senza stato dell'accesso SSH: nessuna verifica del tunnel" {
   _cf_ini; _cf_curl_ssh
   export SSHTUNNEL_STATE="$VPS_OPT/non-esiste.json"
