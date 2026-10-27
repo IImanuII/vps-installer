@@ -14,6 +14,7 @@
 : "${SSH_CF_CA:=/etc/ssh/vps-cf-ca.pub}"
 : "${SSH_CF_PRINCIPALS:=/etc/ssh/vps-cf-principals}"
 : "${SUDOERS_D:=/etc/sudoers.d}"
+: "${LINGER_D:=/var/lib/systemd/linger}"
 : "${SSHTUNNEL_STATE:=$VPS_OPT/ssh-tunnel.json}"
 : "${SSHTUNNEL_ENV:=$VPS_OPT/secrets/cf-tunnel.env}"
 
@@ -114,6 +115,8 @@ st_user_name() {
 
 # st_user_ours NOME — 0 se esiste ed è stato creato da noi (GECOS vps-ssh-tunnel),
 # 1 se non esiste, 2 se esiste ma è di qualcun altro: quest'ultimo non si tocca mai.
+# Il GECOS lo può cambiare l'utente stesso (chfn): rc 0 da solo NON prova che
+# l'utente sia nostro, chi chiama deve controllare anche che sia nello stato.
 st_user_ours() {
   local line
   line="$(getent passwd "$1" 2>/dev/null)" || return 1
@@ -125,7 +128,16 @@ st_user_ours() {
 # certificato breve di Cloudflare. Se un passo fallisce non resta nulla.
 st_user_create() {
   st_valid_name "$1" || return 1
-  useradd -m -s /bin/bash -c vps-ssh-tunnel "$1" || return 1
+  # Un utente già presente non si tocca (nemmeno per ripulire un fallimento).
+  local rc=0
+  st_user_ours "$1" || rc=$?
+  ((rc == 1)) || return 1
+  if ! useradd -m -s /bin/bash -c vps-ssh-tunnel "$1"; then
+    # useradd può uscire con errore dopo aver scritto l'account (es. home non
+    # creabile): se ora esiste con il nostro GECOS l'abbiamo creato noi, va tolto.
+    if st_user_ours "$1"; then userdel -r "$1" || log "ATTENZIONE: utente $1 creato a metà e non rimosso"; fi
+    return 1
+  fi
   # '*' impedisce il login con password ma non "blocca" l'account (con '!' sshd
   # rifiuterebbe anche il certificato).
   if ! usermod -p '*' "$1"; then
@@ -149,8 +161,18 @@ st_user_delete() {
   esac
   # Prima si fermano sessioni e processi, altrimenti userdel si rifiuta o
   # lascia cose in giro. I comandi possono "fallire" se non c'è nulla da fare.
-  loginctl terminate-user "$name" || true
+  # Il linger lascerebbe un file in /var/lib/systemd/linger che un futuro
+  # utente con lo stesso nome erediterebbe.
+  loginctl disable-linger "$name" 2>/dev/null || true
+  rm -f "${LINGER_D:?}/$name"
+  loginctl terminate-user "$name" 2>/dev/null || true
   pkill -KILL -u "$name" || true
+  # Il kill è asincrono: userdel con processi ancora vivi si rifiuta (come in site_user_remove).
+  for _ in {1..50}; do
+    pgrep -u "$name" >/dev/null 2>&1 || break
+    pkill -KILL -u "$name" 2>/dev/null || true
+    sleep 0.1
+  done
   crontab -r -u "$name" 2>/dev/null || true
   # Lavori at: l'ultimo campo di atq è l'utente.
   while IFS= read -r id; do
@@ -158,17 +180,30 @@ st_user_delete() {
   done < <(atq 2>/dev/null | awk -v u="$name" '$NF == u { print $1 }')
   # Un file di sua proprietà in /tmp resterebbe orfano e un UID riusato lo erediterebbe.
   find /tmp /var/tmp /dev/shm -xdev -user "$name" -delete 2>/dev/null || true
+  # sudoers e principal solo dopo userdel: se fallisce l'utente esiste ancora e
+  # il suo stato (sudo, accesso) resta coerente, pronto a un nuovo tentativo.
+  if ! userdel -r "$name"; then
+    userdel -f -r "$name" || return 1
+  fi
   rm -f "${SUDOERS_D:?}/vps-ssh-$name" "$SSH_CF_PRINCIPALS/$name"
-  userdel -r "$name" || return 1
 }
 
 # st_sudo_set NOME true|false — sudo senza password per NOME. Il file si scrive
 # in temporaneo e si sposta solo se visudo lo approva: un sudoers rotto
 # bloccherebbe sudo per tutti.
 st_sudo_set() {
-  local name="$1" f tmp
+  local name="$1" f tmp rc
   st_valid_name "$name" || return 1
   f="${SUDOERS_D:?}/vps-ssh-$name"
+  if [[ "$2" == true ]]; then
+    # Mai sudo a un utente che non è nostro (root, utente dell'installazione, siti).
+    rc=0
+    st_user_ours "$name" || rc=$?
+    if ((rc == 2)); then
+      log "sudo: l'utente $name non è stato creato dall'accesso SSH: rifiutato."
+      return 1
+    fi
+  fi
   case "$2" in
     false)
       rm -f "$f"
@@ -265,11 +300,19 @@ _st_sshd_write() {
 # con il proprio principal; i principal di altri nomi vengono tolti.
 # Se "sshd -t" fallisce tutto torna com'era e sshd non viene ricaricato.
 st_sshd_apply() {
-  local ca="$1" snap p names=()
+  local ca="$1" snap p rc names=()
   shift
   for p in "$@"; do
     # I nomi finiscono in percorsi e nella configurazione di sshd.
     st_valid_name "$p" || return 1
+    # Match User + AuthorizedKeysFile none toglierebbe le chiavi a un utente
+    # estraneo (root, l'utente dell'installazione): mai, prima di ogni scrittura.
+    rc=0
+    st_user_ours "$p" || rc=$?
+    if ((rc == 2)); then
+      log "sshd: l'utente $p esiste già e non è stato creato dall'accesso SSH: rifiutato."
+      return 1
+    fi
     names+=("$p")
   done
   # Senza utenti sshd rifiuterebbe tutti.
@@ -983,6 +1026,7 @@ st_set_host() {
 st_disable() {
   local acc zid tid aid pid did user
   local -a names
+  local pname
   ST_ERR=""
   if [[ ! -f "$SSHTUNNEL_STATE" ]]; then
     _st_service_remove
@@ -1026,8 +1070,8 @@ st_disable() {
   # elenco (più il file dell'utente dell'installazione delle versioni precedenti).
   names=()
   [[ -z "$user" ]] || names+=("$user")
-  while IFS= read -r did; do
-    if [[ -n "$did" ]] && st_valid_name "$did"; then names+=("$did"); fi
+  while IFS= read -r pname; do
+    if [[ -n "$pname" ]] && st_valid_name "$pname"; then names+=("$pname"); fi
   done < <(jq -r '.emails[]? | split("@")[0] | ascii_downcase' <<<"$ST_S")
   if ((${#names[@]})) && ! st_sshd_remove "${names[@]}"; then
     ST_ERR="rimozione della configurazione di sshd non riuscita"

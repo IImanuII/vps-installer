@@ -9,6 +9,7 @@ setup() {
   export SSHTUNNEL_STATE="$VPS_OPT/ssh-tunnel.json"
   export SUDOERS_D="$BATS_TEST_TMPDIR/sudoers.d"
   export PASSWD_FAKE="$BATS_TEST_TMPDIR/passwd"
+  export LINGER_D="$BATS_TEST_TMPDIR/linger"
   export CALLS="$BATS_TEST_TMPDIR/calls"
   mkdir -p "$SSHD_CONFIG_D" "$BATS_TEST_TMPDIR/ssh" "$SUDOERS_D"
   : >"$PASSWD_FAKE"
@@ -797,7 +798,7 @@ cli_env() {
 
 @test "vps-ssh-tunnel sotto sudo azzera i percorsi dell'ambiente" {
   t="$REPO_ROOT/tools/vps-ssh-tunnel"
-  grep -q 'SSHD_CONFIG_D SSH_CF_CA SSH_CF_PRINCIPALS SUDOERS_D SSHTUNNEL_STATE SSHTUNNEL_ENV SSHTUNNEL_LOCK' "$t"
+  grep -q 'SSHD_CONFIG_D SSH_CF_CA SSH_CF_PRINCIPALS SUDOERS_D LINGER_D SSHTUNNEL_STATE SSHTUNNEL_ENV SSHTUNNEL_LOCK' "$t"
   for v in SYSTEMD_DIR APT_SOURCES_D CLOUDFLARED_KEYRING CF_API_TOKEN SITES_DIR CF_API; do
     grep -q "$v" "$t"
   done
@@ -959,10 +960,22 @@ user_stubs() {
   # shellcheck disable=SC2016
   make_stub getent '[ "$1" = passwd ] || exit 2; grep "^$2:" "$PASSWD_FAKE" || exit 2'
   local c
-  for c in useradd usermod userdel loginctl pkill crontab atq atrm find; do
+  for c in useradd usermod userdel loginctl pkill crontab atrm find; do
     # shellcheck disable=SC2016
-    make_stub "$c" 'echo "$(basename "$0") $*" >>"$CALLS"; [ "${USERADD_FAIL:-0}" = 1 ] && [ "$(basename "$0")" = useradd ] && exit 1; [ "${USERMOD_FAIL:-0}" = 1 ] && [ "$(basename "$0")" = usermod ] && exit 1; exit 0'
+    make_stub "$c" 'echo "$(basename "$0") $*" >>"$CALLS"; [ "${USERADD_FAIL:-0}" = 1 ] && [ "$(basename "$0")" = useradd ] && exit 1; [ "${USERMOD_FAIL:-0}" = 1 ] && [ "$(basename "$0")" = usermod ] && exit 1
+[ "${USERDEL_NOF_FAIL:-0}" = 1 ] && [ "$(basename "$0")" = userdel ] && [[ " $* " != *" -f "* ]] && exit 1
+exit 0'
   done
+  # pgrep: con PGREP_BUSY=N segnala un processo vivo per le prime N chiamate.
+  # shellcheck disable=SC2016
+  make_stub pgrep 'echo "pgrep $*" >>"$CALLS"; n=$(cat "$BATS_TEST_TMPDIR/pgrep.n" 2>/dev/null || echo 0)
+[ "$n" -lt "${PGREP_BUSY:-0}" ] || exit 1
+echo $((n + 1)) >"$BATS_TEST_TMPDIR/pgrep.n"; exit 0'
+  # atq: un lavoro di mario e uno di root.
+  # shellcheck disable=SC2016
+  make_stub atq 'printf "7	Thu Oct 27 10:00:00 2026 a mario
+8	Thu Oct 27 10:00:00 2026 a root
+"'
   # shellcheck disable=SC2016
   make_stub visudo 'echo "visudo $*" >>"$CALLS"; [ "${VISUDO_FAIL:-0}" = 1 ] && exit 1; exit 0'
 }
@@ -1012,23 +1025,94 @@ user_stubs() {
   grep -qx "userdel -r mario" "$CALLS"
 }
 
+@test "st_user_create: useradd fallito a metà ma account creato → lo toglie; utente estraneo intatto" {
+  user_stubs
+  # useradd "fallisce" dopo aver scritto l'account.
+  # shellcheck disable=SC2016
+  make_stub useradd 'echo "useradd $*" >>"$CALLS"; echo "mario:x:1001:1001:vps-ssh-tunnel:/home/mario:/bin/bash" >>"$PASSWD_FAKE"; exit 12'
+  run st_user_create mario
+  [ "$status" -eq 1 ]
+  grep -qx "userdel -r mario" "$CALLS"
+  : >"$CALLS"
+  echo "anna:x:1002:1002:Anna:/home/anna:/bin/bash" >>"$PASSWD_FAKE"
+  run st_user_create anna
+  [ "$status" -eq 1 ]
+  [ ! -s "$CALLS" ]
+}
+
 @test "st_user_delete di un utente estraneo → rc 2 senza toccare nulla" {
   user_stubs
   echo "root:x:0:0:root:/root:/bin/bash" >>"$PASSWD_FAKE"
   run st_user_delete root
   [ "$status" -eq 2 ]
-  ! grep -qE "^(userdel|pkill|loginctl|crontab)" "$CALLS"
+  ! grep -qE "^(userdel|pkill|loginctl|crontab|find|atrm)" "$CALLS"
 }
 
-@test "st_user_delete di un nostro utente: ordine e file sudoers" {
+@test "st_user_delete di un nostro utente: ordine, at, find, file" {
   user_stubs
   echo "mario:x:1001:1001:vps-ssh-tunnel:/home/mario:/bin/bash" >>"$PASSWD_FAKE"
   echo "mario ALL=(ALL) NOPASSWD:ALL" >"$SUDOERS_D/vps-ssh-mario"
+  mkdir -p "$SSH_CF_PRINCIPALS" "$LINGER_D"
+  echo mario >"$SSH_CF_PRINCIPALS/mario"
+  : >"$LINGER_D/mario"
   run st_user_delete mario
   [ "$status" -eq 0 ]
   [ ! -e "$SUDOERS_D/vps-ssh-mario" ]
-  expected=$'loginctl terminate-user mario\npkill -KILL -u mario\ncrontab -r -u mario\nuserdel -r mario'
-  [ "$(grep -E '^(loginctl|pkill|crontab|userdel)' "$CALLS")" = "$expected" ]
+  [ ! -e "$SSH_CF_PRINCIPALS/mario" ]
+  [ ! -e "$LINGER_D/mario" ]
+  expected=$'loginctl disable-linger mario
+loginctl terminate-user mario
+pkill -KILL -u mario
+crontab -r -u mario
+atrm 7
+find /tmp /var/tmp /dev/shm -xdev -user mario -delete
+userdel -r mario'
+  [ "$(grep -E '^(loginctl|pkill|crontab|atrm|find|userdel)' "$CALLS")" = "$expected" ]
+  ! grep -qx "atrm 8" "$CALLS"
+}
+
+@test "st_user_delete aspetta che i processi escano; userdel -r rifiutato → userdel -f -r" {
+  user_stubs
+  echo "mario:x:1001:1001:vps-ssh-tunnel:/home/mario:/bin/bash" >>"$PASSWD_FAKE"
+  echo "mario ALL=(ALL) NOPASSWD:ALL" >"$SUDOERS_D/vps-ssh-mario"
+  PGREP_BUSY=2 USERDEL_NOF_FAIL=1 run st_user_delete mario
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '^pgrep' "$CALLS")" -eq 3 ]
+  grep -qx "userdel -f -r mario" "$CALLS"
+  [ ! -e "$SUDOERS_D/vps-ssh-mario" ]
+}
+
+@test "st_user_delete: userdel che fallisce del tutto → rc 1 e sudoers intatto" {
+  user_stubs
+  echo "mario:x:1001:1001:vps-ssh-tunnel:/home/mario:/bin/bash" >>"$PASSWD_FAKE"
+  echo "mario ALL=(ALL) NOPASSWD:ALL" >"$SUDOERS_D/vps-ssh-mario"
+  # shellcheck disable=SC2016
+  make_stub userdel 'echo "userdel $*" >>"$CALLS"; exit 8'
+  run st_user_delete mario
+  [ "$status" -eq 1 ]
+  [ -e "$SUDOERS_D/vps-ssh-mario" ]
+}
+
+@test "st_sshd_apply rifiuta un utente estraneo (utente dell'installazione, root) senza toccare nulla" {
+  user_stubs
+  echo "manu:x:1000:1000:Manu:/home/manu:/bin/bash" >>"$PASSWD_FAKE"
+  echo "root:x:0:0:root:/root:/bin/bash" >>"$PASSWD_FAKE"
+  run st_sshd_apply "ssh-ed25519 AAAA ca" mario manu
+  [ "$status" -ne 0 ]
+  run st_sshd_apply "ssh-ed25519 AAAA ca" root
+  [ "$status" -ne 0 ]
+  [ ! -e "$SSHD_CONFIG_D/20-vps-cfaccess.conf" ]
+  [ ! -e "$SSH_CF_CA" ]
+  [ ! -e "$SSH_CF_PRINCIPALS" ]
+  ! grep -qE "sshd|reload" "$CALLS"
+}
+
+@test "st_sudo_set true rifiuta un utente estraneo" {
+  user_stubs
+  echo "root:x:0:0:root:/root:/bin/bash" >>"$PASSWD_FAKE"
+  run st_sudo_set root true
+  [ "$status" -eq 1 ]
+  [ -z "$(ls -A "$SUDOERS_D")" ]
 }
 
 @test "st_user_delete di un utente assente è idempotente" {
