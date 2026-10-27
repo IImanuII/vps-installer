@@ -2,7 +2,8 @@
 # Libreria dell'accesso SSH dal browser: validazione, stato e configurazione di sshd.
 # Richiede lib/common.sh e lib/validate.sh.
 #
-# ATTENZIONE per chi chiama st_enable / st_set_host / st_set_emails / st_disable:
+# ATTENZIONE per chi chiama st_enable / st_add_user / st_remove_user / st_set_sudo /
+# st_set_host / st_disable:
 # vanno SEMPRE usate in un condizionale (`if ! st_x ...; then json_err "$ST_ERR"; fi`).
 # Fuori da un `if`, errexit o la trap ERR del chiamante interromperebbero la
 # funzione a metà, saltando l'annullamento (_st_rollback) e lasciando risorse
@@ -34,39 +35,6 @@ st_random_label() {
     s+="$(head -c 256 /dev/urandom | LC_ALL=C tr -dc 'a-z0-9')"
   done
   printf 'ssh-%s\n' "${s:0:6}"
-}
-
-# st_parse_emails "a@x.it, B@y.it" — email minuscole, senza duplicati, una per riga.
-# 1 se sono 0 o più di 5, o se una non è valida (o supera 254 caratteri).
-st_parse_emails() {
-  local raw="$1" item e x seen items=() out=()
-  # read -a spezza sulla virgola senza espandere glob (es. "*").
-  IFS=, read -ra items <<<"$raw" || true
-  for item in "${items[@]}"; do
-    e="$(trim "$item")"
-    e="${e,,}"
-    [[ -n "$e" ]] || continue
-    ((${#e} <= 254)) && valid_email "$e" || return 1
-    seen=0
-    for x in "${out[@]}"; do [[ "$x" == "$e" ]] && seen=1; done
-    ((seen)) || out+=("$e")
-  done
-  ((${#out[@]} >= 1 && ${#out[@]} <= 5)) || return 1
-  printf '%s\n' "${out[@]}"
-}
-
-# st_principals EMAIL... — il principal del certificato è la parte prima della @;
-# due email con lo stesso prefisso danno un solo principal.
-st_principals() {
-  local e p x seen out=()
-  for e in "$@"; do
-    p="${e%%@*}"
-    p="${p,,}"
-    seen=0
-    for x in "${out[@]}"; do [[ "$x" == "$p" ]] && seen=1; done
-    ((seen)) || out+=("$p")
-  done
-  ((${#out[@]} == 0)) || printf '%s\n' "${out[@]}"
 }
 
 # st_state_get CAMPO — valore nel JSON di stato (vuoto se manca il file o il campo).
@@ -148,8 +116,13 @@ st_user_create() {
 
 # st_user_delete NOME — elimina l'utente e tutto ciò che ha lasciato. Rifiuta
 # (rc 2) un utente che non abbiamo creato noi; se non esiste è già fatto.
+# Il file principal si toglie PRIMA di fermare i processi: un certificato ancora
+# valido non deve poter riaprire una sessione durante l'attesa. Se poi
+# l'eliminazione si interrompe il principal NON viene rimesso qui (l'utente è
+# comunque in uscita, e rimetterlo riaprirebbe la porta): chi decide di tenere
+# l'utente (remove-user che annulla) riapplica sshd, che lo riscrive.
 st_user_delete() {
-  local name="$1" rc=0 id
+  local name="$1" rc=0 urc=0 id
   st_valid_name "$name" || return 1
   st_user_ours "$name" || rc=$?
   case "$rc" in
@@ -159,6 +132,7 @@ st_user_delete() {
       return 0
       ;;
   esac
+  rm -f "${SSH_CF_PRINCIPALS:?}/$name"
   # Prima si fermano sessioni e processi, altrimenti userdel si rifiuta o
   # lascia cose in giro. I comandi possono "fallire" se non c'è nulla da fare.
   # Il linger lascerebbe un file in /var/lib/systemd/linger che un futuro
@@ -180,10 +154,22 @@ st_user_delete() {
   done < <(atq 2>/dev/null | awk -v u="$name" '$NF == u { print $1 }')
   # Un file di sua proprietà in /tmp resterebbe orfano e un UID riusato lo erediterebbe.
   find /tmp /var/tmp /dev/shm -xdev -user "$name" -delete 2>/dev/null || true
-  # sudoers e principal solo dopo userdel: se fallisce l'utente esiste ancora e
-  # il suo stato (sudo, accesso) resta coerente, pronto a un nuovo tentativo.
-  if ! userdel -r "$name"; then
-    userdel -f -r "$name" || return 1
+  userdel -r "$name" || urc=$?
+  # Solo l'uscita 8 di userdel è "utente in uso": -f serve a quello e non a
+  # coprire altri errori (home non rimovibile, file di sistema bloccato...).
+  if ((urc == 8)); then
+    log "utente $name ancora in uso: userdel -f"
+    urc=0
+    userdel -f -r "$name" || urc=$?
+  fi
+  if ((urc != 0)); then
+    # userdel può uscire con errore dopo aver tolto l'account (es. spool di posta):
+    # se l'account non c'è più, un sudoers NOPASSWD rimasto passerebbe a un futuro
+    # utente con lo stesso nome. Se c'è ancora, sudoers e stato restano coerenti.
+    rc=0
+    st_user_ours "$name" || rc=$?
+    ((rc == 1)) || return 1
+    log "ATTENZIONE: userdel di $name ha dato errore ma l'account non c'è più"
   fi
   rm -f "${SUDOERS_D:?}/vps-ssh-$name" "$SSH_CF_PRINCIPALS/$name"
 }
@@ -408,6 +394,8 @@ ST_UNIT="vps-cloudflared"
 ST_APT_HOOK="90vps-cloudflared"
 CLOUDFLARED_KEY_FPRS=(CC94B39C77AE7342A68B89628A682D308D4E5E73)
 ST_UNDO=()
+# Nome utente dell'ultima operazione riuscita: lo legge tools/vps-ssh-tunnel.
+export ST_USER=""
 
 # _st_manifest FILTRO — campo del manifest (vuoto se manca).
 _st_manifest() {
@@ -697,17 +685,38 @@ st_host_free() {
   fi
 }
 
-# _st_emails EMAIL... — in ST_EMAILS le email normalizzate (1–5, valide).
-_st_emails() {
-  local list
-  list="$(
-    IFS=,
-    st_parse_emails "$*"
-  )" || {
-    ST_ERR="email non valide: da 1 a 5, separate da virgola"
+# _st_person EMAIL — ST_PEMAIL (email normalizzata) e ST_PNAME (nome utente Linux
+# ricavato) o 1 con ST_ERR. Stessa regola della Plancia: mai accettare per fiducia.
+_st_person() {
+  ST_PEMAIL="$(st_parse_user "$1")" || {
+    ST_ERR="email non valida"
     return 1
   }
-  mapfile -t ST_EMAILS <<<"$list"
+  ST_PNAME="$(st_user_name "$ST_PEMAIL")" || {
+    ST_ERR="il nome utente ricavato da $ST_PEMAIL non è valido (minuscole, cifre, _ . -, al massimo 32 caratteri, non inizia con una cifra)"
+    return 1
+  }
+}
+
+# _st_name_available NOME — 0 se sulla VPS non esiste nessun utente con quel nome.
+# Anche un utente con il nostro GECOS ma fuori dallo stato non è "nostro" (il GECOS
+# lo può cambiare chi ci entra con chfn): si rifiuta, mai riusarlo.
+_st_name_available() {
+  local rc=0
+  st_user_ours "$1" || rc=$?
+  if ((rc == 1)); then return 0; fi
+  ST_ERR="l'utente $1 esiste già sulla VPS e non è stato creato dall'accesso SSH"
+  return 1
+}
+
+# _st_sshd_reapply NOME... — rimette sshd con questi utenti usando la CA già
+# installata. La CA contiene spazi e non passerebbe da _st_undo_push, quindi si
+# rilegge dal file: serve sia al flusso normale sia all'annullamento.
+_st_sshd_reapply() {
+  local ca
+  ca="$(head -n 1 "$SSH_CF_CA" 2>/dev/null || true)"
+  [[ -n "$ca" ]] || return 1
+  st_sshd_apply "$ca" "$@"
 }
 
 # _st_check_free HOST — st_host_free con ST_ERR pronto per l'utente.
@@ -720,29 +729,34 @@ _st_check_free() {
   return "$rc"
 }
 
-# st_enable LABEL EMAIL... — attiva l'accesso SSH dal browser su LABEL.<zona>.
+# st_enable LABEL EMAIL SUDO — attiva l'accesso SSH dal browser su LABEL.<zona>,
+# con un utente Linux per quell'email (SUDO = true|false).
 # L'ordine garantisce che il nome entri nel DNS solo quando l'app Access che lo
 # protegge esiste già; al primo errore si annulla quanto fatto (tranne il
 # One-time PIN, che appartiene all'organizzazione Zero Trust).
 st_enable() {
-  local label="$1" host user port missing rc=0 otp tid pid aid ca did state
-  local -a principals
-  shift
-  ST_ERR="" ST_UNDO=()
+  local label="$1" sudo="${3:-}" host name email port missing rc=0 otp tid pid aid ca did state
+  ST_ERR="" ST_UNDO=() ST_USER=""
   st_valid_label "$label" || {
     ST_ERR="nome non valido"
     return 1
   }
-  _st_emails "$@" || return 1
+  [[ "$sudo" == true || "$sudo" == false ]] || {
+    ST_ERR="sudo deve essere true o false"
+    return 1
+  }
+  _st_person "${2:-}" || return 1
+  email="$ST_PEMAIL"
+  name="$ST_PNAME"
   [[ ! -f "$SSHTUNNEL_STATE" ]] || {
     ST_ERR="l'accesso SSH è già attivo"
     return 1
   }
+  _st_name_available "$name" || return 1
   _st_cf_context || return 1
-  user="$(_st_manifest .admin_user)"
   port="$(_st_manifest .ssh_port)"
-  [[ -n "$user" && "$port" =~ ^[0-9]+$ ]] || {
-    ST_ERR="manifest incompleto (admin_user, ssh_port)"
+  [[ "$port" =~ ^[0-9]+$ ]] || {
+    ST_ERR="manifest incompleto (ssh_port)"
     return 1
   }
   host="$label.$ST_ZONE"
@@ -784,10 +798,26 @@ st_enable() {
 
   st_cloudflared_install || return 1
 
+  # L'utente nasce prima di sshd e di tutto ciò che sta su Cloudflare: ogni passo
+  # che segue, se fallisce, lo elimina con il resto (pila di annullamento).
+  if ! st_user_create "$name"; then
+    ST_ERR="creazione dell'utente $name non riuscita"
+    log "accesso SSH: $ST_ERR"
+    return 1
+  fi
+  _st_undo_push st_user_delete "$name"
+  if ! st_sudo_set "$name" "$sudo"; then
+    ST_ERR="configurazione di sudo per $name non riuscita"
+    log "accesso SSH: $ST_ERR"
+    _st_rollback
+    return 1
+  fi
+
   # Tunnel gestito da Cloudflare: il suo token resta solo in memoria e nel file env.
   _st_req POST "/accounts/$ST_ACC/cfd_tunnel" \
     "$(jq -nc --arg n "vps-$(hostname -s 2>/dev/null || hostname)-$label" '{name: $n, config_src: "cloudflare"}')" || {
     _st_fail "creazione del tunnel non riuscita"
+    _st_rollback
     return 1
   }
   tid="$(jq -r '.result.id // empty' <<<"$ST_BODY")"
@@ -795,6 +825,7 @@ st_enable() {
   ST_BODY=""
   [[ -n "$tid" ]] || {
     ST_ERR="Cloudflare non ha restituito l'id del tunnel"
+    _st_rollback
     return 1
   }
   _st_undo_push _st_rm_tunnel "$ST_ACC" "$tid"
@@ -824,7 +855,7 @@ st_enable() {
   ST_TUNNEL_TOKEN=""
 
   # Policy e app Access: da qui il nome, quando entrerà nel DNS, è protetto.
-  if ! _st_req POST "/accounts/$ST_ACC/access/policies" "$(_st_policy_body "$host" "${ST_EMAILS[@]}")"; then
+  if ! _st_req POST "/accounts/$ST_ACC/access/policies" "$(_st_policy_body "$host" "$email")"; then
     _st_fail "creazione della policy Access non riuscita"
     _st_rollback
     return 1
@@ -856,14 +887,13 @@ st_enable() {
     return 1
   fi
   ca="$(jq -r '.result.public_key // empty' <<<"$ST_BODY")"
-  mapfile -t principals < <(st_principals "${ST_EMAILS[@]}")
-  if [[ -z "$ca" ]] || ! st_sshd_apply "$ca" "${principals[@]}"; then
+  if [[ -z "$ca" ]] || ! st_sshd_apply "$ca" "$name"; then
     ST_ERR="configurazione di sshd non riuscita: sshd è rimasto com'era"
     log "accesso SSH: $ST_ERR"
     _st_rollback
     return 1
   fi
-  _st_undo_push st_sshd_remove "${principals[@]}"
+  _st_undo_push st_sshd_remove "$name"
 
   # Solo ora il nome entra nel DNS.
   if ! _st_req POST "/zones/$ST_ZONE_ID/dns_records" "$(_st_cname_body "$host" "$tid")"; then
@@ -883,17 +913,18 @@ st_enable() {
 
   state="$(jq -n --arg host "$host" --arg label "$label" --arg acc "$ST_ACC" --arg zone "$ST_ZONE_ID" \
     --arg tid "$tid" --arg aid "$aid" --arg pid "$pid" --arg did "$did" --arg otp "$otp" \
-    --arg user "$user" --arg at "$(date -u +%FT%TZ)" \
+    --arg email "$email" --arg name "$name" --argjson sudo "$sudo" --arg at "$(date -u +%FT%TZ)" \
     '{host: $host, label: $label, account_id: $acc, zone_id: $zone, tunnel_id: $tid, app_id: $aid,
-      policy_id: $pid, dns_id: $did, otp_id: $otp, emails: $ARGS.positional, user: $user,
-      enabled_at: $at}' --args "${ST_EMAILS[@]}")"
+      policy_id: $pid, dns_id: $did, otp_id: $otp, users: [{email: $email, user: $name, sudo: $sudo}],
+      enabled_at: $at}')"
   if ! st_state_write "$state"; then
     ST_ERR="impossibile scrivere lo stato dell'accesso SSH"
     _st_rollback
     return 1
   fi
   ST_UNDO=()
-  log "accesso SSH attivato su $host (${#ST_EMAILS[@]} email)"
+  ST_USER="$name"
+  log "accesso SSH attivato su $host (1 persona)"
 }
 
 # _st_require_state — lo stato in ST_S (1 con ST_ERR se l'accesso non è attivo).
@@ -905,45 +936,208 @@ _st_require_state() {
   return 1
 }
 
-# st_set_emails EMAIL... — nuova policy Access e nuovi principal di sshd. Se sshd
-# rifiuta la configurazione, la policy torna com'era.
-st_set_emails() {
-  local acc pid host user ca
-  local -a old principals
-  ST_ERR=""
-  _st_emails "$@" || return 1
+# _st_users_state — richiede lo stato nuovo (con "users"): ST_S, ST_ACC_ID, ST_PID,
+# ST_HOST. Uno stato 1.10.0 (solo "emails") non si gestisce: va disattivato e riattivato.
+_st_users_state() {
   _st_require_state || return 1
+  jq -e '(.users | type) == "array"' >/dev/null 2>&1 <<<"$ST_S" || {
+    ST_ERR="l'accesso SSH è di una versione precedente (senza utenti): disattivalo e attivalo di nuovo"
+    return 1
+  }
   _st_token || return 1
-  acc="$(jq -r .account_id <<<"$ST_S")"
-  pid="$(jq -r .policy_id <<<"$ST_S")"
-  host="$(jq -r .host <<<"$ST_S")"
-  user="$(jq -r .user <<<"$ST_S")"
-  mapfile -t old < <(jq -r '.emails[]?' <<<"$ST_S")
-  ca="$(head -n 1 "$SSH_CF_CA" 2>/dev/null || true)"
-  [[ -n "$ca" ]] || {
+  ST_ACC_ID="$(jq -r '.account_id // empty' <<<"$ST_S")"
+  ST_PID="$(jq -r '.policy_id // empty' <<<"$ST_S")"
+  ST_HOST="$(jq -r '.host // empty' <<<"$ST_S")"
+  [[ -n "$ST_ACC_ID" && -n "$ST_PID" && -n "$ST_HOST" ]] || {
+    ST_ERR="stato dell'accesso SSH incompleto"
+    return 1
+  }
+}
+
+# st_add_user EMAIL SUDO — nuova persona: utente Linux, (sudoers), principal e sshd e,
+# PER ULTIMA, l'email nella policy Access. Così non esiste un'email autorizzata
+# senza un utente pronto; se un passo fallisce si annulla tutto, utente compreso.
+st_add_user() {
+  local sudo="${2:-}" email name n
+  local -a emails names
+  ST_ERR="" ST_UNDO=() ST_USER=""
+  [[ "$sudo" == true || "$sudo" == false ]] || {
+    ST_ERR="sudo deve essere true o false"
+    return 1
+  }
+  _st_person "${1:-}" || return 1
+  email="$ST_PEMAIL"
+  name="$ST_PNAME"
+  _st_users_state || return 1
+  mapfile -t emails < <(jq -r '.users[].email' <<<"$ST_S")
+  mapfile -t names < <(jq -r '.users[].user' <<<"$ST_S")
+  for n in "${names[@]}"; do
+    if [[ "$n" == "$name" ]]; then
+      ST_ERR="c'è già una persona con il nome utente $name"
+      return 1
+    fi
+  done
+  ((${#names[@]} < 5)) || {
+    ST_ERR="massimo 5 persone"
+    return 1
+  }
+  _st_name_available "$name" || return 1
+  [[ -s "$SSH_CF_CA" ]] || {
     ST_ERR="CA di Cloudflare assente in sshd: disattivare e riattivare l'accesso"
     return 1
   }
-  _st_put_policy "$acc" "$pid" "$host" "${ST_EMAILS[@]}" || {
-    _st_fail "aggiornamento della policy Access non riuscito"
-    return 1
-  }
-  mapfile -t principals < <(st_principals "${ST_EMAILS[@]}")
-  if ! st_sshd_apply "$ca" "${principals[@]}"; then
-    # sshd si è già rimesso a posto da solo (st_sshd_apply); resta la policy.
-    if _st_put_policy "$acc" "$pid" "$host" "${old[@]}"; then
-      ST_ERR="configurazione di sshd non riuscita: email e sshd rimasti com'erano"
-    else
-      ST_ERR="configurazione di sshd non riuscita (sshd è rimasto com'era) e la policy Access non è stata ripristinata: controlla le email su Cloudflare"
-    fi
+
+  if ! st_user_create "$name"; then
+    ST_ERR="creazione dell'utente $name non riuscita"
     log "accesso SSH: $ST_ERR"
     return 1
   fi
-  st_state_write "$(jq '.emails = $ARGS.positional' --args "${ST_EMAILS[@]}" <<<"$ST_S")" || {
+  _st_undo_push st_user_delete "$name"
+  if ! st_sudo_set "$name" "$sudo"; then
+    ST_ERR="configurazione di sudo per $name non riuscita"
+    log "accesso SSH: $ST_ERR"
+    _st_rollback
+    return 1
+  fi
+  # st_sshd_apply si rimette a posto da solo se fallisce; l'annullamento serve
+  # solo se un passo SUCCESSIVO fallisce.
+  if ! _st_sshd_reapply "${names[@]}" "$name"; then
+    ST_ERR="configurazione di sshd non riuscita: sshd è rimasto com'era"
+    log "accesso SSH: $ST_ERR"
+    _st_rollback
+    return 1
+  fi
+  _st_undo_push _st_sshd_reapply "${names[@]}"
+  # Per ultima: da qui Cloudflare lascia entrare l'email.
+  if ! _st_put_policy "$ST_ACC_ID" "$ST_PID" "$ST_HOST" "${emails[@]}" "$email"; then
+    _st_fail "aggiornamento della policy Access non riuscito"
+    _st_rollback
+    return 1
+  fi
+  _st_undo_push _st_put_policy "$ST_ACC_ID" "$ST_PID" "$ST_HOST" "${emails[@]}"
+  if ! st_state_write "$(jq --arg e "$email" --arg u "$name" --argjson s "$sudo" \
+    '.users += [{email: $e, user: $u, sudo: $s}]' <<<"$ST_S")"; then
     ST_ERR="impossibile aggiornare lo stato dell'accesso SSH"
+    _st_rollback
+    return 1
+  fi
+  ST_UNDO=()
+  ST_USER="$name"
+  log "accesso SSH: aggiunto l'utente $name (sudo: $sudo)"
+}
+
+# st_remove_user EMAIL — l'email esce PRIMA dalla policy Access (nessun nuovo
+# accesso); se Cloudflare non risponde non si tocca nient'altro. Poi sshd e
+# l'eliminazione dell'utente; se questa non riesce si rimettono policy e sshd.
+st_remove_user() {
+  local email name entry rc=0
+  local -a keep_emails keep_names all_names all_emails
+  ST_ERR="" ST_UNDO=() ST_USER=""
+  _st_person "${1:-}" || return 1
+  email="$ST_PEMAIL"
+  _st_users_state || return 1
+  entry="$(jq -c --arg e "$email" '.users[] | select(.email == $e)' <<<"$ST_S")"
+  [[ -n "$entry" ]] || {
+    ST_ERR="$email non è tra le persone autorizzate"
     return 1
   }
-  log "accesso SSH: email autorizzate aggiornate (${#ST_EMAILS[@]})"
+  name="$(jq -r .user <<<"$entry")"
+  st_valid_name "$name" || {
+    ST_ERR="stato dell'accesso SSH non valido"
+    return 1
+  }
+  (($(jq '.users | length' <<<"$ST_S") > 1)) || {
+    ST_ERR="l'ultima persona non si può eliminare: per togliere tutto usa Disattiva"
+    return 1
+  }
+  # Un utente con quel nome che non è nostro (cambiato a mano dopo l'attivazione)
+  # non si elimina mai.
+  st_user_ours "$name" || rc=$?
+  if ((rc == 2)); then
+    ST_ERR="l'utente $name esiste sulla VPS ma non è stato creato dall'accesso SSH: non lo tocco"
+    return 1
+  fi
+  mapfile -t all_emails < <(jq -r '.users[].email' <<<"$ST_S")
+  mapfile -t all_names < <(jq -r '.users[].user' <<<"$ST_S")
+  mapfile -t keep_emails < <(jq -r --arg e "$email" '.users[] | select(.email != $e) | .email' <<<"$ST_S")
+  mapfile -t keep_names < <(jq -r --arg e "$email" '.users[] | select(.email != $e) | .user' <<<"$ST_S")
+
+  if ! _st_put_policy "$ST_ACC_ID" "$ST_PID" "$ST_HOST" "${keep_emails[@]}"; then
+    _st_fail "aggiornamento della policy Access non riuscito: nulla è stato modificato"
+    return 1
+  fi
+  _st_undo_push _st_put_policy "$ST_ACC_ID" "$ST_PID" "$ST_HOST" "${all_emails[@]}"
+  if ! _st_sshd_reapply "${keep_names[@]}"; then
+    ST_ERR="configurazione di sshd non riuscita: policy e sshd rimasti com'erano"
+    log "accesso SSH: $ST_ERR"
+    _st_rollback
+    return 1
+  fi
+  _st_undo_push _st_sshd_reapply "${all_names[@]}"
+  rc=0
+  st_user_delete "$name" || rc=$?
+  if ((rc != 0)); then
+    ST_ERR="eliminazione dell'utente $name non riuscita: ripristinato l'accesso di prima (dettagli nel log)"
+    log "accesso SSH: $ST_ERR"
+    _st_rollback
+    return 1
+  fi
+  ST_UNDO=()
+  # L'utente non c'è più: se lo stato non si scrive non c'è nulla da annullare,
+  # solo da dire (status segnalerà la differenza).
+  if ! st_state_write "$(jq --arg e "$email" '.users |= map(select(.email != $e))' <<<"$ST_S")"; then
+    ST_ERR="l'utente $name è stato eliminato ma lo stato dell'accesso SSH non si è aggiornato"
+    return 1
+  fi
+  ST_USER="$name"
+  log "accesso SSH: eliminato l'utente $name"
+}
+
+# st_set_sudo EMAIL SUDO — scrive o toglie il sudoers di quella persona.
+st_set_sudo() {
+  local sudo="${2:-}" email name entry old rc=0
+  ST_ERR="" ST_USER=""
+  [[ "$sudo" == true || "$sudo" == false ]] || {
+    ST_ERR="sudo deve essere true o false"
+    return 1
+  }
+  _st_person "${1:-}" || return 1
+  email="$ST_PEMAIL"
+  _st_require_state || return 1
+  jq -e '(.users | type) == "array"' >/dev/null 2>&1 <<<"$ST_S" || {
+    ST_ERR="l'accesso SSH è di una versione precedente (senza utenti): disattivalo e attivalo di nuovo"
+    return 1
+  }
+  entry="$(jq -c --arg e "$email" '.users[] | select(.email == $e)' <<<"$ST_S")"
+  [[ -n "$entry" ]] || {
+    ST_ERR="$email non è tra le persone autorizzate"
+    return 1
+  }
+  name="$(jq -r .user <<<"$entry")"
+  old="$(jq -r '.sudo' <<<"$entry")"
+  st_valid_name "$name" || {
+    ST_ERR="stato dell'accesso SSH non valido"
+    return 1
+  }
+  # sudo solo a un utente che è nello stato E ha il nostro GECOS.
+  st_user_ours "$name" || rc=$?
+  if ((rc != 0)); then
+    ST_ERR="l'utente $name non esiste più o non è stato creato dall'accesso SSH: sudo non modificato"
+    return 1
+  fi
+  if ! st_sudo_set "$name" "$sudo"; then
+    ST_ERR="configurazione di sudo per $name non riuscita"
+    return 1
+  fi
+  if ! st_state_write "$(jq --arg e "$email" --argjson s "$sudo" \
+    '.users |= map(if .email == $e then .sudo = $s else . end)' <<<"$ST_S")"; then
+    # Stato e sudoers devono dire la stessa cosa: si rimette quello di prima.
+    st_sudo_set "$name" "$old" || log "ATTENZIONE: sudo di $name non ripristinato"
+    ST_ERR="impossibile aggiornare lo stato dell'accesso SSH"
+    return 1
+  fi
+  ST_USER="$name"
+  log "accesso SSH: sudo di $name = $sudo"
 }
 
 # st_set_host LABEL — sposta l'accesso su LABEL.<zona>. Il vecchio nome esce
@@ -1024,8 +1218,8 @@ st_set_host() {
 # connesso. Un pezzo già assente si salta; al primo errore vero ci si ferma e lo
 # stato resta, così un nuovo tentativo riparte da dove si era arrivati.
 st_disable() {
-  local acc zid tid aid pid did user
-  local -a names
+  local acc zid tid aid pid did u rc
+  local -a names users
   local pname
   ST_ERR=""
   if [[ ! -f "$SSHTUNNEL_STATE" ]]; then
@@ -1040,7 +1234,6 @@ st_disable() {
   aid="$(jq -r '.app_id // empty' <<<"$ST_S")"
   pid="$(jq -r '.policy_id // empty' <<<"$ST_S")"
   did="$(jq -r '.dns_id // empty' <<<"$ST_S")"
-  user="$(jq -r '.user // empty' <<<"$ST_S")"
   if [[ -n "$did" ]] && ! _st_rm_dns "$zid" "$did"; then
     _st_fail "cancellazione del record DNS non riuscita"
     return 1
@@ -1066,17 +1259,37 @@ st_disable() {
     _st_fail "cancellazione del tunnel non riuscita"
     return 1
   fi
-  # Drop-in e CA se ne vanno comunque; i principal sono quelli degli utenti in
-  # elenco (più il file dell'utente dell'installazione delle versioni precedenti).
+  # Drop-in, CA e principal se ne vanno comunque. Gli utenti Linux sono solo quelli
+  # in "users" dello stato (e con il nostro GECOS, lo controlla st_user_delete):
+  # le email e l'utente di uno stato 1.10.0 servono soltanto a togliere i vecchi
+  # principal, mai a eliminare utenti.
   names=()
-  [[ -z "$user" ]] || names+=("$user")
+  users=()
+  while IFS= read -r pname; do
+    if [[ -n "$pname" ]] && st_valid_name "$pname"; then
+      names+=("$pname")
+      users+=("$pname")
+    fi
+  done < <(jq -r '.users[]?.user' <<<"$ST_S")
   while IFS= read -r pname; do
     if [[ -n "$pname" ]] && st_valid_name "$pname"; then names+=("$pname"); fi
-  done < <(jq -r '.emails[]? | split("@")[0] | ascii_downcase' <<<"$ST_S")
+  done < <(jq -r '(.user // empty), (.emails[]? | split("@")[0] | ascii_downcase)' <<<"$ST_S")
   if ((${#names[@]})) && ! st_sshd_remove "${names[@]}"; then
     ST_ERR="rimozione della configurazione di sshd non riuscita"
     return 1
   fi
+  for u in "${users[@]}"; do
+    rc=0
+    st_user_delete "$u" || rc=$?
+    case "$rc" in
+      0) ;;
+      2) log "accesso SSH: l'utente $u non è stato creato dall'accesso SSH: lasciato com'è" ;;
+      *)
+        ST_ERR="eliminazione dell'utente $u non riuscita: riprova la disattivazione"
+        return 1
+        ;;
+    esac
+  done
   rm -f "${SSHTUNNEL_STATE:?}"
   log "accesso SSH disattivato"
 }
@@ -1086,7 +1299,7 @@ st_disable() {
 # {ok:false, error} e 1. drift elenca i pezzi registrati ma spariti.
 st_status_json() {
   local missing rc=0 zt=false otp=false enabled=false service=missing cver="" tstatus=""
-  local host="" emails="[]" user zid did aid tid pid app_gone=0 zrc
+  local host="" ulist="[]" zid did aid tid pid app_gone=0 zrc u urc
   local -a drift=()
   if [[ "$(_st_manifest .cloudflare.enabled)" != true ]]; then
     printf '{"ok":true,"cloudflare":false}\n'
@@ -1122,12 +1335,10 @@ st_status_json() {
   if command -v cloudflared >/dev/null 2>&1; then
     cver="$(cloudflared --version 2>/dev/null | awk '{print $3; exit}' || true)"
   fi
-  user="$(_st_manifest .admin_user)"
   if _st_require_state; then
     enabled=true
     host="$(jq -r '.host // empty' <<<"$ST_S")"
-    emails="$(jq -c '.emails // []' <<<"$ST_S")"
-    user="$(jq -r --arg u "$user" '.user // $u' <<<"$ST_S")"
+    ulist="$(jq -c '.users // []' <<<"$ST_S")"
     zid="$(jq -r '.zone_id // empty' <<<"$ST_S")"
     did="$(jq -r '.dns_id // empty' <<<"$ST_S")"
     aid="$(jq -r '.app_id // empty' <<<"$ST_S")"
@@ -1149,17 +1360,30 @@ st_status_json() {
       drift+=(tunnel)
     fi
     if [[ "$service" == missing ]]; then drift+=(service); fi
+    # Stato 1.10.0 (senza "users") o utente dello stato sparito/non più nostro.
+    if ! jq -e '(.users | type) == "array"' >/dev/null 2>&1 <<<"$ST_S"; then
+      drift+=(users)
+    else
+      while IFS= read -r u; do
+        urc=0
+        st_user_ours "$u" || urc=$?
+        if ((urc != 0)); then
+          drift+=(users)
+          break
+        fi
+      done < <(jq -r '.users[].user' <<<"$ST_S")
+    fi
   fi
   ST_ERR=""
   jq -nc --arg zone "$ST_ZONE" --arg missing "$missing" --argjson zt "$zt" --argjson otp "$otp" \
-    --argjson enabled "$enabled" --arg host "$host" --argjson emails "$emails" --arg user "$user" \
+    --argjson enabled "$enabled" --arg host "$host" --argjson users "$ulist" \
     --arg service "$service" --arg cver "$cver" --arg ts "$tstatus" \
     '($missing | split("\n")) as $m
     | {ok: true, cloudflare: true, zone: $zone,
        perms: {tunnel: ($m | index("tunnel") == null), access: ($m | index("access") == null),
                idp: ($m | index("idp") == null)},
        zerotrust: $zt, otp: $otp, enabled: $enabled,
-       host: (if $host == "" then null else $host end), emails: $emails, user: $user,
+       host: (if $host == "" then null else $host end), users: $users,
        service: $service, cloudflared_version: (if $cver == "" then null else $cver end),
        tunnel_status: (if $ts == "" then null else $ts end), drift: $ARGS.positional}' \
     --args "${drift[@]}"

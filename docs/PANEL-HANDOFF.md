@@ -82,11 +82,12 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | `/etc/cron.d/vps-site-<slug>` | cron di WordPress di un sito (al posto di wp-cron via web) |
 | `/etc/logrotate.d/vps-site-site_<slug>` | rotazione dei log di un sito (nota SP2a rimandata: ruota come root, i log PHP in `logs/php/` con `su`) |
 | `/etc/logrotate.d/vps` | rotazione settimanale (8 copie, compresse) di `vps-tools.log`, `vps-installer.log`, `msmtp.log` e dei log del pannello (`<radice>/logs/*.log`, come `panel`); riscritto da `--tools-only` e `vps-panel-install` (installer ≥ 1.9.0) |
-| `/opt/vps/ssh-tunnel.json` | stato dell'accesso SSH dal browser (installer ≥ 1.10.0): host, id Cloudflare di tunnel, app, policy, record DNS e provider OTP, email, utente; non contiene segreti. Esiste solo con l'accesso attivo |
+| `/opt/vps/ssh-tunnel.json` | stato dell'accesso SSH dal browser (installer ≥ 1.10.0): host, id Cloudflare di tunnel, app, policy, record DNS e provider OTP, `users: [{email, user, sudo}]` (installer ≥ 1.11.0; la 1.10.0 aveva `emails` e `user`); non contiene segreti. Esiste solo con l'accesso attivo |
 | `/opt/vps/secrets/cf-tunnel.env` | `root:root` 600: `TUNNEL_TOKEN` per `cloudflared` |
 | `/etc/ssh/sshd_config.d/20-vps-cfaccess.conf` | drop-in di sshd per l'accesso con certificato breve della CA di Cloudflare Access |
 | `/etc/ssh/vps-cf-ca.pub` | chiave pubblica della CA di Access (`TrustedUserCAKeys`) |
-| `/etc/ssh/vps-cf-principals/` | un file per utente con i principal ammessi (la parte prima della `@` delle email) |
+| `/etc/ssh/vps-cf-principals/` | un file per utente creato dall'accesso SSH, con dentro il proprio nome (la parte prima della `@` dell'email) |
+| `/etc/sudoers.d/vps-ssh-<utente>` | `<utente> ALL=(ALL) NOPASSWD:ALL`, 440 root, solo per chi ha `sudo` (installer ≥ 1.11.0) |
 | `/etc/systemd/system/vps-cloudflared.service` | servizio di `cloudflared` (tunnel verso `ssh://localhost`) |
 | `/etc/apt/apt.conf.d/90vps-cloudflared` | hook apt (`DPkg::Post-Invoke`): riavvia `vps-cloudflared` dopo ogni aggiornamento del pacchetto; tolto con la disattivazione |
 | apt source di `cloudflared` (repository `pkg.cloudflare.com`, suite `any`) | installato con l'accesso SSH; origine aggiunta agli aggiornamenti automatici (`52vps-unattended`) |
@@ -352,17 +353,22 @@ Fornito dall'installer v1.9.0 (eseguito dal pannello, in sudoers):
 
 **Cloudflare è obbligatorio quando la VPS è preparata per il pannello** (wizard, installer ≥ 1.10.0): il pannello e l'accesso SSH dipendono dalla zona e dal token.
 
-Fornito dall'installer v1.10.0 (eseguito dal pannello, in sudoers): `vps-ssh-tunnel`, accesso SSH dal browser con Cloudflare Tunnel + Access (un nome tipo `ssh-xxxxxx.<zona>`, login con codice via email, certificato SSH breve). I comandi che cambiano la macchina (`enable`, `set-emails`, `set-host`, `disable`) si rilanciano in un'unità systemd (`/etc/` è di sola lettura per PHP-FPM) e prendono un lock (`un'altra operazione sull'accesso SSH è in corso`). Dopo un errore in questi comandi tutto è annullato.
+Fornito dall'installer v1.11.0 (eseguito dal pannello, in sudoers): `vps-ssh-tunnel`, accesso SSH dal browser con Cloudflare Tunnel + Access (un nome tipo `ssh-xxxxxx.<zona>`, login con codice via email, certificato SSH breve). I comandi che cambiano la macchina (`enable`, `add-user`, `remove-user`, `set-sudo`, `set-host`, `disable`) si rilanciano in un'unità systemd (`/etc/` è di sola lettura per PHP-FPM) e prendono un lock (`un'altra operazione sull'accesso SSH è in corso`). Dopo un errore in questi comandi tutto è annullato.
 
 | Comando | Risposta |
 |---|---|
 | `vps-ssh-tunnel status` | `{"ok":true,"cloudflare":bool,"zone","perms":{"tunnel","access","idp"},"zerotrust":bool,"otp":bool,"enabled":bool,"host":str\|null,"emails":[...],"user","service":"active"\|"inactive"\|"missing","cloudflared_version":str\|null,"tunnel_status":str\|null,"drift":["dns"\|"app"\|"tunnel"\|"service"]}`. Con Cloudflare spento: `{"ok":true,"cloudflare":false}`. Cloudflare non risponde: `{"ok":false,"error"}` |
 | `vps-ssh-tunnel random` | `{"ok":true,"label":"ssh-xxxxxx"}`: nome non indovinabile (il pannello lo chiama prima di `enable`) |
 | `vps-ssh-tunnel check-host LABEL` | `{"ok":true,"host","free":bool,"reason":str\|null}`; `reason`: `usato da un sito`, `esiste già un record DNS`. Con etichetta non valida: `{"ok":true,"host":null,"free":false,"reason":"nome non valido"}` |
-| `vps-ssh-tunnel enable` | stdin `{"label":"...","emails":"a@x.it, b@y.it"}` (1-5 email; **`label` obbligatorio**, mancante o vuoto = errore) → `{"ok":true,"host"}` |
-| `vps-ssh-tunnel set-emails` | stdin `{"emails":"..."}` → `{"ok":true,"emails":[...]}` |
+| `vps-ssh-tunnel enable` | stdin `{"label":"...","email":"a@x.it","sudo":true}` (**`label` obbligatorio**, mancante o vuoto = errore; `sudo` deve essere un booleano JSON) → `{"ok":true,"host"}`. Crea l'utente Linux dell'email |
+| `vps-ssh-tunnel add-user` | stdin `{"email":"b@y.it","sudo":false}` → `{"ok":true,"user"}`. Rifiuta: 6ª persona (`massimo 5 persone`), nome già in elenco (`c'è già una persona con il nome utente b`), utente esistente non creato da noi, nome non valido. L'email entra nella policy Access per ultima |
+| `vps-ssh-tunnel remove-user` | stdin `{"email":"b@y.it"}` → `{"ok":true,"user"}`. Rifiuta l'ultima persona (`l'ultima persona non si può eliminare: per togliere tutto usa Disattiva`). L'email esce dalla policy per prima; se questo fallisce non si tocca nient'altro |
+| `vps-ssh-tunnel set-sudo` | stdin `{"email":"b@y.it","sudo":true}` → `{"ok":true,"user","sudo"}` |
+| `vps-ssh-tunnel set-emails` | **non esiste più** (1.11.0): errore d'uso. Usare `add-user` / `remove-user` |
 | `vps-ssh-tunnel set-host LABEL` | `{"ok":true,"from","host"}` |
-| `vps-ssh-tunnel disable` | `{"ok":true}` |
+| `vps-ssh-tunnel disable` | `{"ok":true}`: toglie anche tutti gli utenti dello stato (non quelli estranei) |
+
+Utenti: ogni email autorizzata ha un utente Linux con il nome della parte prima della `@` (minuscola, `^[a-z_][a-z0-9_.-]{0,31}$`, non finisce con `.`), creato con `useradd -m -s /bin/bash -c vps-ssh-tunnel`, senza password né `authorized_keys`: si entra solo col certificato di Cloudflare. Lo strumento tocca solo utenti presenti in `users` **e** con GECOS `vps-ssh-tunnel`; un nome già usato da altri (`root`, `www-data`, l'utente dell'installazione) è rifiutato con `l'utente <nome> esiste già sulla VPS e non è stato creato dall'accesso SSH`. L'utente dell'installazione non cambia (chiave sulla porta SSH come prima). Il sudoers del pannello non cambia.
 
 Altre regole: `vps-site create` rifiuta il dominio uguale all'host dell'accesso SSH (`nome usato dall'accesso SSH`); `vps-cf-token set`, con l'accesso attivo, rifiuta un token che non gestisce tunnel e app (o se lo stato è incompleto): `l'accesso SSH è attivo: il nuovo token deve poterlo gestire, oppure disattivalo prima`. Nessun comando mette segreti in output o nei log.
 
@@ -399,4 +405,5 @@ Convenzione: DB e utenti dei siti hanno nome `site_<slug>` (es. `site_miosito_it
 - [x] **Stato server:** fatto (Plancia 2.5.0): dashboard da `vps-status` e `vps-monitor status`, pagina Avvisi con `vps-monitor config`/`test`.
 - [x] **Sicurezza:** fatto (Plancia 2.9.0 + installer 1.9.0): pagina Fail2ban, IP bannati e sblocco. Usa `vps-f2b`.
 - [x] **Accesso SSH:** lato installer fatto (1.10.0, `vps-ssh-tunnel`); la pagina nel pannello è il sotto-progetto 8. Cloudflare Tunnel + Access, con guida nel pannello.
+- [x] **Accesso SSH, utenti per email:** installer 1.11.0 (`add-user`, `remove-user`, `set-sudo`; `set-emails` tolto). Motivo: il terminale nel browser di Cloudflare entra da solo con il nome utente uguale alla parte dell'email prima della `@`, e il certificato vale solo per quel nome; mappare tutte le email sull'utente dell'installazione non funziona (dopo il tentativo fallito Cloudflare chiede nome utente e password). Quindi un utente Linux per ogni email, con `sudo` scelto per persona. Spec: `vps-panel/Documenti/PIANO/2026-10-27-vps-sp7b-utenti-ssh-design.md`; pagina nel pannello: Plancia 2.11.0.
 - [x] **Pulizia log:** fatto lato installer: log dei siti in `vps-site-<slug>` (dalla 1.2), log di sistema e del pannello in `/etc/logrotate.d/vps` (1.9.0). Nel pannello la pagina Registri svuota i canali a mano.

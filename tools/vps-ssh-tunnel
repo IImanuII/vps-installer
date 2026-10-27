@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # vps-ssh-tunnel — accesso SSH dal browser (Cloudflare Tunnel + Access):
-#   status | random | check-host LABEL | enable | set-emails | set-host LABEL | disable
-# enable e set-emails leggono un JSON da stdin. Contratto in docs/PANEL-HANDOFF.md.
-usage="uso: vps-ssh-tunnel status|random|check-host LABEL|enable|set-emails|set-host LABEL|disable (JSON da stdin per enable e set-emails)"
+#   status | random | check-host LABEL | enable | add-user | remove-user | set-sudo
+#   | set-host LABEL | disable
+# enable, add-user, remove-user e set-sudo leggono un JSON da stdin. Contratto in
+# docs/PANEL-HANDOFF.md.
+usage="uso: vps-ssh-tunnel status|random|check-host LABEL|enable|add-user|remove-user|set-sudo|set-host LABEL|disable (JSON da stdin per enable, add-user, remove-user e set-sudo)"
 
 # I comandi che cambiano la macchina scrivono in /etc (sshd, unità systemd, apt):
 # PHP-FPM gira con ProtectSystem=full, dove /etc è in sola lettura, e sudo ne
@@ -10,7 +12,7 @@ usage="uso: vps-ssh-tunnel status|random|check-host LABEL|enable|set-emails|set-
 # (come vps-site): stdin, stdout e codice d'uscita passano intatti. Il percorso
 # è assoluto e fisso, mai preso dall'ambiente.
 case "${1:-}" in
-  enable | set-emails | set-host | disable)
+  enable | add-user | remove-user | set-sudo | set-host | disable)
     if [[ -n "${SUDO_USER:-}" && -z "${VPS_SSHT_VIA_SYSTEMD:-}" ]]; then
       exec systemd-run --wait --pipe --collect --quiet --service-type=exec \
         --setenv=VPS_SSHT_VIA_SYSTEMD=1 /opt/vps/bin/vps-ssh-tunnel "$@"
@@ -51,7 +53,14 @@ lock_or_die() {
 
 # stdin_field CAMPO — campo del JSON letto da stdin (già in $dati); stringa o elenco.
 stdin_field() {
-  jq -r --arg k "$1" '.[$k] // "" | if type == "array" then join(",") else tostring end' <<<"$dati"
+  # L'operatore "//" scambierebbe false per "mancante": sudo:false deve restare "false".
+  jq -r --arg k "$1" '.[$k] | if . == null then "" elif type == "array" then join(",") else tostring end' <<<"$dati"
+}
+
+# need_sudo_bool — "sudo" deve essere un booleano JSON vero: "false" come stringa
+# o 0 non diventano mai un permesso (né un rifiuto) per equivoco.
+need_sudo_bool() {
+  jq -e '(.sudo | type) == "boolean"' >/dev/null 2>&1 <<<"$dati" || json_err "sudo deve essere true o false"
 }
 
 # read_json — il JSON da stdin in $dati (oggetto, al massimo 4 KB).
@@ -97,17 +106,33 @@ case "${1:-}" in
     label="$(stdin_field label)"
     # Il pannello chiama prima "random": niente generazione silenziosa qui.
     [[ -n "$label" ]] || json_err "nome mancante"
-    emails="$(stdin_field emails)"
-    if ! st_enable "$label" "$emails" >&2; then json_err "$ST_ERR"; fi
+    need_sudo_bool
+    if ! st_enable "$label" "$(stdin_field email)" "$(stdin_field sudo)" >&2; then json_err "$ST_ERR"; fi
     json_ok --arg h "$(st_state_get host)" '{ok: true, host: $h}'
     ;;
-  set-emails)
+  add-user)
     [[ $# -eq 1 ]] || json_err "$usage"
     lock_or_die
     read_json
-    emails="$(stdin_field emails)"
-    if ! st_set_emails "$emails" >&2; then json_err "$ST_ERR"; fi
-    json_ok --argjson e "$(jq -c '.emails // []' "$SSHTUNNEL_STATE")" '{ok: true, emails: $e}'
+    need_sudo_bool
+    if ! st_add_user "$(stdin_field email)" "$(stdin_field sudo)" >&2; then json_err "$ST_ERR"; fi
+    json_ok --arg u "$ST_USER" '{ok: true, user: $u}'
+    ;;
+  remove-user)
+    [[ $# -eq 1 ]] || json_err "$usage"
+    lock_or_die
+    read_json
+    if ! st_remove_user "$(stdin_field email)" >&2; then json_err "$ST_ERR"; fi
+    json_ok --arg u "$ST_USER" '{ok: true, user: $u}'
+    ;;
+  set-sudo)
+    [[ $# -eq 1 ]] || json_err "$usage"
+    lock_or_die
+    read_json
+    need_sudo_bool
+    sudo_val="$(stdin_field sudo)"
+    if ! st_set_sudo "$(stdin_field email)" "$sudo_val" >&2; then json_err "$ST_ERR"; fi
+    json_ok --arg u "$ST_USER" --argjson s "$sudo_val" '{ok: true, user: $u, sudo: $s}'
     ;;
   set-host)
     [[ $# -eq 2 ]] || json_err "$usage"
