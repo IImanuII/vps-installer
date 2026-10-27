@@ -7,8 +7,11 @@ setup() {
   export SSH_CF_CA="$BATS_TEST_TMPDIR/ssh/vps-cf-ca.pub"
   export SSH_CF_PRINCIPALS="$BATS_TEST_TMPDIR/ssh/vps-cf-principals"
   export SSHTUNNEL_STATE="$VPS_OPT/ssh-tunnel.json"
+  export SUDOERS_D="$BATS_TEST_TMPDIR/sudoers.d"
+  export PASSWD_FAKE="$BATS_TEST_TMPDIR/passwd"
   export CALLS="$BATS_TEST_TMPDIR/calls"
-  mkdir -p "$SSHD_CONFIG_D" "$BATS_TEST_TMPDIR/ssh"
+  mkdir -p "$SSHD_CONFIG_D" "$BATS_TEST_TMPDIR/ssh" "$SUDOERS_D"
+  : >"$PASSWD_FAKE"
   : >"$CALLS"
   # shellcheck disable=SC2016
   make_stub sshd 'echo "sshd $*" >>"$CALLS"; [ "${SSHD_FAIL:-0}" = 1 ] && exit 1; exit 0'
@@ -54,7 +57,7 @@ exit 0'
 }
 
 @test "st_sshd_apply scrive i tre file e ricarica" {
-  run st_sshd_apply manu "ssh-ed25519 AAAA ca" manu
+  run st_sshd_apply "ssh-ed25519 AAAA ca" manu
   [ "$status" -eq 0 ]
   [ -f "$SSHD_CONFIG_D/20-vps-cfaccess.conf" ]
   grep -q TrustedUserCAKeys "$SSHD_CONFIG_D/20-vps-cfaccess.conf"
@@ -66,7 +69,7 @@ exit 0'
 
 @test "st_sshd_apply con sshd -t che fallisce ripristina" {
   echo VECCHIO >"$SSHD_CONFIG_D/20-vps-cfaccess.conf"
-  SSHD_FAIL=1 run st_sshd_apply manu "ssh-ed25519 AAAA ca" manu
+  SSHD_FAIL=1 run st_sshd_apply "ssh-ed25519 AAAA ca" manu
   [ "$status" -eq 1 ]
   [ "$(cat "$SSHD_CONFIG_D/20-vps-cfaccess.conf")" = VECCHIO ]
   [ ! -e "$SSH_CF_CA" ]
@@ -75,7 +78,7 @@ exit 0'
 }
 
 @test "st_sshd_remove toglie i file e ricarica" {
-  st_sshd_apply manu "ssh-ed25519 AAAA ca" manu
+  st_sshd_apply "ssh-ed25519 AAAA ca" manu
   : >"$CALLS"
   run st_sshd_remove manu
   [ "$status" -eq 0 ]
@@ -106,9 +109,9 @@ exit 0'
 }
 
 @test "st_sshd_apply senza principal o con utente non valido ritorna 1 senza toccare nulla" {
-  run st_sshd_apply manu "ssh-ed25519 AAAA ca"; [ "$status" -eq 1 ]
-  run st_sshd_apply manu "ssh-ed25519 AAAA ca" ""; [ "$status" -eq 1 ]
-  run st_sshd_apply "../x" "ssh-ed25519 AAAA ca" manu; [ "$status" -eq 1 ]
+  run st_sshd_apply "ssh-ed25519 AAAA ca"; [ "$status" -eq 1 ]
+  run st_sshd_apply "ssh-ed25519 AAAA ca" ""; [ "$status" -eq 1 ]
+  run st_sshd_apply "ssh-ed25519 AAAA ca" "../x"; [ "$status" -eq 1 ]
   run st_sshd_remove "../x"; [ "$status" -eq 1 ]
   [ ! -e "$SSH_CF_CA" ]
   [ ! -e "$SSH_CF_PRINCIPALS" ]
@@ -119,7 +122,7 @@ exit 0'
   mkdir -p "$SSH_CF_PRINCIPALS"
   echo CA-VECCHIA >"$SSH_CF_CA"
   echo vecchio >"$SSH_CF_PRINCIPALS/manu"
-  SSHD_FAIL=1 run st_sshd_apply manu "ssh-ed25519 AAAA ca" manu
+  SSHD_FAIL=1 run st_sshd_apply "ssh-ed25519 AAAA ca" manu
   [ "$status" -eq 1 ]
   [ "$(cat "$SSH_CF_CA")" = CA-VECCHIA ]
   [ "$(cat "$SSH_CF_PRINCIPALS/manu")" = vecchio ]
@@ -130,7 +133,7 @@ exit 0'
   echo CA-VECCHIA >"$SSH_CF_CA"
   echo vecchio >"$SSH_CF_PRINCIPALS/manu"
   chmod 555 "$SSHD_CONFIG_D"
-  TMPDIR="$BATS_TEST_TMPDIR/tmp" run st_sshd_apply manu "ssh-ed25519 AAAA ca" manu
+  TMPDIR="$BATS_TEST_TMPDIR/tmp" run st_sshd_apply "ssh-ed25519 AAAA ca" manu
   chmod 755 "$SSHD_CONFIG_D"
   [ "$status" -eq 1 ]
   [ "$(cat "$SSH_CF_CA")" = CA-VECCHIA ]
@@ -301,7 +304,8 @@ in_order() {
   pol="$(grep -- '--data' "$CALLS" | grep '"decision":"allow"' | head -1)"
   [[ "$pol" == *'{"email":{"email":"manu@x.it"}}'* ]]
   [[ "$pol" == *'{"email":{"email":"altro@y.it"}}'* ]]
-  [ "$(cat "$SSH_CF_PRINCIPALS/manu")" = $'manu\naltro' ]
+  [ "$(cat "$SSH_CF_PRINCIPALS/manu")" = manu ]
+  [ "$(cat "$SSH_CF_PRINCIPALS/altro")" = altro ]
 }
 
 @test "st_enable: One-time PIN già presente → nessuna creazione" {
@@ -372,7 +376,8 @@ in_order() {
   [ "$status" -eq 0 ]
   grep -q "PUT /accounts/acc1/access/policies/pol1" "$CFLOG"
   grep -- '--data' "$CALLS" | grep -q '{"email":{"email":"altro@y.it"}}'
-  [ "$(cat "$SSH_CF_PRINCIPALS/manu")" = altro ]
+  [ "$(cat "$SSH_CF_PRINCIPALS/altro")" = altro ]
+  [ ! -e "$SSH_CF_PRINCIPALS/manu" ]
   [ "$(jq -c .emails "$SSHTUNNEL_STATE")" = '["altro@y.it"]' ]
 }
 
@@ -792,7 +797,7 @@ cli_env() {
 
 @test "vps-ssh-tunnel sotto sudo azzera i percorsi dell'ambiente" {
   t="$REPO_ROOT/tools/vps-ssh-tunnel"
-  grep -q 'SSHD_CONFIG_D SSH_CF_CA SSH_CF_PRINCIPALS SSHTUNNEL_STATE SSHTUNNEL_ENV SSHTUNNEL_LOCK' "$t"
+  grep -q 'SSHD_CONFIG_D SSH_CF_CA SSH_CF_PRINCIPALS SUDOERS_D SSHTUNNEL_STATE SSHTUNNEL_ENV SSHTUNNEL_LOCK' "$t"
   for v in SYSTEMD_DIR APT_SOURCES_D CLOUDFLARED_KEYRING CF_API_TOKEN SITES_DIR CF_API; do
     grep -q "$v" "$t"
   done
@@ -824,7 +829,7 @@ cli_env() {
   mkdir -p "$SSH_CF_PRINCIPALS"
   echo CA-VECCHIA >"$SSH_CF_CA"
   echo vecchio >"$SSH_CF_PRINCIPALS/manu"
-  RELOAD_FAIL=1 run st_sshd_apply manu "ssh-ed25519 AAAA ca" manu
+  RELOAD_FAIL=1 run st_sshd_apply "ssh-ed25519 AAAA ca" manu
   [ "$status" -eq 1 ]
   [ "$(cat "$SSH_CF_CA")" = CA-VECCHIA ]
   [ "$(cat "$SSH_CF_PRINCIPALS/manu")" = vecchio ]
@@ -837,7 +842,7 @@ cli_env() {
   mkdir -p "$SSH_CF_PRINCIPALS"
   echo CA-VECCHIA >"$SSH_CF_CA"
   cp() { return 1; }
-  run st_sshd_apply manu "ssh-ed25519 AAAA ca" manu
+  run st_sshd_apply "ssh-ed25519 AAAA ca" manu
   unset -f cp
   [ "$status" -eq 1 ]
   [ "$(cat "$SSH_CF_CA")" = CA-VECCHIA ]
@@ -945,4 +950,155 @@ cli_env() {
   st_set_host ssh-nuovo1 || rc=$?
   [ "$rc" -eq 1 ]
   [ ! -s "$CFLOG" ]
+}
+
+# --- utenti Linux e drop-in per più utenti (1.11.0) ---
+
+user_stubs() {
+  # getent legge un passwd finto: "nome:x:1000:1000:GECOS:/home/nome:/bin/bash".
+  # shellcheck disable=SC2016
+  make_stub getent '[ "$1" = passwd ] || exit 2; grep "^$2:" "$PASSWD_FAKE" || exit 2'
+  local c
+  for c in useradd usermod userdel loginctl pkill crontab atq atrm find; do
+    # shellcheck disable=SC2016
+    make_stub "$c" 'echo "$(basename "$0") $*" >>"$CALLS"; [ "${USERADD_FAIL:-0}" = 1 ] && [ "$(basename "$0")" = useradd ] && exit 1; [ "${USERMOD_FAIL:-0}" = 1 ] && [ "$(basename "$0")" = usermod ] && exit 1; exit 0'
+  done
+  # shellcheck disable=SC2016
+  make_stub visudo 'echo "visudo $*" >>"$CALLS"; [ "${VISUDO_FAIL:-0}" = 1 ] && exit 1; exit 0'
+}
+
+@test "st_user_name: prefisso minuscolo, rifiuta i non validi" {
+  run st_user_name Mario.Rossi@x.it
+  [ "$status" -eq 0 ]; [ "$output" = mario.rossi ]
+  run st_user_name 'mario+x@a.it'; [ "$status" -eq 1 ]
+  run st_user_name '.m@a.it'; [ "$status" -eq 1 ]
+  run st_user_name 'm.@a.it'; [ "$status" -eq 1 ]
+  run st_user_name '1abc@a.it'; [ "$status" -eq 1 ]
+  run st_user_name "$(printf 'a%.0s' {1..33})@a.it"; [ "$status" -eq 1 ]
+  run st_user_name "$(printf 'a%.0s' {1..32})@a.it"; [ "$status" -eq 0 ]
+}
+
+@test "st_parse_user normalizza e rifiuta" {
+  run st_parse_user "  Mario@X.it "
+  [ "$status" -eq 0 ]; [ "$output" = mario@x.it ]
+  run st_parse_user "x@"; [ "$status" -eq 1 ]
+}
+
+@test "st_user_ours: assente 1, nostro 0, estraneo 2" {
+  user_stubs
+  echo "mario:x:1001:1001:vps-ssh-tunnel:/home/mario:/bin/bash" >>"$PASSWD_FAKE"
+  echo "root:x:0:0:root:/root:/bin/bash" >>"$PASSWD_FAKE"
+  run st_user_ours anna; [ "$status" -eq 1 ]
+  run st_user_ours mario; [ "$status" -eq 0 ]
+  run st_user_ours root; [ "$status" -eq 2 ]
+}
+
+@test "st_user_create crea l'utente con password bloccata" {
+  user_stubs
+  run st_user_create mario
+  [ "$status" -eq 0 ]
+  grep -qx "useradd -m -s /bin/bash -c vps-ssh-tunnel mario" "$CALLS"
+  grep -qxF "usermod -p * mario" "$CALLS"
+}
+
+@test "st_user_create: useradd o usermod che falliscono → rc 1, nulla resta" {
+  user_stubs
+  USERADD_FAIL=1 run st_user_create mario
+  [ "$status" -eq 1 ]
+  ! grep -q "^usermod" "$CALLS"
+  : >"$CALLS"
+  USERMOD_FAIL=1 run st_user_create mario
+  [ "$status" -eq 1 ]
+  grep -qx "userdel -r mario" "$CALLS"
+}
+
+@test "st_user_delete di un utente estraneo → rc 2 senza toccare nulla" {
+  user_stubs
+  echo "root:x:0:0:root:/root:/bin/bash" >>"$PASSWD_FAKE"
+  run st_user_delete root
+  [ "$status" -eq 2 ]
+  ! grep -qE "^(userdel|pkill|loginctl|crontab)" "$CALLS"
+}
+
+@test "st_user_delete di un nostro utente: ordine e file sudoers" {
+  user_stubs
+  echo "mario:x:1001:1001:vps-ssh-tunnel:/home/mario:/bin/bash" >>"$PASSWD_FAKE"
+  echo "mario ALL=(ALL) NOPASSWD:ALL" >"$SUDOERS_D/vps-ssh-mario"
+  run st_user_delete mario
+  [ "$status" -eq 0 ]
+  [ ! -e "$SUDOERS_D/vps-ssh-mario" ]
+  expected=$'loginctl terminate-user mario\npkill -KILL -u mario\ncrontab -r -u mario\nuserdel -r mario'
+  [ "$(grep -E '^(loginctl|pkill|crontab|userdel)' "$CALLS")" = "$expected" ]
+}
+
+@test "st_user_delete di un utente assente è idempotente" {
+  user_stubs
+  run st_user_delete anna
+  [ "$status" -eq 0 ]
+  ! grep -q "^userdel" "$CALLS"
+}
+
+@test "st_sudo_set true scrive il file 440 validato, false lo toglie" {
+  user_stubs
+  run st_sudo_set mario true
+  [ "$status" -eq 0 ]
+  [ "$(stat -c %a "$SUDOERS_D/vps-ssh-mario")" = 440 ]
+  [ "$(cat "$SUDOERS_D/vps-ssh-mario")" = "mario ALL=(ALL) NOPASSWD:ALL" ]
+  grep -q "^visudo -cf" "$CALLS"
+  run st_sudo_set mario false
+  [ "$status" -eq 0 ]
+  [ ! -e "$SUDOERS_D/vps-ssh-mario" ]
+}
+
+@test "st_sudo_set con visudo che fallisce → rc 1, nessun file" {
+  user_stubs
+  VISUDO_FAIL=1 run st_sudo_set mario true
+  [ "$status" -eq 1 ]
+  [ -z "$(ls -A "$SUDOERS_D")" ]
+}
+
+@test "st_sshd_apply con più utenti: drop-in, principal, pulizia dei vecchi" {
+  mkdir -p "$SSH_CF_PRINCIPALS"
+  echo iimanuii >"$SSH_CF_PRINCIPALS/iimanuii"
+  run st_sshd_apply "ssh-ed25519 AAAA ca" mario anna
+  [ "$status" -eq 0 ]
+  d="$SSHD_CONFIG_D/20-vps-cfaccess.conf"
+  grep -qx "AllowUsers mario anna" "$d"
+  grep -qx "Match User mario,anna" "$d"
+  grep -qx "    AuthorizedKeysFile none" "$d"
+  grep -q "^TrustedUserCAKeys" "$d"
+  # Match per ultimo e uno solo; niente utente dell'installazione.
+  [ "$(grep -c '^Match' "$d")" -eq 1 ]
+  [ "$(tail -n 1 "$d")" = "    AuthorizedKeysFile none" ]
+  ! grep -q iimanuii "$d"
+  [ "$(cat "$SSH_CF_PRINCIPALS/mario")" = mario ]
+  [ "$(cat "$SSH_CF_PRINCIPALS/anna")" = anna ]
+  [ ! -e "$SSH_CF_PRINCIPALS/iimanuii" ]
+  grep -q "sshd -t" "$CALLS"
+  grep -q "systemctl reload ssh" "$CALLS"
+}
+
+@test "st_sshd_apply con sshd -t che fallisce ripristina anche i principal tolti" {
+  mkdir -p "$SSH_CF_PRINCIPALS"
+  echo iimanuii >"$SSH_CF_PRINCIPALS/iimanuii"
+  echo VECCHIO >"$SSHD_CONFIG_D/20-vps-cfaccess.conf"
+  echo CA-VECCHIA >"$SSH_CF_CA"
+  SSHD_FAIL=1 run st_sshd_apply "ssh-ed25519 AAAA ca" mario anna
+  [ "$status" -eq 1 ]
+  [ "$(cat "$SSH_CF_PRINCIPALS/iimanuii")" = iimanuii ]
+  [ ! -e "$SSH_CF_PRINCIPALS/mario" ]
+  [ ! -e "$SSH_CF_PRINCIPALS/anna" ]
+  [ "$(cat "$SSHD_CONFIG_D/20-vps-cfaccess.conf")" = VECCHIO ]
+  [ "$(cat "$SSH_CF_CA")" = CA-VECCHIA ]
+  ! grep -q "reload" "$CALLS"
+}
+
+@test "st_sshd_remove con più nomi toglie drop-in, CA e i loro principal" {
+  st_sshd_apply "ssh-ed25519 AAAA ca" mario anna
+  run st_sshd_remove mario anna
+  [ "$status" -eq 0 ]
+  [ ! -e "$SSHD_CONFIG_D/20-vps-cfaccess.conf" ]
+  [ ! -e "$SSH_CF_CA" ]
+  [ ! -e "$SSH_CF_PRINCIPALS/mario" ]
+  [ ! -e "$SSH_CF_PRINCIPALS/anna" ]
 }

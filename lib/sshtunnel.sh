@@ -13,6 +13,7 @@
 : "${SSHD_CONFIG_D:=/etc/ssh/sshd_config.d}"
 : "${SSH_CF_CA:=/etc/ssh/vps-cf-ca.pub}"
 : "${SSH_CF_PRINCIPALS:=/etc/ssh/vps-cf-principals}"
+: "${SUDOERS_D:=/etc/sudoers.d}"
 : "${SSHTUNNEL_STATE:=$VPS_OPT/ssh-tunnel.json}"
 : "${SSHTUNNEL_ENV:=$VPS_OPT/secrets/cf-tunnel.env}"
 
@@ -86,22 +87,134 @@ st_sshd_test() {
   "$bin" -t >/dev/null 2>&1
 }
 
-# st_sshd_files USER — i tre file toccati, uno per riga.
-st_sshd_files() {
-  printf '%s\n' "$SSHD_CONFIG_D/$ST_DROPIN" "$SSH_CF_CA" "$SSH_CF_PRINCIPALS/$1"
+# st_valid_name NOME — nome utente Linux ammesso: stessa regola della Plancia
+# (^[a-z_][a-z0-9_.-]{0,31}$, senza punto finale). Finisce in percorsi e in
+# sshd_config, quindi niente scorciatoie.
+st_valid_name() {
+  [[ "$1" =~ ^[a-z_][a-z0-9_.-]{0,31}$ && "$1" != *. ]]
 }
 
-# st_sshd_snapshot DIR USER — copia i file che esistono; "N.none" per quelli assenti.
+# st_parse_user EMAIL — email normalizzata (trim, minuscola, valida, ≤ 254).
+st_parse_user() {
+  local e
+  e="$(trim "$1")"
+  e="${e,,}"
+  ((${#e} <= 254)) && valid_email "$e" || return 1
+  printf '%s\n' "$e"
+}
+
+# st_user_name EMAIL — Cloudflare accede con utente = prefisso dell'email (e
+# principal uguale): da qui il nome dell'utente Linux. 1 se non è un nome valido.
+st_user_name() {
+  local e
+  e="$(st_parse_user "$1")" || return 1
+  st_valid_name "${e%%@*}" || return 1
+  printf '%s\n' "${e%%@*}"
+}
+
+# st_user_ours NOME — 0 se esiste ed è stato creato da noi (GECOS vps-ssh-tunnel),
+# 1 se non esiste, 2 se esiste ma è di qualcun altro: quest'ultimo non si tocca mai.
+st_user_ours() {
+  local line
+  line="$(getent passwd "$1" 2>/dev/null)" || return 1
+  [[ -n "$line" ]] || return 1
+  [[ "$(cut -d: -f5 <<<"$line")" == vps-ssh-tunnel ]] || return 2
+}
+
+# st_user_create NOME — utente senza password né chiavi: si entra solo col
+# certificato breve di Cloudflare. Se un passo fallisce non resta nulla.
+st_user_create() {
+  st_valid_name "$1" || return 1
+  useradd -m -s /bin/bash -c vps-ssh-tunnel "$1" || return 1
+  # '*' impedisce il login con password ma non "blocca" l'account (con '!' sshd
+  # rifiuterebbe anche il certificato).
+  if ! usermod -p '*' "$1"; then
+    userdel -r "$1" || log "ATTENZIONE: utente $1 creato a metà e non rimosso"
+    return 1
+  fi
+}
+
+# st_user_delete NOME — elimina l'utente e tutto ciò che ha lasciato. Rifiuta
+# (rc 2) un utente che non abbiamo creato noi; se non esiste è già fatto.
+st_user_delete() {
+  local name="$1" rc=0 id
+  st_valid_name "$name" || return 1
+  st_user_ours "$name" || rc=$?
+  case "$rc" in
+    2) return 2 ;;
+    1)
+      rm -f "${SUDOERS_D:?}/vps-ssh-$name" "$SSH_CF_PRINCIPALS/$name"
+      return 0
+      ;;
+  esac
+  # Prima si fermano sessioni e processi, altrimenti userdel si rifiuta o
+  # lascia cose in giro. I comandi possono "fallire" se non c'è nulla da fare.
+  loginctl terminate-user "$name" || true
+  pkill -KILL -u "$name" || true
+  crontab -r -u "$name" 2>/dev/null || true
+  # Lavori at: l'ultimo campo di atq è l'utente.
+  while IFS= read -r id; do
+    if [[ -n "$id" ]]; then atrm "$id" || true; fi
+  done < <(atq 2>/dev/null | awk -v u="$name" '$NF == u { print $1 }')
+  # Un file di sua proprietà in /tmp resterebbe orfano e un UID riusato lo erediterebbe.
+  find /tmp /var/tmp /dev/shm -xdev -user "$name" -delete 2>/dev/null || true
+  rm -f "${SUDOERS_D:?}/vps-ssh-$name" "$SSH_CF_PRINCIPALS/$name"
+  userdel -r "$name" || return 1
+}
+
+# st_sudo_set NOME true|false — sudo senza password per NOME. Il file si scrive
+# in temporaneo e si sposta solo se visudo lo approva: un sudoers rotto
+# bloccherebbe sudo per tutti.
+st_sudo_set() {
+  local name="$1" f tmp
+  st_valid_name "$name" || return 1
+  f="${SUDOERS_D:?}/vps-ssh-$name"
+  case "$2" in
+    false)
+      rm -f "$f"
+      return 0
+      ;;
+    true) ;;
+    *) return 1 ;;
+  esac
+  mkdir -p "$SUDOERS_D" || return 1
+  # Il nome inizia con un punto: sudo ignora i file con il punto, quindi il
+  # temporaneo non è mai attivo prima della validazione.
+  tmp="$(mktemp "$SUDOERS_D/.vps-ssh.XXXXXX")" || return 1
+  if ! { printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$name" >"$tmp" &&
+    chmod 440 "$tmp" && own root:root "$tmp" &&
+    visudo -cf "$tmp" >/dev/null && mv -f "$tmp" "$f"; }; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+# st_sshd_files NOME... — i file toccati, uno per riga: drop-in, CA, i principal
+# dei NOME e quelli già presenti nella cartella (da togliere se non più in elenco).
+st_sshd_files() {
+  local f n
+  printf '%s\n' "$SSHD_CONFIG_D/$ST_DROPIN" "$SSH_CF_CA"
+  {
+    for n in "$@"; do printf '%s\n' "$SSH_CF_PRINCIPALS/$n"; done
+    for f in "$SSH_CF_PRINCIPALS"/*; do [[ -e "$f" ]] && printf '%s\n' "$f"; done
+  } | sort -u
+  return 0
+}
+
+# st_sshd_snapshot DIR NOME... — copia i file che esistono; "N.none" per quelli
+# assenti. L'elenco va in DIR/list: il ripristino usa quello, non ne calcola uno nuovo.
 st_sshd_snapshot() {
   local dir="$1" f i=0
+  shift
+  st_sshd_files "$@" >"$dir/list" || return 1
   while IFS= read -r f; do
     # Senza una copia fedele il ripristino non sarebbe possibile: meglio fermarsi.
     if [[ -e "$f" ]]; then cp -p "$f" "$dir/$i" || return 1; else : >"$dir/$i.none" || return 1; fi
     i=$((i + 1))
-  done < <(st_sshd_files "$2")
+  done <"$dir/list"
 }
 
-# st_sshd_restore DIR USER — rimette i file com'erano (o li toglie se non c'erano).
+# st_sshd_restore DIR — rimette i file com'erano (o li toglie se non c'erano).
 st_sshd_restore() {
   local dir="$1" f i=0
   while IFS= read -r f; do
@@ -112,59 +225,89 @@ st_sshd_restore() {
       cp -p "$dir/$i" "$f" || log "ripristino: impossibile ripristinare $f"
     fi
     i=$((i + 1))
-  done < <(st_sshd_files "$2")
+  done <"$dir/list"
 }
 
-# st_sshd_apply USER CA_PUBKEY PRINCIPAL... — sshd si fida della CA per USER.
+# st_sshd_conf NOME... — il drop-in: intestazione fissa (template) più, in fondo,
+# AllowUsers e il Match. Match per ultimo perché tutto ciò che lo segue sarebbe
+# condizionale. L'utente dell'installazione non compare: il suo AllowUsers è nel
+# file dell'installer (le righe AllowUsers si sommano) e le sue chiavi restano valide.
+st_sshd_conf() {
+  local names="$*" csv
+  csv="$(IFS=,; printf '%s' "$*")"
+  cat "$VPS_TEMPLATES/sshd-20-vps-cfaccess.conf"
+  printf 'AllowUsers %s\n' "$names"
+  printf 'Match User %s\n    AuthorizedKeysFile none\n' "$csv"
+}
+
+# _st_sshd_write CA NOME... — scrive CA, principal, drop-in e toglie i principal
+# di chi non è più in elenco. Funzione a parte: ogni errore è un return 1 e il
+# chiamante ripristina, senza uscite a metà.
+_st_sshd_write() {
+  local ca="$1" p f
+  shift
+  mkdir -p "$SSHD_CONFIG_D" "$SSH_CF_PRINCIPALS" "$(dirname "$SSH_CF_CA")" || return 1
+  # sshd legge i file come root, ma la cartella deve essere attraversabile.
+  chmod 755 "$SSH_CF_PRINCIPALS" || return 1
+  printf '%s\n' "$ca" | write_file "$SSH_CF_CA" 644 root:root || return 1
+  for p in "$@"; do
+    printf '%s\n' "$p" | write_file "$SSH_CF_PRINCIPALS/$p" 644 root:root || return 1
+  done
+  # Principal di utenti non più in elenco: sshd darebbe loro ancora accesso.
+  for f in "$SSH_CF_PRINCIPALS"/*; do
+    [[ -e "$f" ]] || continue
+    [[ " $* " == *" ${f##*/} "* ]] || rm -f "$f" || return 1
+  done
+  st_sshd_conf "$@" | write_file "$SSHD_CONFIG_D/$ST_DROPIN" 644 root:root
+}
+
+# st_sshd_apply CA_PUBKEY NOME... — sshd si fida della CA per questi utenti, ognuno
+# con il proprio principal; i principal di altri nomi vengono tolti.
 # Se "sshd -t" fallisce tutto torna com'era e sshd non viene ricaricato.
 st_sshd_apply() {
-  local user="$1" ca="$2" snap p n=0
-  shift 2
-  # L'utente finisce in un percorso; senza principal sshd rifiuterebbe tutti.
-  [[ "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || return 1
-  for p in "$@"; do [[ -n "$p" ]] && n=$((n + 1)); done
-  ((n >= 1)) || return 1
+  local ca="$1" snap p names=()
+  shift
+  for p in "$@"; do
+    # I nomi finiscono in percorsi e nella configurazione di sshd.
+    st_valid_name "$p" || return 1
+    names+=("$p")
+  done
+  # Senza utenti sshd rifiuterebbe tutti.
+  ((${#names[@]} >= 1)) || return 1
   snap="$(mktemp -d)" || return 1
   # Prima di scrivere qualunque cosa: se lo snapshot non è completo si esce
   # senza aver toccato sshd.
-  if ! st_sshd_snapshot "$snap" "$user"; then
+  if ! st_sshd_snapshot "$snap" "${names[@]}"; then
     rm -rf "$snap"
     log "snapshot della configurazione di sshd non riuscito: nulla è stato modificato."
     return 1
   fi
-  # Gruppo in un "if": un'unica scrittura fallita porta al ripristino, non a
-  # un'uscita a metà per "set -e" con file mezzi scritti e snapshot orfano.
-  # sshd legge i file come root, ma la cartella deve essere attraversabile.
-  if {
-    mkdir -p "$SSHD_CONFIG_D" "$SSH_CF_PRINCIPALS" "$(dirname "$SSH_CF_CA")" &&
-      chmod 755 "$SSH_CF_PRINCIPALS" &&
-      printf '%s\n' "$ca" | write_file "$SSH_CF_CA" 644 root:root &&
-      printf '%s\n' "$@" | write_file "$SSH_CF_PRINCIPALS/$user" 644 root:root &&
-      write_file "$SSHD_CONFIG_D/$ST_DROPIN" 644 root:root <"$VPS_TEMPLATES/sshd-20-vps-cfaccess.conf"
-  } && st_sshd_test; then
+  if _st_sshd_write "$ca" "${names[@]}" && st_sshd_test; then
     if systemctl reload ssh; then
       rm -rf "$snap"
       return 0
     fi
     # sshd -t era a posto ma il reload no: i file nuovi non devono restare su
     # disco (al prossimo riavvio sshd partirebbe con una configurazione mai provata).
-    st_sshd_restore "$snap" "$user"
+    st_sshd_restore "$snap"
     rm -rf "$snap"
     systemctl reload ssh || log "ripristino: anche il reload di sshd con la configurazione di prima è fallito"
     log "reload di sshd fallito: ripristinata la configurazione di prima."
     return 1
   fi
-  st_sshd_restore "$snap" "$user"
+  st_sshd_restore "$snap"
   rm -rf "$snap"
-  log "scrittura o "sshd -t" falliti: ripristinata la configurazione di prima."
+  log "scrittura o \"sshd -t\" falliti: ripristinata la configurazione di prima."
   return 1
 }
 
-# st_sshd_remove USER — toglie drop-in, CA e principal di USER; poi test e reload.
+# st_sshd_remove NOME... — toglie drop-in, CA e i principal dei NOME; poi test e reload.
 st_sshd_remove() {
-  local f
-  [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || return 1
-  while IFS= read -r f; do rm -f "$f"; done < <(st_sshd_files "$1")
+  local n
+  (($# >= 1)) || return 1
+  for n in "$@"; do st_valid_name "$n" || return 1; done
+  rm -f "$SSHD_CONFIG_D/$ST_DROPIN" "$SSH_CF_CA"
+  for n in "$@"; do rm -f "$SSH_CF_PRINCIPALS/$n"; done
   st_sshd_test || {
     log "sshd -t fallisce dopo la rimozione: controllare la configurazione."
     return 1
@@ -671,13 +814,13 @@ st_enable() {
   fi
   ca="$(jq -r '.result.public_key // empty' <<<"$ST_BODY")"
   mapfile -t principals < <(st_principals "${ST_EMAILS[@]}")
-  if [[ -z "$ca" ]] || ! st_sshd_apply "$user" "$ca" "${principals[@]}"; then
+  if [[ -z "$ca" ]] || ! st_sshd_apply "$ca" "${principals[@]}"; then
     ST_ERR="configurazione di sshd non riuscita: sshd è rimasto com'era"
     log "accesso SSH: $ST_ERR"
     _st_rollback
     return 1
   fi
-  _st_undo_push st_sshd_remove "$user"
+  _st_undo_push st_sshd_remove "${principals[@]}"
 
   # Solo ora il nome entra nel DNS.
   if ! _st_req POST "/zones/$ST_ZONE_ID/dns_records" "$(_st_cname_body "$host" "$tid")"; then
@@ -743,7 +886,7 @@ st_set_emails() {
     return 1
   }
   mapfile -t principals < <(st_principals "${ST_EMAILS[@]}")
-  if ! st_sshd_apply "$user" "$ca" "${principals[@]}"; then
+  if ! st_sshd_apply "$ca" "${principals[@]}"; then
     # sshd si è già rimesso a posto da solo (st_sshd_apply); resta la policy.
     if _st_put_policy "$acc" "$pid" "$host" "${old[@]}"; then
       ST_ERR="configurazione di sshd non riuscita: email e sshd rimasti com'erano"
@@ -839,6 +982,7 @@ st_set_host() {
 # stato resta, così un nuovo tentativo riparte da dove si era arrivati.
 st_disable() {
   local acc zid tid aid pid did user
+  local -a names
   ST_ERR=""
   if [[ ! -f "$SSHTUNNEL_STATE" ]]; then
     _st_service_remove
@@ -878,7 +1022,14 @@ st_disable() {
     _st_fail "cancellazione del tunnel non riuscita"
     return 1
   fi
-  if [[ -n "$user" ]] && ! st_sshd_remove "$user"; then
+  # Drop-in e CA se ne vanno comunque; i principal sono quelli degli utenti in
+  # elenco (più il file dell'utente dell'installazione delle versioni precedenti).
+  names=()
+  [[ -z "$user" ]] || names+=("$user")
+  while IFS= read -r did; do
+    if [[ -n "$did" ]] && st_valid_name "$did"; then names+=("$did"); fi
+  done < <(jq -r '.emails[]? | split("@")[0] | ascii_downcase' <<<"$ST_S")
+  if ((${#names[@]})) && ! st_sshd_remove "${names[@]}"; then
     ST_ERR="rimozione della configurazione di sshd non riuscita"
     return 1
   fi
