@@ -136,3 +136,402 @@ setup() {
   [ -z "$(ls -A "$BATS_TEST_TMPDIR/tmp")" ]
   ! grep -q reload "$CALLS"
 }
+
+# ---------------------------------------------------------------------------
+# Cloudflare: tunnel, Access, CA, DNS (Task 4)
+
+# cf_env — manifest, token, percorsi finti e uno stub curl che risponde per
+# metodo e percorso. Ogni chiamata finisce in $CFLOG come "METODO PERCORSO";
+# gli argomenti interi in $CALLS (per verificare che nessun token ci arrivi).
+#   CF_FAIL="POST:*/ca"         → errore 400 sulle chiamate che corrispondono
+#   CF_404="DELETE:*/apps/app1" → 404
+#   CF_DENY="GET:…"             → 403 di autorizzazione (permesso mancante)
+#   CF_OTP=1                    → One-time PIN già presente
+#   CF_DNS_EXISTS=1             → la zona ha già un record con quel nome
+cf_env() {
+  export CFLOG="$BATS_TEST_TMPDIR/cflog"
+  export SYSTEMD_DIR="$BATS_TEST_TMPDIR/systemd"
+  export SSHTUNNEL_ENV="$VPS_OPT/secrets/cf-tunnel.env"
+  export APT_SOURCES_D="$BATS_TEST_TMPDIR/apt"
+  export CLOUDFLARED_KEYRING="$BATS_TEST_TMPDIR/keyrings/cloudflare-main.gpg"
+  export SITES_DIR="$VPS_OPT/sites"
+  mkdir -p "$SYSTEMD_DIR" "$VPS_OPT/secrets" "$SITES_DIR"
+  : >"$CFLOG"
+  jq -n '{admin_user:"manu", ssh_port:6666, cloudflare:{enabled:true, zone:"example.it"}}' >"$VPS_OPT/manifest.json"
+  printf 'dns_cloudflare_api_token = SYSTOKEN-abc123\n' >"$VPS_OPT/secrets/cloudflare.ini"
+  # shellcheck disable=SC2016
+  make_stub curl '
+echo "curl $*" >>"$CALLS"
+method=GET data="" wcode=0
+while (($#)); do
+  case "$1" in
+    -X) method="$2"; shift ;;
+    --data) data="$2"; shift ;;
+    -w) wcode=1; shift ;;
+    *) url="$1" ;;
+  esac
+  shift
+done
+path="${url#https://api.cloudflare.com/client/v4}"
+p="${path%%\?*}"
+echo "$method $p" >>"$CFLOG"
+key="$method:$p"
+code=200
+body="{\"success\":true,\"result\":{}}"
+for pat in ${CF_FAIL:-}; do
+  if [[ "$key" == $pat ]]; then code=400; body="{\"success\":false,\"errors\":[{\"code\":9999,\"message\":\"rifiutato dal test\"}]}"; fi
+done
+for pat in ${CF_DENY:-}; do
+  if [[ "$key" == $pat ]]; then code=403; body="{\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}]}"; fi
+done
+for pat in ${CF_404:-}; do
+  if [[ "$key" == $pat ]]; then code=404; body="{\"success\":false,\"errors\":[{\"code\":1003,\"message\":\"not found\"}]}"; fi
+done
+if [[ $code == 200 ]]; then
+  case "$key" in
+    GET:/zones) body="{\"success\":true,\"result\":[{\"id\":\"zone123\"}]}" ;;
+    GET:/zones/zone123) body="{\"success\":true,\"result\":{\"id\":\"zone123\",\"account\":{\"id\":\"acc1\"}}}" ;;
+    GET:/zones/zone123/dns_records)
+      if [[ -n "${CF_DNS_EXISTS:-}" ]]; then body="{\"success\":true,\"result\":[{\"id\":\"x\",\"type\":\"A\"}]}"
+      else body="{\"success\":true,\"result\":[]}"; fi ;;
+    POST:/zones/zone123/dns_records)
+      if [[ "$data" == *ssh-nuovo1* ]]; then body="{\"success\":true,\"result\":{\"id\":\"dns2\"}}"
+      else body="{\"success\":true,\"result\":{\"id\":\"dns1\"}}"; fi ;;
+    GET:/accounts/acc1/access/identity_providers)
+      if [[ -n "${CF_OTP:-}" ]]; then body="{\"success\":true,\"result\":[{\"id\":\"otp9\",\"type\":\"onetimepin\"}]}"
+      else body="{\"success\":true,\"result\":[{\"id\":\"gh1\",\"type\":\"github\"}]}"; fi ;;
+    POST:/accounts/acc1/access/identity_providers) body="{\"success\":true,\"result\":{\"id\":\"otp1\",\"type\":\"onetimepin\"}}" ;;
+    GET:/accounts/acc1/cfd_tunnel | GET:/accounts/acc1/access/apps) body="{\"success\":true,\"result\":[]}" ;;
+    POST:/accounts/acc1/cfd_tunnel) body="{\"success\":true,\"result\":{\"id\":\"tun1\",\"token\":\"TUNNELTOKEN-SECRET-xyz\"}}" ;;
+    GET:/accounts/acc1/cfd_tunnel/tun1) body="{\"success\":true,\"result\":{\"id\":\"tun1\",\"status\":\"healthy\"}}" ;;
+    POST:/accounts/acc1/access/policies) body="{\"success\":true,\"result\":{\"id\":\"pol1\"}}" ;;
+    POST:/accounts/acc1/access/apps) body="{\"success\":true,\"result\":{\"id\":\"app1\"}}" ;;
+    POST:/accounts/acc1/access/apps/app1/ca) body="{\"success\":true,\"result\":{\"id\":\"ca1\",\"public_key\":\"ecdsa-sha2-nistp256 AAAACAKEY open-ssh-ca@cloudflareaccess.org\"}}" ;;
+  esac
+fi
+printf "%s" "$body"
+if ((wcode)); then printf "\n%s" "$code"; fi
+exit 0'
+  # shellcheck disable=SC2016
+  make_stub cloudflared 'echo "cloudflared $*" >>"$CALLS"; echo "cloudflared version 2025.10.0 (built 2025-10-01)"'
+  # shellcheck disable=SC2016
+  make_stub apt-get 'echo "apt-get $*" >>"$CALLS"; exit 0'
+}
+
+# st_enable riuscito, con stato scritto: base dei test di modifica.
+cf_enabled() {
+  cf_env
+  CF_OTP=1 st_enable ssh-k3f9x2 manu@x.it
+  : >"$CFLOG"
+  : >"$CALLS"
+}
+
+# in_order FILE RIGA... — le righe compaiono nel file in quest'ordine.
+in_order() {
+  local f="$1" prev=0 n l
+  shift
+  for l in "$@"; do
+    n="$(grep -nxF -- "$l" "$f" | head -1 | cut -d: -f1)"
+    [[ -n "$n" ]] || { echo "manca: $l"; return 1; }
+    ((n > prev)) || { echo "fuori ordine: $l"; return 1; }
+    prev="$n"
+  done
+}
+
+@test "st_enable: ordine delle chiamate, stato e token del tunnel solo nel file env" {
+  cf_env
+  run st_enable ssh-k3f9x2 manu@x.it
+  [ "$status" -eq 0 ]
+  in_order "$CFLOG" \
+    "GET /accounts/acc1/access/identity_providers" \
+    "POST /accounts/acc1/access/identity_providers" \
+    "POST /accounts/acc1/cfd_tunnel" \
+    "PUT /accounts/acc1/cfd_tunnel/tun1/configurations" \
+    "POST /accounts/acc1/access/apps" \
+    "POST /accounts/acc1/access/apps/app1/ca" \
+    "POST /zones/zone123/dns_records"
+  [ "$(jq -r .tunnel_id "$SSHTUNNEL_STATE")" = tun1 ]
+  [ "$(jq -r .app_id "$SSHTUNNEL_STATE")" = app1 ]
+  [ "$(jq -r .policy_id "$SSHTUNNEL_STATE")" = pol1 ]
+  [ "$(jq -r .dns_id "$SSHTUNNEL_STATE")" = dns1 ]
+  [ "$(jq -r .host "$SSHTUNNEL_STATE")" = ssh-k3f9x2.example.it ]
+  [ "$(jq -r .label "$SSHTUNNEL_STATE")" = ssh-k3f9x2 ]
+  [ "$(jq -r .user "$SSHTUNNEL_STATE")" = manu ]
+  [ "$(jq -r .account_id "$SSHTUNNEL_STATE")" = acc1 ]
+  [ "$(jq -r .zone_id "$SSHTUNNEL_STATE")" = zone123 ]
+  [ -n "$(jq -r .enabled_at "$SSHTUNNEL_STATE")" ]
+  [ "$(jq -c .emails "$SSHTUNNEL_STATE")" = '["manu@x.it"]' ]
+  [ "$(stat -c %a "$SSHTUNNEL_ENV")" = 600 ]
+  grep -qx 'TUNNEL_TOKEN=TUNNELTOKEN-SECRET-xyz' "$SSHTUNNEL_ENV"
+  [ -f "$SYSTEMD_DIR/vps-cloudflared.service" ]
+  grep -q "systemctl enable --now vps-cloudflared" "$CALLS"
+  [ "$(cat "$SSH_CF_PRINCIPALS/manu")" = manu ]
+  grep -q AAAACAKEY "$SSH_CF_CA"
+  # Ingresso verso la porta SSH del manifest, CNAME verso il tunnel.
+  grep -q 'ssh://localhost:6666' "$CALLS"
+  grep -q 'tun1.cfargotunnel.com' "$CALLS"
+  # Nessun token in stato, log, argomenti di processo o output.
+  for f in "$SSHTUNNEL_STATE" "$VPS_LOG" "$CALLS"; do
+    ! grep -q TUNNELTOKEN "$f"
+    ! grep -q SYSTOKEN "$f"
+  done
+  [[ "$output" != *TUNNELTOKEN* && "$output" != *SYSTOKEN* ]]
+}
+
+@test "st_enable: app Access type ssh, sessione 1h, solo One-time PIN, policy con le email" {
+  cf_env
+  CF_OTP=1 st_enable ssh-k3f9x2 manu@x.it altro@y.it
+  app="$(grep -- '--data' "$CALLS" | grep '"type":"ssh"' | head -1)"
+  [[ "$app" == *'"domain":"ssh-k3f9x2.example.it"'* ]]
+  [[ "$app" == *'"session_duration":"1h"'* ]]
+  [[ "$app" == *'"allowed_idps":["otp9"]'* ]]
+  [[ "$app" == *'"auto_redirect_to_identity":true'* ]]
+  [[ "$app" == *'"policies":[{"id":"pol1","precedence":1}]'* ]]
+  pol="$(grep -- '--data' "$CALLS" | grep '"decision":"allow"' | head -1)"
+  [[ "$pol" == *'{"email":{"email":"manu@x.it"}}'* ]]
+  [[ "$pol" == *'{"email":{"email":"altro@y.it"}}'* ]]
+  [ "$(cat "$SSH_CF_PRINCIPALS/manu")" = $'manu\naltro' ]
+}
+
+@test "st_enable: One-time PIN già presente → nessuna creazione" {
+  cf_env
+  CF_OTP=1 run st_enable ssh-k3f9x2 manu@x.it
+  [ "$status" -eq 0 ]
+  ! grep -q "POST /accounts/acc1/access/identity_providers" "$CFLOG"
+}
+
+@test "st_enable: CA rifiutata → annulla tutto, niente DNS né sshd né stato" {
+  cf_env
+  rc=0
+  CF_FAIL="POST:*/ca" st_enable ssh-k3f9x2 manu@x.it || rc=$?
+  [ "$rc" -eq 1 ]
+  [ -n "$ST_ERR" ]
+  [[ "$ST_ERR" != *TOKEN* ]]
+  ! grep -q "POST /zones/zone123/dns_records" "$CFLOG"
+  grep -q "DELETE /accounts/acc1/access/apps/app1" "$CFLOG"
+  grep -q "DELETE /accounts/acc1/access/policies/pol1" "$CFLOG"
+  grep -q "DELETE /accounts/acc1/cfd_tunnel/tun1" "$CFLOG"
+  grep -q "systemctl disable --now vps-cloudflared" "$CALLS"
+  [ ! -e "$SYSTEMD_DIR/vps-cloudflared.service" ]
+  [ ! -e "$SSHTUNNEL_ENV" ]
+  [ ! -e "$SSHD_CONFIG_D/20-vps-cfaccess.conf" ]
+  [ ! -e "$SSH_CF_CA" ]
+  [ ! -e "$SSHTUNNEL_STATE" ]
+}
+
+@test "st_enable: DNS rifiutato → annulla app, tunnel e sshd, niente stato" {
+  cf_env
+  CF_FAIL="POST:/zones/zone123/dns_records" run st_enable ssh-k3f9x2 manu@x.it
+  [ "$status" -eq 1 ]
+  grep -q "DELETE /accounts/acc1/access/apps/app1" "$CFLOG"
+  grep -q "DELETE /accounts/acc1/cfd_tunnel/tun1" "$CFLOG"
+  [ ! -e "$SSHD_CONFIG_D/20-vps-cfaccess.conf" ]
+  [ ! -e "$SSH_CF_PRINCIPALS/manu" ]
+  [ ! -e "$SSHTUNNEL_STATE" ]
+  # Il tunnel si cancella solo dopo aver fermato cloudflared e pulito le connessioni.
+  in_order "$CFLOG" "DELETE /accounts/acc1/cfd_tunnel/tun1/connections" "DELETE /accounts/acc1/cfd_tunnel/tun1"
+}
+
+@test "st_enable: rifiuta se già attivo, nome occupato, email non valide o permessi mancanti" {
+  cf_env
+  st_enable ssh-k3f9x2 manu@x.it
+  : >"$CFLOG"
+  run st_enable ssh-altro1 manu@x.it; [ "$status" -eq 1 ]
+  ! grep -q "^POST" "$CFLOG"
+  rm -f "${SSHTUNNEL_STATE:?}"
+  CF_DNS_EXISTS=1 run st_enable ssh-altro1 manu@x.it; [ "$status" -eq 1 ]
+  ! grep -q "^POST" "$CFLOG"
+  run st_enable ssh-altro1 "non-una-email"; [ "$status" -eq 1 ]
+  run st_enable "Bad_Label" manu@x.it; [ "$status" -eq 1 ]
+  CF_DENY="GET:/accounts/acc1/cfd_tunnel" run st_enable ssh-altro1 manu@x.it; [ "$status" -eq 1 ]
+  ! grep -q "^POST" "$CFLOG"
+}
+
+@test "st_enable: Cloudflare spento nel manifest → errore senza chiamate" {
+  cf_env
+  jq -n '{admin_user:"manu", ssh_port:6666, cloudflare:{enabled:false}}' >"$VPS_OPT/manifest.json"
+  run st_enable ssh-k3f9x2 manu@x.it
+  [ "$status" -eq 1 ]
+  [ ! -s "$CFLOG" ]
+}
+
+@test "st_set_emails aggiorna la policy e i principal" {
+  cf_enabled
+  run st_set_emails altro@y.it
+  [ "$status" -eq 0 ]
+  grep -q "PUT /accounts/acc1/access/policies/pol1" "$CFLOG"
+  grep -- '--data' "$CALLS" | grep -q '{"email":{"email":"altro@y.it"}}'
+  [ "$(cat "$SSH_CF_PRINCIPALS/manu")" = altro ]
+  [ "$(jq -c .emails "$SSHTUNNEL_STATE")" = '["altro@y.it"]' ]
+}
+
+@test "st_set_emails: sshd che fallisce rimette la policy di prima" {
+  cf_enabled
+  SSHD_FAIL=1 run st_set_emails altro@y.it
+  [ "$status" -eq 1 ]
+  [ "$(grep -c "PUT /accounts/acc1/access/policies/pol1" "$CFLOG")" -eq 2 ]
+  last="$(grep -- '"decision":"allow"' "$CALLS" | tail -1)"
+  [[ "$last" == *'"manu@x.it"'* ]]
+  [ "$(cat "$SSH_CF_PRINCIPALS/manu")" = manu ]
+  [ "$(jq -c .emails "$SSHTUNNEL_STATE")" = '["manu@x.it"]' ]
+}
+
+@test "st_set_host: nuovo CNAME prima di cancellare il vecchio, stato aggiornato" {
+  cf_enabled
+  run st_set_host ssh-nuovo1
+  [ "$status" -eq 0 ]
+  in_order "$CFLOG" \
+    "PUT /accounts/acc1/cfd_tunnel/tun1/configurations" \
+    "PUT /accounts/acc1/access/apps/app1" \
+    "POST /zones/zone123/dns_records" \
+    "DELETE /zones/zone123/dns_records/dns1"
+  # Il vecchio nome esce subito dall'ingresso: quando l'app Access lo lascia,
+  # il suo CNAME (ancora presente) non deve portare a sshd senza protezione.
+  [ "$(grep -c 'ssh://localhost' "$CALLS")" -eq 1 ]
+  cfg="$(grep 'ssh://localhost' "$CALLS")"
+  [[ "$cfg" == *ssh-nuovo1.example.it* && "$cfg" != *ssh-k3f9x2* ]]
+  [ "$(jq -r .host "$SSHTUNNEL_STATE")" = ssh-nuovo1.example.it ]
+  [ "$(jq -r .label "$SSHTUNNEL_STATE")" = ssh-nuovo1 ]
+  [ "$(jq -r .dns_id "$SSHTUNNEL_STATE")" = dns2 ]
+}
+
+@test "st_set_host: DNS nuovo rifiutato → app e ingresso tornano al vecchio nome" {
+  cf_enabled
+  CF_FAIL="POST:/zones/zone123/dns_records" run st_set_host ssh-nuovo1
+  [ "$status" -eq 1 ]
+  ! grep -q "DELETE /zones/zone123/dns_records/dns1" "$CFLOG"
+  [ "$(grep -c "PUT /accounts/acc1/access/apps/app1" "$CFLOG")" -eq 2 ]
+  last_app="$(grep -- '"type":"ssh"' "$CALLS" | tail -1)"
+  [[ "$last_app" == *'"domain":"ssh-k3f9x2.example.it"'* ]]
+  last_cfg="$(grep 'ssh://localhost' "$CALLS" | tail -1)"
+  [[ "$last_cfg" != *ssh-nuovo1* ]]
+  [ "$(jq -r .host "$SSHTUNNEL_STATE")" = ssh-k3f9x2.example.it ]
+}
+
+@test "st_disable con l'app già cancellata (404) completa" {
+  cf_enabled
+  CF_404="DELETE:/accounts/acc1/access/apps/app1 DELETE:/accounts/acc1/access/apps/app1/ca" run st_disable
+  [ "$status" -eq 0 ]
+  in_order "$CFLOG" "DELETE /zones/zone123/dns_records/dns1" "DELETE /accounts/acc1/access/apps/app1" "DELETE /accounts/acc1/cfd_tunnel/tun1"
+  grep -q "systemctl disable --now vps-cloudflared" "$CALLS"
+  [ ! -e "$SYSTEMD_DIR/vps-cloudflared.service" ]
+  [ ! -e "$SSHTUNNEL_ENV" ]
+  [ ! -e "$SSH_CF_PRINCIPALS/manu" ]
+  [ ! -e "$SSHTUNNEL_STATE" ]
+}
+
+@test "st_disable: un errore vero (non 404) si ferma e conserva lo stato" {
+  cf_enabled
+  CF_FAIL="DELETE:/accounts/acc1/access/apps/app1" run st_disable
+  [ "$status" -eq 1 ]
+  [ -f "$SSHTUNNEL_STATE" ]
+  ! grep -q "DELETE /accounts/acc1/cfd_tunnel/tun1" "$CFLOG"
+}
+
+@test "unità vps-cloudflared: token nell'ambiente, non negli argomenti" {
+  u="$REPO_ROOT/templates/vps-cloudflared.service"
+  grep -qx 'EnvironmentFile=/opt/vps/secrets/cf-tunnel.env' "$u"
+  grep -qx 'ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel run' "$u"
+  grep -qx 'DynamicUser=yes' "$u"
+  grep -qx 'NoNewPrivileges=yes' "$u"
+  grep -qx 'Restart=on-failure' "$u"
+  grep -qx 'After=network-online.target' "$u"
+  grep -qx 'Wants=network-online.target' "$u"
+  ! grep -q -- '--token' "$u"
+}
+
+@test "st_cloudflared_install: già presente → niente apt" {
+  cf_env
+  run st_cloudflared_install
+  [ "$status" -eq 0 ]
+  ! grep -q apt-get "$CALLS"
+}
+
+@test "st_cloudflared_install: repository Cloudflare con chiave verificata" {
+  cf_env
+  rm -f "$BATS_TEST_TMPDIR/bin/cloudflared"
+  if command -v cloudflared; then skip "cloudflared installato sul sistema di test"; fi
+  # Verifica del fingerprint finta: qui conta il flusso, non gpg.
+  gpg_keyring_install() { echo "keyring $*" >>"$CALLS"; mkdir -p "$(dirname "$2")"; cp "$1" "$2"; }
+  # shellcheck disable=SC2016
+  make_stub curl 'echo "curl $*" >>"$CALLS"; while (($#)); do [ "$1" = -o ] && echo KEY >"$2"; shift; done; exit 0'
+  # shellcheck disable=SC2016
+  make_stub apt-get 'echo "apt-get $*" >>"$CALLS"; case "$*" in *install*) printf "#!/bin/sh\necho cloudflared version 1\n" >"$BATS_TEST_TMPDIR/bin/cloudflared"; chmod +x "$BATS_TEST_TMPDIR/bin/cloudflared";; esac; exit 0'
+  run st_cloudflared_install
+  [ "$status" -eq 0 ]
+  grep -q "https://pkg.cloudflare.com/cloudflare-main.gpg" "$CALLS"
+  grep -q "CC94B39C77AE7342A68B89628A682D308D4E5E73" "$CALLS"
+  grep -qxF "deb [signed-by=$CLOUDFLARED_KEYRING] https://pkg.cloudflare.com/cloudflared any main" "$APT_SOURCES_D/cloudflared.list"
+  grep -q "apt-get .*install.*cloudflared" "$CALLS"
+}
+
+@test "st_cloudflared_install: chiave non scaricabile → 1 con ST_ERR, niente repository" {
+  cf_env
+  rm -f "$BATS_TEST_TMPDIR/bin/cloudflared"
+  if command -v cloudflared; then skip "cloudflared installato sul sistema di test"; fi
+  make_stub curl 'exit 22'
+  rc=0
+  st_cloudflared_install || rc=$?
+  [ "$rc" -eq 1 ]
+  [ -n "$ST_ERR" ]
+  [ ! -e "$APT_SOURCES_D/cloudflared.list" ]
+}
+
+@test "st_host_free: libero, sito registrato (anche www), record DNS" {
+  cf_env
+  export CF_API_TOKEN=SYSTOKEN-abc123
+  run st_host_free ssh-abc123.example.it
+  [ "$status" -eq 0 ]
+  echo '{"domain":"ssh-abc123.example.it","www":false}' >"$SITES_DIR/ssh-abc123.example.it.json"
+  rc=0; st_host_free ssh-abc123.example.it || rc=$?
+  [ "$rc" -eq 1 ]
+  [ "$ST_REASON" = "usato da un sito" ]
+  rm -f "${SITES_DIR:?}/ssh-abc123.example.it.json"
+  echo '{"domain":"blog.example.it","www":true}' >"$SITES_DIR/blog.example.it.json"
+  rc=0; st_host_free www.blog.example.it || rc=$?
+  [ "$rc" -eq 1 ]
+  [ "$ST_REASON" = "usato da un sito" ]
+  rc=0; CF_DNS_EXISTS=1 st_host_free ssh-abc123.example.it || rc=$?
+  [ "$rc" -eq 1 ]
+  [ "$ST_REASON" = "esiste già un record DNS" ]
+}
+
+@test "st_status_json: Cloudflare spento → solo cloudflare:false" {
+  cf_env
+  jq -n '{admin_user:"manu", cloudflare:{enabled:false}}' >"$VPS_OPT/manifest.json"
+  run --separate-stderr st_status_json
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"ok":true,"cloudflare":false}' ]
+}
+
+@test "st_status_json: non attivo" {
+  cf_env
+  CF_OTP=1 run --separate-stderr st_status_json
+  [ "$status" -eq 0 ]
+  jq -e '.ok and .cloudflare and .zone == "example.it" and .perms == {tunnel:true, access:true, idp:true}
+    and .zerotrust and .otp and (.enabled | not) and .host == null and .emails == [] and .user == "manu"
+    and .service == "missing" and .cloudflared_version == "2025.10.0" and .tunnel_status == null
+    and .drift == []' <<<"$output"
+}
+
+@test "st_status_json: attivo e completo, poi pezzi cancellati a mano → drift" {
+  cf_enabled
+  run --separate-stderr st_status_json
+  [ "$status" -eq 0 ]
+  jq -e '.enabled and .host == "ssh-k3f9x2.example.it" and .emails == ["manu@x.it"]
+    and .service == "active" and .tunnel_status == "healthy" and .drift == []' <<<"$output"
+  CF_404="GET:/accounts/acc1/access/apps/app1" run --separate-stderr st_status_json
+  jq -e '.drift == ["app"]' <<<"$output"
+  rm -f "${SYSTEMD_DIR:?}/vps-cloudflared.service"
+  CF_404="GET:/zones/zone123/dns_records/dns1 GET:/accounts/acc1/cfd_tunnel/tun1" run --separate-stderr st_status_json
+  jq -e '.drift == ["dns","tunnel","service"] and .service == "missing" and .tunnel_status == null' <<<"$output"
+  [[ "$output" != *TOKEN* ]]
+}
+
+@test "st_status_json: Cloudflare che non risponde → ok:false" {
+  cf_env
+  make_stub curl 'exit 7'
+  run --separate-stderr st_status_json
+  [ "$status" -eq 1 ]
+  jq -e '.ok == false and (.error | length > 0)' <<<"$output"
+}

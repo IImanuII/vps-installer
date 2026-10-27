@@ -14,9 +14,19 @@ cf_api() {
   if [[ -n "$data" ]]; then
     args+=(--data "$data")
   fi
+  # CF_WCODE=1: dopo il corpo, una riga finale col codice HTTP (cf_api_code).
+  if [[ -n "${CF_WCODE:-}" ]]; then
+    args+=(-w $'\n%{http_code}')
+  fi
   curl "${args[@]}" "$CF_API$path" || rc=$?
   rm -f "$hdr"
   return "$rc"
+}
+
+# cf_api_code METODO PERCORSO [DATI] — come cf_api, con il codice HTTP
+# nell'ultima riga: serve a distinguere "non esiste più" (404) da un errore vero.
+cf_api_code() {
+  CF_WCODE=1 cf_api "$@"
 }
 
 # cf_find_zone DOMINIO → "ZONE_ID ZONE_NAME"
@@ -167,7 +177,9 @@ cf_create_record() {
 
 # Permessi del token per l'accesso SSH dal browser (etichette come nella
 # dashboard Cloudflare, così l'elenco si può ricopiare alla lettera).
-# Quello della CA di Access verrà aggiunto dopo la verifica sulla reference API.
+# La CA dei certificati brevi dell'app (POST .../access/apps/{id}/ca) richiede
+# "Access: Apps and Policies Write", già in elenco: nessun permesso in più
+# (verificato sulla reference API il 2026-10-27, vedi lib/sshtunnel.sh).
 # shellcheck disable=SC2034  # usata da wizard e strumenti che caricano la libreria
 CF_PERMS_TEXT="Zone › Zone › Read
 Zone › DNS › Edit
