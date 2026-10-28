@@ -307,6 +307,39 @@ esac'
   [ "$(jq -r .error <<<"$output")" = "zona non trovata: altro.it" ]
 }
 
+@test "vps-cf-purge --host: host da stdin, svuota solo quelli (hosts), maiuscole e righe vuote tollerate" {
+  _cf_ini; _cf_curl
+  run bash -c "printf 'miosito.it\n\n  WWW.miosito.it \r\n' | bash '$T/vps-cf-purge' miosito.it --host 2>/dev/null"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .purged <<<"$output")" = 2 ]
+  grep -qF '{"hosts":["miosito.it","www.miosito.it"]}' "$BATS_TEST_TMPDIR/curl.args"
+  run ! grep -qF 'purge_everything' "$BATS_TEST_TMPDIR/curl.args"
+  grep -q 'vps-cf-purge: miosito.it svuotata (host: miosito.it www.miosito.it)' "$VPS_LOG"
+}
+
+@test "vps-cf-purge --host rifiuta host fuori zona, elenco vuoto o troppo lungo prima di chiamare Cloudflare" {
+  _cf_ini; _cf_curl
+  run bash -c "printf 'altro.it\n' | bash '$T/vps-cf-purge' miosito.it --host"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "host non valido: altro.it" ]
+  run bash -c "printf 'https://miosito.it/\n' | bash '$T/vps-cf-purge' miosito.it --host"
+  [ "$(jq -r .error <<<"$output")" = "host non valido: https://miosito.it/" ]
+  run bash -c "printf '' | bash '$T/vps-cf-purge' miosito.it --host"
+  [ "$(jq -r .error <<<"$output")" = "nessun host" ]
+  run bash -c "for i in \$(seq 31); do echo s\$i.miosito.it; done | bash '$T/vps-cf-purge' miosito.it --host"
+  [ "$(jq -r .error <<<"$output")" = "troppi host: il limite è 30" ]
+  ! grep -qF purge_cache "$BATS_TEST_TMPDIR/curl.args"
+}
+
+@test "vps-cf-purge --host: rifiuto di Cloudflare riportato senza ricadere su purge_everything" {
+  _cf_ini; _cf_curl
+  echo '{"success":false,"errors":[{"code":1018,"message":"Purge by host not allowed"}]}' >"$BATS_TEST_TMPDIR/purge.json"
+  run bash -c "printf 'miosito.it\n' | bash '$T/vps-cf-purge' miosito.it --host 2>/dev/null"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "Cloudflare ha rifiutato la richiesta: Purge by host not allowed" ]
+  run ! grep -qF 'purge_everything' "$BATS_TEST_TMPDIR/curl.args"
+}
+
 # curl finto per vps-cf-token: zone visibili in $BATS_TEST_TMPDIR/zones (una per riga).
 _cf_curl_zone() {
   printf '%s\n' "$@" >"$BATS_TEST_TMPDIR/zones"

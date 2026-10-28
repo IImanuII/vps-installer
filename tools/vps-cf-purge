@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# vps-cf-purge ZONA [--all] — svuota la cache Cloudflare di ZONA con il token di
-# sistema. Senza --all gli indirizzi arrivano da stdin, uno per riga (1-30): negli
-# argomenti si vedrebbero in `ps`. Contratto in docs/PANEL-HANDOFF.md, sezione 4.
+# vps-cf-purge ZONA [--all|--host] — svuota la cache Cloudflare di ZONA con il token
+# di sistema. Senza opzioni gli indirizzi arrivano da stdin, uno per riga (1-30): negli
+# argomenti si vedrebbero in `ps`. Con --host da stdin arrivano i nomi (1-30) e si
+# svuota tutto ciò che è servito con quei nomi, senza toccare gli altri siti della zona.
+# Contratto in docs/PANEL-HANDOFF.md, sezione 4.
 # Sotto sudo l'ambiente del chiamante non deve influenzare lo script.
 if [[ -n "${SUDO_USER:-}" ]]; then
   VPS_OPT=/opt/vps
@@ -21,12 +23,13 @@ for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
 done
 tool_init
 
-USO="uso: vps-cf-purge ZONA [--all] (indirizzi da stdin senza --all)"
+USO="uso: vps-cf-purge ZONA [--all|--host] (indirizzi da stdin senza opzioni, host con --host)"
 (($# >= 1 && $# <= 2)) || json_err "$USO"
 zone="$1"
-all=no
+mode=urls
 case "${2:-}" in
-  --all) all=yes ;;
+  --all) mode=all ;;
+  --host) mode=hosts ;;
   "") ;;
   *) json_err "$USO" ;;
 esac
@@ -35,9 +38,27 @@ valid_domain "$zone" || json_err "zona non valida"
 # shellcheck disable=SC2034
 CF_API_TOKEN="$(cf_token_from_ini)"
 
-if [[ "$all" == yes ]]; then
+if [[ "$mode" == all ]]; then
   body='{"purge_everything":true}'
   n=all
+elif [[ "$mode" == hosts ]]; then
+  # Purge per host: Cloudflare lo accetta su tutti i piani. Se lo rifiuta si dà
+  # errore e basta: ricadere su purge_everything svuoterebbe anche gli altri siti.
+  hosts=()
+  # Si leggono 10001 byte: 30 nomi da 253 caratteri ci stanno, di più è troppo.
+  dati="$(read_stdin_limited 10001)"
+  ((${#dati} <= 10000)) || json_err "troppi host: il limite è 30"
+  while IFS= read -r riga || [[ -n "$riga" ]]; do
+    riga="$(trim "$riga")"
+    if [[ -n "$riga" ]]; then hosts+=("${riga,,}"); fi
+  done <<<"$dati"
+  ((${#hosts[@]} >= 1)) || json_err "nessun host"
+  ((${#hosts[@]} <= 30)) || json_err "troppi host: il limite è 30"
+  for h in "${hosts[@]}"; do
+    valid_purge_host "$h" "$zone" || json_err "host non valido: $h"
+  done
+  body="$(jq -nc '{hosts: $ARGS.positional}' --args "${hosts[@]}")"
+  n="${#hosts[@]}"
 else
   urls=()
   # Si leggono 40001 byte: se arrivano più di 40000 l'elenco è troppo lungo.
@@ -66,7 +87,11 @@ if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$resp"; then
   log "vps-cf-purge: $zone rifiutato da Cloudflare: ${msg:-risposta non valida}"
   json_err "Cloudflare ha rifiutato la richiesta: ${msg:-risposta non valida}"
 fi
-log "vps-cf-purge: $zone svuotata ($n)"
+if [[ "$mode" == hosts ]]; then
+  log "vps-cf-purge: $zone svuotata (host: ${hosts[*]})"
+else
+  log "vps-cf-purge: $zone svuotata ($n)"
+fi
 if [[ "$n" == all ]]; then
   json_ok '{ok: true, purged: "all"}'
 else

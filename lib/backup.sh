@@ -1971,8 +1971,9 @@ _bk_db_swap() {
 
 # --- cache e avviso -----------------------------------------------------------------
 
-# _bk_flush_cache DOMINIO SLUG — chiavi Redis del sito (se ha l'utente ACL) e zona
-# Cloudflare (se attivo). Un errore si registra e basta: il ripristino è fatto.
+# _bk_flush_cache DOMINIO SLUG — chiavi Redis del sito (se ha l'utente ACL) e cache
+# Cloudflare dei soli nomi del sito (se attivo). Un errore si registra e basta: il
+# ripristino è fatto.
 _bk_flush_cache() {
   local d="$1" slug="$2" zone
   if grep -q "^user $slug " "$REDIS_ACL_FILE" 2>/dev/null; then
@@ -1981,7 +1982,11 @@ _bk_flush_cache() {
   # Nel registro la zona e' {id, name} (vps-site): a vps-cf-purge serve il nome.
   zone="$(site_reg_get "$d" '.zone | if type == "object" then (.name // "") else (. // "") end' 2>/dev/null || true)"
   if [[ -n "$zone" && "$(jq -r '.cloudflare.enabled // false' "$(manifest_path)" 2>/dev/null || true)" == true && -x "$BK_CF_PURGE" ]]; then
-    _bk_nolock "$BK_CF_PURGE" "$zone" --all >>"$VPS_LOG" 2>&1 || log "ATTENZIONE: cache Cloudflare di $zone non svuotata"
+    # Per host (il dominio e, se c'e', www.dominio: site_names), non tutta la zona:
+    # nella zona ci sono anche gli altri siti. Se Cloudflare rifiuta si registra e
+    # basta, senza ricadere su --all.
+    site_names "$d" | _bk_nolock "$BK_CF_PURGE" "$zone" --host >>"$VPS_LOG" 2>&1 ||
+      log "ATTENZIONE: cache Cloudflare di $d (zona $zone) non svuotata"
   fi
 }
 

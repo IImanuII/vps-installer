@@ -75,6 +75,15 @@ valid_purge_url() {
   [[ "$host" == "$z" || "$host" == *".$z" ]]
 }
 
+# valid_purge_host HOST ZONA — un nome che Cloudflare può svuotare per ZONA (purge per
+# host): la zona stessa o un suo sottodominio a etichette intere, in minuscolo, niente
+# schema, porta o jolly.
+valid_purge_host() {
+  local LC_ALL=C h="$1" z="$2"
+  valid_domain "$h" || return 1
+  [[ "$h" == "$z" || "$h" == *".$z" ]]
+}
+
 valid_ssh_pubkey() {
   local key="$1" tmp info bits rc=0
   valid_line "$key" || return 1

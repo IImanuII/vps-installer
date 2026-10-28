@@ -123,6 +123,19 @@ setup() {
   run valid_purge_url "" arcomy.com; [ "$status" -ne 0 ]
 }
 
+@test "valid_purge_host: la zona o un suo sottodominio, niente altro" {
+  valid_purge_host arcomy.com arcomy.com
+  valid_purge_host www.arcomy.com arcomy.com
+  valid_purge_host blog.arcomy.com arcomy.com
+  run valid_purge_host xarcomy.com arcomy.com; [ "$status" -ne 0 ]
+  run valid_purge_host arcomy.com.evil.it arcomy.com; [ "$status" -ne 0 ]
+  run valid_purge_host Www.arcomy.com arcomy.com; [ "$status" -ne 0 ]
+  run valid_purge_host "https://arcomy.com" arcomy.com; [ "$status" -ne 0 ]
+  run valid_purge_host "arcomy.com:443" arcomy.com; [ "$status" -ne 0 ]
+  run valid_purge_host "*.arcomy.com" arcomy.com; [ "$status" -ne 0 ]
+  run valid_purge_host "" arcomy.com; [ "$status" -ne 0 ]
+}
+
 @test "valid_purge_url conta byte, anche con una locale UTF-8" {
   export LC_ALL=C.UTF-8
   run valid_purge_url "https://arcomy.com/$(printf 'é%.0s' {1..1000})" arcomy.com; [ "$status" -ne 0 ]

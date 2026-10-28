@@ -1517,7 +1517,7 @@ done
 exit 0'
   # shellcheck disable=SC2016
   make_stub vps-cf-purge 'n=0; for f in /proc/self/fd/*; do case "$(readlink "$f" 2>/dev/null)" in *vps-*.lock) n=$((n+1));; esac; done; echo $n >>"$BATS_TEST_TMPDIR/cf.lockfds"
-echo "vps-cf-purge $*" >>"$BATS_TEST_TMPDIR/cf.purge"; exit "${STUB_RC_cf_purge:-0}"'
+echo "vps-cf-purge $*" >>"$BATS_TEST_TMPDIR/cf.purge"; if [[ "${2:-}" == --host ]]; then cat >>"$BATS_TEST_TMPDIR/cf.hosts"; fi; exit "${STUB_RC_cf_purge:-0}"'
   # redis-cli come in sites_helper, ma conta anche i lock ereditati
   # shellcheck disable=SC2016
   make_stub redis-cli 'n=0; for f in /proc/self/fd/*; do case "$(readlink "$f" 2>/dev/null)" in *vps-*.lock) n=$((n+1));; esac; done; echo $n >>"$BATS_TEST_TMPDIR/redis.lockfds"
@@ -2171,13 +2171,28 @@ rs_run() { bk_tool _restore "$@"; }
   grep -q 'SCAN' "$CALLS"
   run ! grep -q 'KEYS' "$CALLS"
   grep -q 'site_a_it:\*' "$CALLS"
-  grep -qx 'vps-cf-purge miosito.it --all' "$BATS_TEST_TMPDIR/cf.purge"
+  # solo gli host del sito, mai tutta la zona (ci sono anche gli altri siti)
+  grep -qx 'vps-cf-purge miosito.it --host' "$BATS_TEST_TMPDIR/cf.purge"
+  run ! grep -q -- '--all' "$BATS_TEST_TMPDIR/cf.purge"
+  [ "$(cat "$BATS_TEST_TMPDIR/cf.hosts")" = "a.it" ]
   # entrambi falliscono: il ripristino riesce lo stesso
   : >"$CALLS"
   STUB_RC_redis_cli=1 STUB_RC_cf_purge=1 rs_run local a.it "$ARC_NAME" files
   [ "$status" -eq 0 ]
   jq -e '.last_restore.ok == true' "$BK_STATE"
   grep -q 'cache' "$VPS_LOG"
+}
+
+@test "_restore: sito con www = svuotati il dominio e www.dominio; rifiuto di Cloudflare registrato, niente --all" {
+  rs_env
+  rs_site
+  site_reg_update a.it '.www = true'
+  STUB_RC_cf_purge=1 rs_run local a.it "$ARC_NAME" files
+  [ "$status" -eq 0 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/cf.hosts")" = "$(printf 'a.it\nwww.a.it')" ]
+  [ "$(wc -l <"$BATS_TEST_TMPDIR/cf.purge")" -eq 1 ]
+  run ! grep -q -- '--all' "$BATS_TEST_TMPDIR/cf.purge"
+  grep -q 'cache Cloudflare di a.it' "$VPS_LOG"
 }
 
 @test "_restore: sito senza utente Redis e senza zona = nessuna chiamata alla cache" {
