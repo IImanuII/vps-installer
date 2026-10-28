@@ -2,8 +2,21 @@
 # vps-pma-pass set|dbadmin — nuova password (da stdin).
 #   set     basic auth di phpMyAdmin
 #   dbadmin password MariaDB di panel_dbadmin + DBADMIN_PASS in <pannello>/config/.env
-# Sotto sudo l'ambiente del chiamante non deve influenzare lo script.
-if [[ -n "${SUDO_USER:-}" ]]; then
+# I comandi che scrivono in /etc: PHP-FPM gira con ProtectSystem=full, dove /etc è
+# in sola lettura, e sudo lanciato dal pannello ne eredita lo spazio dei mount. Ci si
+# rilancia allora in un'unità systemd nuova (come vps-site): stdin, stdout e codice
+# d'uscita passano intatti. Il percorso è assoluto e fisso, mai preso dall'ambiente.
+case "${1:-}" in
+  set)
+    if [[ -n "${SUDO_USER:-}" && -z "${VPS_PMAPASS_VIA_SYSTEMD:-}" ]]; then
+      exec systemd-run --wait --pipe --collect --quiet --service-type=exec \
+        --setenv=VPS_PMAPASS_VIA_SYSTEMD=1 /opt/vps/bin/vps-pma-pass "$@"
+    fi
+    ;;
+esac
+# Sotto sudo (o nell'unità del rilancio) l'ambiente del chiamante non deve influenzare
+# lo script.
+if [[ -n "${SUDO_USER:-}" || -n "${VPS_PMAPASS_VIA_SYSTEMD:-}" ]]; then
   VPS_OPT=/opt/vps
   VPS_LIB=$VPS_OPT/lib
   VPS_TEMPLATES=$VPS_OPT/templates

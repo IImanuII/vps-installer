@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 # vps-cf-ips-update — aggiorna real_ip di Nginx e regole UFW con gli IP Cloudflare.
-# Sotto sudo l'ambiente del chiamante non deve influenzare lo script.
-if [[ -n "${SUDO_USER:-}" ]]; then
+# PHP-FPM gira con ProtectSystem=full: sudo lanciato dal pannello eredita il suo
+# spazio dei mount, dove /etc è in sola lettura. Ci si rilancia allora in un'unità
+# systemd nuova, fuori da quella sandbox (come vps-site): stdin, stdout e codice
+# d'uscita passano intatti. Il percorso è assoluto e fisso, mai preso dall'ambiente.
+if [[ -n "${SUDO_USER:-}" && -z "${VPS_CFIPS_VIA_SYSTEMD:-}" ]]; then
+  exec systemd-run --wait --pipe --collect --quiet --service-type=exec \
+    --setenv=VPS_CFIPS_VIA_SYSTEMD=1 /opt/vps/bin/vps-cf-ips-update "$@"
+fi
+# Sotto sudo (o nell'unità del rilancio) l'ambiente del chiamante non deve influenzare
+# lo script.
+if [[ -n "${SUDO_USER:-}" || -n "${VPS_CFIPS_VIA_SYSTEMD:-}" ]]; then
   VPS_OPT=/opt/vps
   VPS_LIB=$VPS_OPT/lib
   VPS_TEMPLATES=$VPS_OPT/templates

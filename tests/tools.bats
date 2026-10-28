@@ -464,3 +464,54 @@ exit 0'
   [ "$status" -eq 0 ]
   ! grep -q cfd_tunnel "$BATS_TEST_TMPDIR/curl.urls"
 }
+
+# --- rilancio in un'unità systemd (ProtectSystem=full di PHP-FPM) ------------------
+
+# systemd-run finto: annota gli argomenti e lo stdin, risponde e esce con 7.
+_sdrun_stub() {
+  # shellcheck disable=SC2016
+  make_stub systemd-run 'echo "systemd-run $*" >>"$BATS_TEST_TMPDIR/sdrun.calls"; cat >"$BATS_TEST_TMPDIR/sdrun.stdin"; echo "{\"ok\":true,\"interno\":true}"; exit 7'
+}
+
+@test "vps-cf-ips-update sotto sudo si rilancia con systemd-run (scrive in /etc), uscita e codice compresi" {
+  _sdrun_stub
+  run bash -c "SUDO_USER=panel bash '$T/vps-cf-ips-update' </dev/null"
+  [ "$status" -eq 7 ]
+  [ "$output" = '{"ok":true,"interno":true}' ]
+  grep -qx 'systemd-run --wait --pipe --collect --quiet --service-type=exec --setenv=VPS_CFIPS_VIA_SYSTEMD=1 /opt/vps/bin/vps-cf-ips-update' "$BATS_TEST_TMPDIR/sdrun.calls"
+}
+
+@test "vps-smtp set e disable sotto sudo si rilanciano con systemd-run, stdin compreso" {
+  _sdrun_stub
+  run bash -c "printf '{\"pass\":\"segreta\"}' | SUDO_USER=panel bash '$T/vps-smtp' set"
+  [ "$status" -eq 7 ]
+  [ "$output" = '{"ok":true,"interno":true}' ]
+  grep -qx 'systemd-run --wait --pipe --collect --quiet --service-type=exec --setenv=VPS_SMTP_VIA_SYSTEMD=1 /opt/vps/bin/vps-smtp set' "$BATS_TEST_TMPDIR/sdrun.calls"
+  [ "$(cat "$BATS_TEST_TMPDIR/sdrun.stdin")" = '{"pass":"segreta"}' ]
+  run bash -c "SUDO_USER=panel bash '$T/vps-smtp' disable </dev/null"
+  [ "$status" -eq 7 ]
+  grep -qx 'systemd-run --wait --pipe --collect --quiet --service-type=exec --setenv=VPS_SMTP_VIA_SYSTEMD=1 /opt/vps/bin/vps-smtp disable' "$BATS_TEST_TMPDIR/sdrun.calls"
+  [ "$(wc -l <"$BATS_TEST_TMPDIR/sdrun.calls")" -eq 2 ]
+}
+
+@test "vps-pma-pass set sotto sudo si rilancia con systemd-run (.htpasswd-pma è in /etc/nginx), password su stdin" {
+  _sdrun_stub
+  run bash -c "printf 'Password-lunga-1' | SUDO_USER=panel bash '$T/vps-pma-pass' set"
+  [ "$status" -eq 7 ]
+  [ "$output" = '{"ok":true,"interno":true}' ]
+  grep -qx 'systemd-run --wait --pipe --collect --quiet --service-type=exec --setenv=VPS_PMAPASS_VIA_SYSTEMD=1 /opt/vps/bin/vps-pma-pass set' "$BATS_TEST_TMPDIR/sdrun.calls"
+  [ "$(cat "$BATS_TEST_TMPDIR/sdrun.stdin")" = 'Password-lunga-1' ]
+}
+
+@test "rilancio: già dentro l'unità (VIA_SYSTEMD, senza SUDO_USER) nessun nuovo systemd-run" {
+  _sdrun_stub
+  for t in vps-cf-ips-update vps-smtp vps-pma-pass; do
+    grep -q 'if \[\[ -n "${SUDO_USER:-}" && -z "${VPS_[A-Z]*_VIA_SYSTEMD:-}" \]\]; then' "$T/$t"
+    # nell'unità l'ambiente si ripulisce come sotto sudo
+    grep -q 'if \[\[ -n "${SUDO_USER:-}" || -n "${VPS_[A-Z]*_VIA_SYSTEMD:-}" \]\]; then' "$T/$t"
+  done
+  # vps-smtp show e test, vps-pma-pass dbadmin non scrivono in /etc: niente rilancio
+  run bash -c "VPS_SMTP_VIA_SYSTEMD= bash '$T/vps-smtp' show"
+  [ "$status" -eq 0 ]
+  [ ! -e "$BATS_TEST_TMPDIR/sdrun.calls" ]
+}
