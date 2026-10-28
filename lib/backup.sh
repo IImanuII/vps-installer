@@ -623,9 +623,44 @@ bk_drive_json() {
   printf '%s' "${out:-null}"
 }
 
+# Cache di bk_drive_json: il pannello chiede status di continuo (la pagina Backup fa
+# poll) e `rclone about` costa fino a 20 s e una chiamata alle API di Google. Lo
+# spazio cambia solo con un giro o un nuovo collegamento, che tolgono la cache.
+: "${BK_DRIVE_CACHE:=$BK_DIR/drive.json}"
+# Secondi di validità: un dato buono 15 minuti, un fallimento 2 (per riprovare presto
+# senza martellare Drive a ogni poll).
+: "${BK_DRIVE_TTL:=900}" "${BK_DRIVE_TTL_FAIL:=120}"
+
+# bk_drive_cache_clear — toglie la cache dello spazio di Drive (collegamento cambiato,
+# giro finito). Un errore non ferma chi la chiama: al peggio il dato scade da solo.
+bk_drive_cache_clear() {
+  rm -f "$BK_DRIVE_CACHE" 2>/dev/null || true
+}
+
+# bk_drive_cached — stampa {checked_at, drive}: dalla cache se ancora valida, altrimenti
+# chiede a Drive (bk_drive_json) e la riscrive (600, temporaneo + mv). Una cache rovinata
+# o con l'ora nel futuro (orologio spostato) non vale.
+bk_drive_cached() {
+  local now c=""
+  now="$(date +%s)"
+  if [[ -f "$BK_DRIVE_CACHE" ]]; then
+    c="$(jq -c --argjson now "$now" --argjson ok "$BK_DRIVE_TTL" --argjson ko "$BK_DRIVE_TTL_FAIL" '
+      select(type == "object" and (.checked_at | type) == "number" and .checked_at <= $now
+        and (.drive == null or ((.drive | type) == "object" and (.drive.used | type) == "number" and (.drive.total | type) == "number"))
+        and ($now - .checked_at) < (if .drive == null then $ko else $ok end))
+      | {checked_at, drive}' "$BK_DRIVE_CACHE" 2>/dev/null)" || c=""
+  fi
+  if [[ -z "$c" ]]; then
+    c="$(jq -nc --argjson t "$now" --argjson d "$(bk_drive_json)" '{checked_at: $t, drive: $d}')"
+    { install -d -m 700 "$BK_DIR" && printf '%s\n' "$c" | write_file "$BK_DRIVE_CACHE" 600 root:root; } 2>/dev/null ||
+      log "vps-backup: cache dello spazio di Drive non scritta"
+  fi
+  printf '%s' "$c"
+}
+
 # bk_status_json — risposta di `vps-backup status`.
 bk_status_json() {
-  local cfg state='{}' drive=null conn=false interrupted running=0 ijob
+  local cfg state='{}' drive=null conn=false interrupted running=0 ijob dc checked=null
   bk_auth_prune
   # Prima si guarda se un giro è vivo (lock o unità systemd), poi si legge lo stato:
   # un giro che parte o finisce nel frattempo non può essere dichiarato interrotto.
@@ -635,7 +670,10 @@ bk_status_json() {
   [[ -n "$state" ]] || state='{}'
   if [[ -f "$BK_RCLONE_CONF" ]]; then
     conn=true
-    drive="$(bk_drive_json)"
+    dc="$(bk_drive_cached)"
+    drive="$(jq -c .drive <<<"$dc")"
+    # Età del dato, nello stesso formato delle altre date di stato (ora del server).
+    checked="$(date -d "@$(jq -r .checked_at <<<"$dc")" -Iseconds | jq -R .)"
   fi
   # Un giro morto (kill, riavvio) lascia `job` in state.json: se il lock globale è
   # libero e nessuna unità gira, nessuno sta più lavorando: niente job e
@@ -648,9 +686,10 @@ bk_status_json() {
     state="$(jq -c '.job = null' <<<"$state")"
   fi
   jq -nc --argjson c "$cfg" --argjson s "$state" --argjson d "$drive" --argjson conn "$conn" --argjson i "$interrupted" --argjson ij "$ijob" --argjson a "$(bk_auth_json)" \
+    --argjson dca "$checked" \
     '{ok: true, connected: $conn, folder: $c.folder, enabled: $c.enabled, time: $c.time,
       job: ($s.job // null), interrupted: $i, interrupted_job: $ij, last_run: ($s.last_run // null),
-      last_restore: ($s.last_restore // null), drive: $d, auth: $a}'
+      last_restore: ($s.last_restore // null), drive: $d, drive_checked_at: $dca, auth: $a}'
 }
 
 # bk_connect DATI_STDIN — riga 1: token JSON di `rclone authorize`; righe 2-3
@@ -720,6 +759,9 @@ bk_connect() {
     BK_ERR="file del collegamento non scritto: nulla è cambiato"
     return 1
   fi
+  # Collegamento nuovo (o, se Drive lo rifiuta, quello di prima rimesso): lo spazio
+  # in cache poteva essere di un altro account.
+  bk_drive_cache_clear
 
   read -ra cmd <<<"$BK_RCLONE"
   # Pochi tentativi: con i 10 predefiniti (e le attese crescenti) il tetto di tempo
@@ -1286,6 +1328,8 @@ bk_run_all() {
     _bk_purge_gone "$folder" || log "vps-backup: pulizia delle cartelle di Drive non riuscita"
     last="$(_bk_last_json "$alert")"
   fi
+  # Caricamenti ed eliminazioni hanno cambiato lo spazio usato su Drive.
+  bk_drive_cache_clear
   _bk_state_write null "$last" || { log "vps-backup: state.json non scritto"; rc=1; }
   st="$(jq -c '{ok: true, finished: true, all_ok: .ok}' <<<"$last")"
   log "vps-backup: giro finito ($st)"

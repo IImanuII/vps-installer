@@ -720,7 +720,7 @@ wait_for_file() {
   bk_tool_env
   bk_tool status
   [ "$status" -eq 0 ]
-  jq -e --arg f "Plancia-$(hostname -s)" '. == {ok:true,connected:false,folder:$f,enabled:false,time:"04:00",job:null,interrupted:false,interrupted_job:null,last_run:null,last_restore:null,drive:null,auth:{pending:false,expires:null}}' <<<"$output"
+  jq -e --arg f "Plancia-$(hostname -s)" '. == {ok:true,connected:false,folder:$f,enabled:false,time:"04:00",job:null,interrupted:false,interrupted_job:null,last_run:null,last_restore:null,drive:null,drive_checked_at:null,auth:{pending:false,expires:null}}' <<<"$output"
   [ ! -e "$BATS_TEST_TMPDIR/rclone.calls" ]
 }
 
@@ -750,6 +750,76 @@ J
   bk_tool status
   [ "$status" -eq 0 ]
   jq -e '.ok == true and .connected == true and .drive == null' <<<"$output"
+}
+
+# about_calls — quante volte status ha chiesto lo spazio a Drive.
+about_calls() { grep -c ' about ' "$BATS_TEST_TMPDIR/rclone.calls" 2>/dev/null || true; }
+
+@test "vps-backup status: spazio di Drive in cache (600) per 15 minuti, con drive_checked_at" {
+  bk_tool_env
+  echo x >"$VPS_OPT/secrets/rclone.conf"
+  echo '{"used":1234,"total":5000}' >"$BATS_TEST_TMPDIR/about.json"
+  bk_tool status
+  [ "$status" -eq 0 ]
+  jq -e '.drive == {used:1234,total:5000} and (.drive_checked_at | type) == "string"' <<<"$output"
+  [ "$(about_calls)" -eq 1 ]
+  [ "$(stat -c %a "$BK_DIR/drive.json")" = 600 ]
+  # la seconda volta Drive non si chiama: il dato è quello della cache, con la sua età
+  echo '{"used":9,"total":5000}' >"$BATS_TEST_TMPDIR/about.json"
+  at="$(jq -r .drive_checked_at <<<"$output")"
+  bk_tool status
+  jq -e --arg at "$at" '.drive.used == 1234 and .drive_checked_at == $at' <<<"$output"
+  [ "$(about_calls)" -eq 1 ]
+  # dopo 15 minuti si richiede
+  jq '.checked_at -= 901' "$BK_DIR/drive.json" >"$BK_DIR/d.tmp" && mv "$BK_DIR/d.tmp" "$BK_DIR/drive.json"
+  bk_tool status
+  jq -e '.drive.used == 9' <<<"$output"
+  [ "$(about_calls)" -eq 2 ]
+  # una cache rovinata o nel futuro non vale
+  echo garbage >"$BK_DIR/drive.json"
+  bk_tool status
+  [ "$status" -eq 0 ]
+  [ "$(about_calls)" -eq 3 ]
+  jq '.checked_at += 3600' "$BK_DIR/drive.json" >"$BK_DIR/d.tmp" && mv "$BK_DIR/d.tmp" "$BK_DIR/drive.json"
+  bk_tool status
+  [ "$(about_calls)" -eq 4 ]
+}
+
+@test "vps-backup status: Drive che non risponde resta in cache solo 2 minuti" {
+  bk_tool_env
+  echo x >"$VPS_OPT/secrets/rclone.conf"
+  bk_tool status
+  jq -e '.drive == null and (.drive_checked_at | type) == "string"' <<<"$output"
+  [ "$(about_calls)" -eq 1 ]
+  echo '{"used":7,"total":0}' >"$BATS_TEST_TMPDIR/about.json"
+  bk_tool status
+  jq -e '.drive == null' <<<"$output"
+  [ "$(about_calls)" -eq 1 ]
+  jq '.checked_at -= 121' "$BK_DIR/drive.json" >"$BK_DIR/d.tmp" && mv "$BK_DIR/d.tmp" "$BK_DIR/drive.json"
+  bk_tool status
+  jq -e '.drive == {used:7,total:0}' <<<"$output"
+  [ "$(about_calls)" -eq 2 ]
+}
+
+@test "vps-backup: collegamento, scollegamento e giro tolgono la cache dello spazio di Drive" {
+  bk_tool_env
+  echo '{"used":1,"total":2}' >"$BATS_TEST_TMPDIR/about.json"
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -eq 0 ]
+  bk_tool status
+  [ -f "$BK_DIR/drive.json" ]
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -eq 0 ]
+  [ ! -e "$BK_DIR/drive.json" ]
+  bk_tool status
+  [ -f "$BK_DIR/drive.json" ]
+  bk_tool disconnect
+  [ "$status" -eq 0 ]
+  [ ! -e "$BK_DIR/drive.json" ]
+  # scollegato: niente spazio, niente cache
+  bk_tool status
+  jq -e '.drive == null and .drive_checked_at == null' <<<"$output"
+  [ ! -e "$BK_DIR/drive.json" ]
 }
 
 @test "vps-backup status: config.json o state.json rovinati = predefiniti" {
@@ -941,8 +1011,11 @@ drive_files() { ls "$DRIVE/F/$1" 2>/dev/null || true; }
   mk_site a.it yes
   mk_site b.it no
   mk_site c.it yes
+  # lo spazio usato su Drive cambia: la cache di status non vale più
+  echo '{"checked_at":1,"drive":null}' >"$BK_DIR/drive.json"
   bk_tool _run
   [ "$status" -eq 0 ]
+  [ ! -e "$BK_DIR/drive.json" ]
   [ "$(grep -c ' copyto ' "$BATS_TEST_TMPDIR/rclone.calls")" -eq 4 ]
   for d in a.it b.it c.it; do
     [ "$(drive_files $d)" = "$d-20261001-0400.tar.gz" ]
