@@ -901,7 +901,6 @@ _BK_SITES='[]'
 _BK_PANEL='null'
 _BK_PURGED='[]'
 _BK_STARTED=""
-_BK_PREV_LAST='null'
 _BK_KNOWN='[]'
 _BK_RCRC=0
 _BK_LAST_RESTORE='null'
@@ -932,23 +931,56 @@ _bk_rcq() {
   return "$rc"
 }
 
-# _bk_state_write JOB LAST — state.json (600) con sostituzione atomica. L'esito
-# dell'ultimo ripristino (last_restore) sta nello stesso file: un giro non lo cancella.
-# `known` sono
-# i domini che questa installazione ha già salvato almeno una volta: solo quelli si
-# potranno eliminare da Drive (una VPS ricostruita non cancella le copie di altri).
-_bk_state_write() {
-  install -d -m 700 "$BK_DIR" || return 1
-  jq -nc --argjson j "$1" --argjson l "$2" --argjson k "$_BK_KNOWN" --argjson r "$_BK_LAST_RESTORE" \
-    '{job: $j, last_run: $l, known: $k, last_restore: $r}' | write_file "$BK_STATE" 600 root:root
+# Lock di state.json: breve, solo per il tempo di rileggere e riscrivere il file. Il
+# lock globale non basta: un giro notturno saltato (_bk_busy_skip) scrive last_run
+# proprio mentre un ripristino tiene il lock globale e scrive il suo job.
+: "${BK_STATE_LOCK_WAIT:=30}"
+
+bk_state_lock_file() {
+  printf '%s/vps-backup-state.lock' "$BK_LOCK_DIR"
 }
 
-# _bk_progress PASSO [DOMINIO] — il pannello legge job.step e job.domain.
+# _bk_state_set CAMPI_JSON — state.json (600, sostituzione atomica) con i campi dati
+# cambiati e gli altri riletti dal file sotto il lock di stato, mai da copie in memoria
+# (che un altro processo può aver superato nel frattempo). Ogni campo ha un padrone:
+# - job: chi tiene il lock globale (giro o ripristino);
+# - last_run: il giro, o il giro saltato; known: il giro;
+# - last_restore: il ripristino.
+# `known` sono i domini che questa installazione ha già salvato almeno una volta: solo
+# quelli si potranno eliminare da Drive (una VPS ricostruita non cancella le copie di
+# altri). 1 se il lock non arriva entro BK_STATE_LOCK_WAIT secondi o il file non si scrive.
+_bk_state_set() {
+  local campi="$1" lf fd cur='{}' w="$BK_STATE_LOCK_WAIT" rc=0
+  [[ "$w" =~ ^[0-9]{1,4}$ ]] || w=30
+  install -d -m 700 "$BK_DIR" || return 1
+  lf="$(bk_state_lock_file)"
+  # shellcheck disable=SC2261
+  { exec {fd}>>"$lf"; } 2>/dev/null || return 1
+  chmod 600 "$lf" 2>/dev/null || true
+  if ! flock -w "$w" "$fd"; then
+    exec {fd}>&-
+    return 1
+  fi
+  if [[ -f "$BK_STATE" ]]; then
+    cur="$(jq -cs 'if length == 1 and (.[0] | type) == "object" then .[0] else {} end' "$BK_STATE" 2>/dev/null)" || cur='{}'
+    [[ -n "$cur" ]] || cur='{}'
+  fi
+  jq -nc --argjson c "$cur" --argjson f "$campi" \
+    '{job: ($c.job // null), last_run: ($c.last_run // null),
+      known: (($c.known // []) | if type == "array" then map(select(type == "string")) else [] end),
+      last_restore: ($c.last_restore // null)} + $f' | write_file "$BK_STATE" 600 root:root || rc=1
+  exec {fd}>&-
+  return "$rc"
+}
+
+# _bk_progress PASSO [DOMINIO] — il pannello legge job.step e job.domain. Anche known:
+# un giro interrotto non deve dimenticare i domini già salvati.
 _bk_progress() {
   local job
   job="$(jq -nc --arg u "${BK_UNIT:-vps-backup.service}" --arg s "$_BK_STARTED" --arg st "$1" --arg d "${2-}" \
     '{unit: $u, op: "run", started: $s, step: $st, domain: (if $d == "" then null else $d end)}')"
-  _bk_state_write "$job" "$_BK_PREV_LAST" || log "vps-backup: state.json non scritto"
+  _bk_state_set "$(jq -nc --argjson j "$job" --argjson k "$_BK_KNOWN" '{job: $j, known: $k}')" ||
+    log "vps-backup: state.json non scritto"
 }
 
 # _bk_add_site DOMINIO OK(true|false) MOTIVO FILE DIMENSIONE ELIMINATE
@@ -1221,26 +1253,23 @@ _bk_last_json() {
     '{started: $st, finished: $fin, ok: $ok, sites: $s, panel: $p, purged: $pu, alert: $al}'
 }
 
-# _bk_state_load — azzera i dati del giro e rilegge da state.json last_run, known e
-# last_restore (quelli che ogni scrittura di state.json deve conservare).
+# _bk_state_load — azzera i dati del giro e rilegge da state.json known, che il giro
+# aggiorna in memoria (è l'unico a scriverlo, col lock globale in mano). Gli altri campi
+# non si tengono in memoria: _bk_state_set li rilegge sotto il lock di stato.
 _bk_state_load() {
-  _BK_SITES='[]' _BK_PANEL='null' _BK_PURGED='[]' _BK_PREV_LAST='null' _BK_KNOWN='[]' _BK_LAST_RESTORE='null'
+  _BK_SITES='[]' _BK_PANEL='null' _BK_PURGED='[]' _BK_KNOWN='[]'
   if [[ -f "$BK_STATE" ]]; then
-    _BK_LAST_RESTORE="$(jq -c '.last_restore // null' "$BK_STATE" 2>/dev/null)" || _BK_LAST_RESTORE='null'
-    [[ -n "$_BK_LAST_RESTORE" ]] || _BK_LAST_RESTORE='null'
-    _BK_PREV_LAST="$(jq -c '.last_run // null' "$BK_STATE" 2>/dev/null)" || _BK_PREV_LAST='null'
     _BK_KNOWN="$(jq -c '(.known // []) | if type == "array" then map(select(type == "string")) else [] end' "$BK_STATE" 2>/dev/null)" || _BK_KNOWN='[]'
   fi
-  [[ -n "$_BK_PREV_LAST" ]] || _BK_PREV_LAST='null'
   [[ -n "$_BK_KNOWN" ]] || _BK_KNOWN='[]'
 }
 
 # _bk_busy_skip — il giro notturno ha aspettato il lock globale invano (un ripristino
 # lungo): niente giro, ma l'esito si scrive in last_run (ok:false) e l'avviso Telegram
-# parte come per un giro fallito. Il lock non è in mano: state.json si rilegge e si
-# riscrive subito, conservando il job di chi lo tiene.
+# parte come per un giro fallito. Il lock globale non è in mano: si scrive solo last_run
+# (sotto il lock di stato), il job di chi tiene il lock globale resta quello del file.
 _bk_busy_skip() {
-  local alert last job
+  local alert last
   install -d -m 700 "$BK_BACKUPS" "$BK_BACKUPS/tmp"
   BK_RUN_DIR="$(mktemp -d "$BK_BACKUPS/tmp/bk.skip.XXXXXX")"
   # shellcheck disable=SC2064
@@ -1250,9 +1279,7 @@ _bk_busy_skip() {
   _BK_PANEL='{"ok":false,"error":"ripristino in corso","file":null}'
   alert="$(_bk_alert)"
   last="$(_bk_last_json "$alert")"
-  job="$(jq -c '.job // null' "$BK_STATE" 2>/dev/null)" || job=null
-  [[ -n "$job" ]] || job=null
-  _bk_state_write "$job" "$last" || log "vps-backup: state.json non scritto"
+  _bk_state_set "$(jq -nc --argjson l "$last" '{last_run: $l}')" || log "vps-backup: state.json non scritto"
   log "vps-backup: giro notturno saltato, ripristino in corso"
   printf '{"ok":false,"error":"ripristino in corso"}\n'
 }
@@ -1323,14 +1350,15 @@ bk_run_all() {
   alert="$(_bk_alert)"
   last="$(_bk_last_json "$alert")"
   if ((drive_ok)); then
-    _bk_state_write "$(jq -nc --arg u "${BK_UNIT:-vps-backup.service}" --arg s "$_BK_STARTED" \
-      '{unit: $u, started: $s, step: "purge", domain: null}')" "$last" || log "vps-backup: state.json non scritto"
+    _bk_state_set "$(jq -nc --arg u "${BK_UNIT:-vps-backup.service}" --arg s "$_BK_STARTED" --argjson l "$last" --argjson k "$_BK_KNOWN" \
+      '{job: {unit: $u, started: $s, step: "purge", domain: null}, last_run: $l, known: $k}')" || log "vps-backup: state.json non scritto"
     _bk_purge_gone "$folder" || log "vps-backup: pulizia delle cartelle di Drive non riuscita"
     last="$(_bk_last_json "$alert")"
   fi
   # Caricamenti ed eliminazioni hanno cambiato lo spazio usato su Drive.
   bk_drive_cache_clear
-  _bk_state_write null "$last" || { log "vps-backup: state.json non scritto"; rc=1; }
+  _bk_state_set "$(jq -nc --argjson l "$last" --argjson k "$_BK_KNOWN" '{job: null, last_run: $l, known: $k}')" ||
+    { log "vps-backup: state.json non scritto"; rc=1; }
   st="$(jq -c '{ok: true, finished: true, all_ok: .ok}' <<<"$last")"
   log "vps-backup: giro finito ($st)"
   printf '%s\n' "$st"
@@ -2053,7 +2081,7 @@ _bk_rprogress() {
   job="$(jq -nc --arg u "${BK_UNIT:-vps-backup-restore}" --arg s "$_BK_STARTED" --arg st "$1" --arg d "$_BK_R_DOM" \
     --arg sf "${_BK_SAFETY##*/}" \
     '{unit: $u, op: "restore", started: $s, step: $st, domain: $d, safety: (if $sf == "" then null else $sf end)}')"
-  _bk_state_write "$job" "$_BK_PREV_LAST" || log "vps-backup: state.json non scritto"
+  _bk_state_set "$(jq -nc --argjson j "$job" '{job: $j}')" || log "vps-backup: state.json non scritto"
 }
 
 # _bk_restore_do SRC DOMINIO NOME MODO SLUG RADICE — i passi. Prima tutto ciò che non
@@ -2274,15 +2302,9 @@ bk_restore_run() {
   # shellcheck disable=SC2064
   trap "rm -rf -- '$BK_RUN_DIR'" EXIT
   _BK_STARTED="$(date -Iseconds)"
-  _BK_PREV_LAST='null' _BK_KNOWN='[]' _BK_LAST_RESTORE='null'
-  if [[ -f "$BK_STATE" ]]; then
-    _BK_PREV_LAST="$(jq -c '.last_run // null' "$BK_STATE" 2>/dev/null)" || _BK_PREV_LAST='null'
-    _BK_KNOWN="$(jq -c '(.known // []) | if type == "array" then map(select(type == "string")) else [] end' "$BK_STATE" 2>/dev/null)" || _BK_KNOWN='[]'
-    _BK_LAST_RESTORE="$(jq -c '.last_restore // null' "$BK_STATE" 2>/dev/null)" || _BK_LAST_RESTORE='null'
-  fi
-  [[ -n "$_BK_PREV_LAST" ]] || _BK_PREV_LAST='null'
-  [[ -n "$_BK_KNOWN" ]] || _BK_KNOWN='[]'
-  [[ -n "$_BK_LAST_RESTORE" ]] || _BK_LAST_RESTORE='null'
+  # Il ripristino scrive in state.json solo job e last_restore: last_run e known sono del
+  # giro (anche di un giro saltato che li scrive mentre questo lavora).
+  _BK_LAST_RESTORE='null'
   _bk_rprogress start
   bk_prune_site_tmp "$slug" "$root"
   # avanzi di una prova uccisa a metà (utente e database temporanei): via anche se
@@ -2322,7 +2344,7 @@ bk_restore_run() {
     '{domain: $d, mode: $m, source: $s, name: $n, started: $st, finished: $f, ok: $ok,
       error: (if $e == "" then null else $e end), safety: (if $sf == "" then null else $sf end),
       backup_date: (if $bd == "" then null else $bd end), alert: $al}')"
-  _bk_state_write null "$_BK_PREV_LAST" || log "vps-backup: state.json non scritto"
+  _bk_state_set "$(jq -nc --argjson r "$_BK_LAST_RESTORE" '{job: null, last_restore: $r}')" || log "vps-backup: state.json non scritto"
   log "vps-backup: ripristino di $d finito (ok=$ok)"
   jq -nc --argjson ok "$ok" '{ok: true, finished: true, restore_ok: $ok}'
   [[ "$ok" == true ]]

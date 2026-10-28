@@ -1301,6 +1301,59 @@ drive_files() { ls "$DRIVE/F/$1" 2>/dev/null || true; }
   [ -z "$(drive_files _pannello)" ]
 }
 
+@test "state.json: il giro saltato scrive sotto il lock di stato e conserva il job scritto nel frattempo dal ripristino" {
+  bk_run_env
+  mk_site a.it no
+  # un ripristino tiene il lock globale e ha scritto il suo job
+  exec {gl}>>"$BK_LOCK_DIR/vps-backup.lock"
+  flock -n "$gl"
+  echo '{"job":{"op":"restore","step":"start","domain":"a.it"},"last_run":null,"known":["a.it"],"last_restore":{"domain":"b.it","ok":true}}' >"$BK_STATE"
+  # ... e sta per riscriverlo: tiene il lock di stato
+  exec {sl}>>"$BK_LOCK_DIR/vps-backup-state.lock"
+  flock -n "$sl"
+  # il giro saltato non deve ereditare il lock di stato del test (lo terrebbe lui)
+  (exec {sl}>&-; BK_RUN_LOCK_WAIT=1 bk_tool _run; echo "$status" >"$BATS_TEST_TMPDIR/skip.rc") &
+  local bg=$!
+  # l'avviso parte prima della scrittura dello stato: da lì il giro saltato vuole scrivere
+  wait_for_file "$BATS_TEST_TMPDIR/curl.args"
+  sleep 0.5
+  # il ripristino scrive il passo successivo e lascia il lock di stato
+  echo '{"job":{"op":"restore","step":"files","domain":"a.it"},"last_run":null,"known":["a.it"],"last_restore":{"domain":"b.it","ok":true}}' >"$BK_STATE"
+  exec {sl}>&-
+  wait "$bg"
+  exec {gl}>&-
+  [ "$(cat "$BATS_TEST_TMPDIR/skip.rc")" = 1 ]
+  jq -e '.job.step == "files" and .last_run.panel.error == "ripristino in corso"
+    and .known == ["a.it"] and .last_restore.domain == "b.it"' "$BK_STATE"
+}
+
+@test "state.json: il ripristino a fine lavoro non cancella last_run e known scritti da altri mentre lavorava" {
+  rs_env
+  rs_site
+  echo '{"job":null,"last_run":{"ok":true,"started":"vecchio"},"known":["a.it"],"last_restore":null}' >"$BK_STATE"
+  # mentre il ripristino lavora (passo cache), un giro saltato scrive il suo last_run
+  # shellcheck disable=SC2016
+  make_stub vps-cf-purge 'cat >/dev/null
+jq -c ".last_run = {ok: false, started: \"saltato\"} | .known += [\"z.it\"]" "$BK_STATE" >"$BK_STATE.t" && mv "$BK_STATE.t" "$BK_STATE"'
+  rs_run local a.it "$ARC_NAME" files
+  [ "$status" -eq 0 ]
+  jq -e '.job == null and .last_run.started == "saltato" and .known == ["a.it","z.it"]
+    and .last_restore.domain == "a.it" and .last_restore.ok == true' "$BK_STATE"
+  [ "$(stat -c %a "$BK_STATE")" = 600 ]
+}
+
+@test "state.json: il lock di stato occupato troppo a lungo = stato non scritto e registrato, il lavoro va avanti" {
+  rs_env
+  rs_site
+  exec {sl}>>"$BK_LOCK_DIR/vps-backup-state.lock"
+  flock -n "$sl"
+  BK_STATE_LOCK_WAIT=1 rs_run local a.it "$ARC_NAME" files
+  exec {sl}>&-
+  [ "$status" -eq 0 ]
+  [ ! -e "$BK_STATE" ]
+  grep -q 'state.json non scritto' "$VPS_LOG"
+}
+
 @test "run: parte come unità systemd vps-backup-run e risponde subito" {
   bk_run_env
   bk_tool run
