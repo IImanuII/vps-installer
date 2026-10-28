@@ -58,11 +58,12 @@ site_reg_update() {
   printf '%s\n' "$json" | site_reg_write "$d"
 }
 
-# site_reg_new DOMINIO TIPO WWW DB — registro di un sito appena chiesto (WWW e DB: yes|no).
+# site_reg_new DOMINIO TIPO WWW DB [CUSTOM] — registro di un sito appena chiesto
+# (WWW, DB e CUSTOM, le regole Nginx a mano: yes|no; CUSTOM assente = no).
 site_reg_new() {
-  jq -n --arg d "$1" --arg slug "$(site_slug "$1")" --arg t "$2" --arg www "$3" --arg db "$4" \
+  jq -n --arg d "$1" --arg slug "$(site_slug "$1")" --arg t "$2" --arg www "$3" --arg db "$4" --arg c "${5:-no}" \
     --arg at "$(date -Iseconds)" --arg ts "$(date +%s)" '
-    {domain: $d, slug: $slug, type: $t, www: ($www == "yes"), db: ($db == "yes"),
+    {domain: $d, slug: $slug, type: $t, www: ($www == "yes"), db: ($db == "yes"), custom_rules: ($c == "yes"),
      state: "creating", zone: null, dns_records: [],
      job: {op: "create", step: "queued", error: null, updated_at: $at, ts: ($ts | tonumber)},
      created_at: $at}' | site_reg_write "$1"
@@ -1006,11 +1007,22 @@ site_refresh_locked() {
 # Si guarda public/ solo per i siti PHP attivi, gli unici su cui wp-install è
 # ammesso: per gli altri è false senza toccare il disco (il pannello chiede la
 # lista ogni 3 s).
+# Aggiunge anche le regole Nginx a mano: custom_rules e custom_restored (bool, assenti
+# = false) e custom_files, null se entrambi falsi. Il disco si guarda solo per
+# cron_review, e solo con custom_restored vero, per lo stesso motivo.
 site_reg_json_full() {
-  local d p=false
+  local d p=false dom review=null
   d="$(jq -r 'select(.type == "php" and .state == "active") | .domain // empty' "$1")"
   if [[ -n "$d" ]] && site_placeholder_intact "$d"; then p=true; fi
-  jq --argjson p "$p" '. + {placeholder: $p}' "$1"
+  dom="$(jq -r '.domain' "$1")"
+  if [[ "$(jq -r '.custom_restored // false' "$1")" == true && -e "$(site_custom_review "$dom")" ]]; then
+    review="$(jq -n --arg r "$(site_custom_review "$dom")" '$r')"
+  fi
+  jq --argjson p "$p" --argjson review "$review" --arg conf "$(site_custom_conf "$dom")" \
+    --arg http "$(site_custom_http "$dom")" --arg cron "$(site_custom_cron_prefix "$dom")" '
+    (.custom_rules // false) as $c | (.custom_restored // false) as $r
+    | . + {placeholder: $p, custom_rules: $c, custom_restored: $r,
+           custom_files: (if $c or $r then {conf: $conf, http_conf: $http, cron_prefix: $cron, cron_review: $review} else null end)}' "$1"
 }
 
 site_list_json() {

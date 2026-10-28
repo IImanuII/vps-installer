@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # vps-site — i siti della VPS: zones, list, show, create, disable, enable,
-# delete, db-create, db-password. Contratto in docs/PANEL-HANDOFF.md, sezione 4.
+# delete, db-create, db-password, rules (regole Nginx a mano dei siti PHP). Contratto in docs/PANEL-HANDOFF.md, sezione 4.
 # Lo esegue il pannello con sudo; _run e _prune li lanciano solo systemd e cron,
 # quindi attraverso sudo (o il rilancio qui sotto) si rifiutano prima ancora di
 # caricare le librerie. Questo controllo deve restare il primo.
@@ -59,7 +59,7 @@ esac
 tool_init
 
 usage() {
-  json_err "uso: vps-site zones | list | show D | create D --type static|php [--www] [--db] | create D --type wordpress [--www] --title T --admin-user U --admin-email E --login-path P [--cloudflare] | create D --from-backup NOME (sites/FILE, restore/FILE o remote:dominio/file; password del database da stdin se la copia ha un database) | wp-install D --title T --admin-user U --admin-email E --login-path P [--cloudflare] | disable D | enable D | delete D | db-create D | db-password D (password da stdin per --db, db-create, db-password, wp-install; due righe per create wordpress: database e admin WordPress)"
+  json_err "uso: vps-site zones | list | show D | create D --type static|php [--www] [--db] [--custom-rules] | create D --type wordpress [--www] --title T --admin-user U --admin-email E --login-path P [--cloudflare] | create D --from-backup NOME (sites/FILE, restore/FILE o remote:dominio/file; password del database da stdin se la copia ha un database) | wp-install D --title T --admin-user U --admin-email E --login-path P [--cloudflare] | disable D | enable D | delete D | db-create D | db-password D | rules D on|off (password da stdin per --db, db-create, db-password, wp-install; due righe per create wordpress: database e admin WordPress)"
 }
 
 need_cf() {
@@ -194,7 +194,7 @@ case "$cmd" in
   create)
     d="${1:-}"
     shift || true
-    type="" www=no db=no fb=""
+    type="" www=no db=no fb="" custom=no
     wp_args=()
     while (($#)); do
       case "$1" in
@@ -211,6 +211,11 @@ case "$cmd" in
         --db)
           [[ "$db" == no ]] || usage
           db=yes
+          shift
+          ;;
+        --custom-rules)
+          [[ "$custom" == no ]] || usage
+          custom=yes
           shift
           ;;
         --from-backup)
@@ -238,6 +243,7 @@ case "$cmd" in
     if [[ -n "$fb" ]]; then
       # ricreato da una copia: tipo, www e database vengono dal manifest, WordPress non
       # si installa (i file e il database arrivano dal ripristino)
+      [[ "$custom" == no ]] || json_err "con --from-backup il sito si ricrea con le regole standard: togli --custom-rules"
       [[ -z "$type" && "$www" == no && "$db" == no && ${#wp_args[@]} -eq 0 ]] \
         || json_err "con --from-backup il tipo, www e il database vengono dalla copia: togli --type, --www, --db e le opzioni di WordPress"
       valid_domain "$d" || json_err "dominio non valido: $d"
@@ -258,6 +264,7 @@ case "$cmd" in
       [[ "$type" == wordpress || ${#wp_args[@]} -eq 0 ]] || usage
       [[ "$type" != wordpress || "$db" == no ]] || json_err "WordPress ha sempre il database: togli --db"
       [[ "$db" == no || "$type" == php ]] || json_err "il database si crea solo per i siti PHP"
+      [[ "$custom" == no || "$type" == php ]] || json_err "le regole Nginx a mano valgono solo per i siti PHP"
       if [[ "$type" == wordpress ]]; then
         db=yes
         parse_wp_opts "${wp_args[@]}"
@@ -286,7 +293,7 @@ case "$cmd" in
     elif [[ "$db" == yes ]]; then
       read_password
     fi
-    site_reg_new "$d" "$type" "$www" "$db"
+    site_reg_new "$d" "$type" "$www" "$db" "$custom"
     if [[ -n "$fb" ]]; then
       site_reg_update "$d" '.from_backup = {source: $s, name: $n, login_path: (if $l == "" then null else $l end), table_prefix: (if $t == "" then null else $t end)}' \
         --arg s "$FB_SRC" --arg n "$FB_NAME" --arg l "$FB_LOGIN" --arg t "$FB_PREFIX"
@@ -311,6 +318,7 @@ case "$cmd" in
     no_restore "$d"
     [[ "$(site_reg_get "$d" .type)" == php ]] || json_err "WordPress si installa solo su un sito PHP"
     [[ "$(site_reg_get "$d" .state)" == active ]] || json_err "il sito non è attivo"
+    [[ "$(site_reg_get "$d" .custom_rules)" != true ]] || json_err "disattiva prima le regole Nginx a mano"
     [[ "$(site_reg_get "$d" .db)" == true ]] || json_err "il sito non ha un database: aggiungilo prima"
     site_placeholder_intact "$d" || json_err "public/ non è vuota: WordPress si installa solo su un sito appena creato"
     need_wp
@@ -346,6 +354,24 @@ case "$cmd" in
     rm -f "$SITE_ERROR_FILE"
     site_reg_update "$d" '.state = $s' --arg s "$new"
     json_ok --arg s "$new" '{ok: true, state: $s}'
+    ;;
+  rules)
+    d="${1:-}"
+    if (($# != 2)) || [[ "$2" != on && "$2" != off ]]; then usage; fi
+    existing "$d"
+    no_restore "$d"
+    lock_now
+    state="$(site_reg_get "$d" .state)"
+    [[ "$state" == active || "$state" == disabled ]] || json_err "il sito non è pronto"
+    [[ "$(site_reg_get "$d" .type)" == php ]] || json_err "le regole Nginx a mano valgono solo per i siti PHP"
+    SITE_ERROR_FILE="$(mktemp)"
+    if ! site_custom_set "$d" "$2"; then
+      msg="$(site_error_text nginx)"
+      rm -f "$SITE_ERROR_FILE"
+      json_err "$msg"
+    fi
+    rm -f "$SITE_ERROR_FILE"
+    json_ok --argjson c "$([[ "$2" == on ]] && echo true || echo false)" '{ok: true, custom_rules: $c}'
     ;;
   delete)
     d="${1:-}"

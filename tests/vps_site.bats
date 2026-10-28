@@ -788,3 +788,160 @@ wp_opts=(--title "Il blog" --admin-user gestore --admin-email io@miosito.it --lo
   vs create blog.miosito.it --type static
   [ "$status" -eq 0 ]
 }
+
+# Sito PHP attivo (creato e portato in esercizio come fa il pannello).
+sito_php() {
+  vs create "$1" --type php "${@:2}"
+  bash "$T" _run create "$1"
+}
+
+@test "create --custom-rules: registro con custom_rules, solo per PHP, non con --from-backup" {
+  vs create blog.miosito.it --type php --custom-rules
+  [ "$status" -eq 0 ]
+  [ "$(site_reg_get blog.miosito.it .custom_rules)" = true ]
+  vs create fisso.miosito.it --type static --custom-rules
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "le regole Nginx a mano valgono solo per i siti PHP" ]
+  [ ! -e "$SITES_DIR/fisso.miosito.it.json" ]
+  run --separate-stderr bash -c "printf 'a\nb\n' | bash '$T' create wp.miosito.it --type wordpress --custom-rules --title T --admin-user gestore --admin-email io@miosito.it --login-path accesso-7k2f"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "le regole Nginx a mano valgono solo per i siti PHP" ]
+  [ ! -e "$SITES_DIR/wp.miosito.it.json" ]
+  vs create due.miosito.it --type php --custom-rules --custom-rules
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == uso:* ]]
+  [ ! -e "$SITES_DIR/due.miosito.it.json" ]
+  vs create copia.miosito.it --from-backup x --custom-rules
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "con --from-backup il sito si ricrea con le regole standard: togli --custom-rules" ]
+}
+
+@test "_run create con --custom-rules: file creati e vhost con gli include" {
+  sito_php blog.miosito.it --custom-rules
+  [ -f "$NGINX_CUSTOM_D/blog.miosito.it.conf" ]
+  [ -f "$NGINX_CUSTOM_D/blog.miosito.it.http.conf" ]
+  grep -qx "    include $NGINX_CUSTOM_D/blog.miosito.it.conf;" "$NGINX_CONF_D/blog.miosito.it.conf"
+  grep -q "include $NGINX_CUSTOM_D/blog.miosito.it.http.conf;" "$NGINX_CONF_D/blog.miosito.it.conf"
+}
+
+@test "rules on/off: JSON, registro, vhost; i file restano" {
+  sito_php blog.miosito.it
+  vs rules blog.miosito.it on
+  [ "$status" -eq 0 ]
+  [ "$(jq -c . <<<"$output")" = '{"ok":true,"custom_rules":true}' ]
+  [ "$(site_reg_get blog.miosito.it .custom_rules)" = true ]
+  grep -q vps-custom "$NGINX_CONF_D/blog.miosito.it.conf"
+  vs rules blog.miosito.it off
+  [ "$status" -eq 0 ]
+  [ "$(jq -c . <<<"$output")" = '{"ok":true,"custom_rules":false}' ]
+  [ "$(site_reg_get blog.miosito.it .custom_rules)" = false ]
+  run grep -c vps-custom "$NGINX_CONF_D/blog.miosito.it.conf"
+  [ "$output" = 0 ]
+  [ -f "$NGINX_CUSTOM_D/blog.miosito.it.conf" ]
+  [ -f "$NGINX_CUSTOM_D/blog.miosito.it.http.conf" ]
+  # idempotente: ripetere on ricrea un file mancante
+  rm "$NGINX_CUSTOM_D/blog.miosito.it.conf"
+  vs rules blog.miosito.it on
+  vs rules blog.miosito.it on
+  [ "$status" -eq 0 ]
+  [ -f "$NGINX_CUSTOM_D/blog.miosito.it.conf" ]
+}
+
+@test "rules on su sito disattivato: vhost di manutenzione intatto, enable rimette gli include" {
+  sito_php blog.miosito.it
+  vs disable blog.miosito.it
+  vs rules blog.miosito.it on
+  [ "$status" -eq 0 ]
+  [ "$(site_reg_get blog.miosito.it .custom_rules)" = true ]
+  grep -q 'return 503;' "$NGINX_CONF_D/blog.miosito.it.conf"
+  run grep -c vps-custom "$NGINX_CONF_D/blog.miosito.it.conf"
+  [ "$output" = 0 ]
+  vs enable blog.miosito.it
+  grep -q vps-custom "$NGINX_CONF_D/blog.miosito.it.conf"
+}
+
+@test "rules: sito statico o in creazione rifiutato, argomento non valido" {
+  vs create fisso.miosito.it --type static
+  bash "$T" _run create fisso.miosito.it
+  vs rules fisso.miosito.it on
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "le regole Nginx a mano valgono solo per i siti PHP" ]
+  vs create nuovo.miosito.it --type php
+  vs rules nuovo.miosito.it on
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "il sito non è pronto" ]
+  bash "$T" _run create nuovo.miosito.it
+  vs rules nuovo.miosito.it forse
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == uso:* ]]
+  vs rules nuovo.miosito.it
+  [ "$status" -eq 1 ]
+  vs rules nuovo.miosito.it on off
+  [ "$status" -eq 1 ]
+  [ "$(site_reg_get nuovo.miosito.it .custom_rules)" = false ]
+}
+
+@test "rules on con nginx -t che fallisce: registro di prima" {
+  sito_php blog.miosito.it
+  STUB_RC_nginx=1 vs rules blog.miosito.it on
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == *"configurazione Nginx"* ]]
+  [ "$(site_reg_get blog.miosito.it .custom_rules)" = false ]
+  run grep -c vps-custom "$NGINX_CONF_D/blog.miosito.it.conf"
+  [ "$output" = 0 ]
+}
+
+@test "rules off ripara un file a mano rotto" {
+  sito_php blog.miosito.it --custom-rules
+  # nginx finto: rifiuta solo un vhost che include i file a mano
+  # shellcheck disable=SC2016
+  make_stub nginx 'grep -q vps-custom "$NGINX_CONF_D/blog.miosito.it.conf" && exit 1; exit 0'
+  vs rules blog.miosito.it off
+  [ "$status" -eq 0 ]
+  [ "$(site_reg_get blog.miosito.it .custom_rules)" = false ]
+}
+
+@test "rules on e rules off tolgono custom_restored" {
+  sito_php blog.miosito.it
+  site_reg_update blog.miosito.it '.custom_restored = true'
+  vs rules blog.miosito.it on
+  [ "$(site_reg_get blog.miosito.it '.custom_restored // "assente"')" = assente ]
+  site_reg_update blog.miosito.it '.custom_restored = true'
+  vs rules blog.miosito.it off
+  [ "$(site_reg_get blog.miosito.it '.custom_restored // "assente"')" = assente ]
+  # off anche su un sito che le aveva già spente
+  site_reg_update blog.miosito.it '.custom_restored = true'
+  vs rules blog.miosito.it off
+  [ "$status" -eq 0 ]
+  [ "$(site_reg_get blog.miosito.it '.custom_restored // "assente"')" = assente ]
+}
+
+@test "wp-install rifiutato con le regole a mano" {
+  run bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --type php --db --custom-rules"
+  bash "$T" _run create blog.miosito.it
+  run --separate-stderr bash -c "printf 'Password-admin-wp-12345\n' | bash '$T' wp-install blog.miosito.it --title T --admin-user gestore --admin-email io@miosito.it --login-path accesso-7k2f"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "disattiva prima le regole Nginx a mano" ]
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+}
+
+@test "show e list: custom_rules, custom_restored e custom_files" {
+  sito_php blog.miosito.it
+  vs show blog.miosito.it
+  [ "$(jq -c '.site | [.custom_rules, .custom_restored, .custom_files]' <<<"$output")" = '[false,false,null]' ]
+  vs rules blog.miosito.it on
+  d="$NGINX_CUSTOM_D"
+  esperato="{\"conf\":\"$d/blog.miosito.it.conf\",\"http_conf\":\"$d/blog.miosito.it.http.conf\",\"cron_prefix\":\"$CRON_D/vps-site-site_blog_miosito_it-\",\"cron_review\":null}"
+  vs show blog.miosito.it
+  [ "$(jq -c '.site | [.custom_rules, .custom_restored]' <<<"$output")" = '[true,false]' ]
+  [ "$(jq -c .site.custom_files <<<"$output")" = "$esperato" ]
+  vs list
+  [ "$(jq -c '.sites[0].custom_files' <<<"$output")" = "$esperato" ]
+  # regole spente ma ricreazione da rivedere: custom_files c'è, cron_review solo se il file esiste
+  site_reg_update blog.miosito.it '.custom_rules = false | .custom_restored = true'
+  vs show blog.miosito.it
+  [ "$(jq -c '.site | [.custom_rules, .custom_restored, .custom_files.cron_review]' <<<"$output")" = '[false,true,null]' ]
+  : >"$d/blog.miosito.it.cron-da-rivedere"
+  vs list
+  [ "$(jq -r '.sites[0].custom_files.cron_review' <<<"$output")" = "$d/blog.miosito.it.cron-da-rivedere" ]
+}

@@ -60,3 +60,24 @@ _site_custom_files_write() {
       write_file "$f" 644 root:root || return 1
   fi
 }
+
+# site_custom_set DOMINIO on|off — accende o spegne le regole a mano. Salva il registro
+# di prima: se Nginx rifiuta il vhost nuovo si torna lì (il vhost lo rimette già
+# site_vhost_add). I file restano sempre, anche con off. Entrambi tolgono custom_restored,
+# anche off su un sito che le aveva già spente: è il modo per chiudere l'avviso di
+# ricreazione a chi non vuole le regole. Con il sito disattivato il vhost di
+# manutenzione non si tocca: gli include tornano con enable.
+site_custom_set() {
+  local d="$1" mode="$2" prev
+  prev="$(cat "$(site_reg_path "$d")")" || return 1
+  if [[ "$mode" == on ]]; then
+    site_custom_files_add "$d" || return 1
+    site_reg_update "$d" '.custom_rules = true | del(.custom_restored)' || return 1
+  else
+    site_reg_update "$d" '.custom_rules = false | del(.custom_restored)' || return 1
+  fi
+  if [[ "$(site_reg_get "$d" .state)" == active ]] && ! site_vhost_add "$d" normal; then
+    printf '%s\n' "$prev" | site_reg_write "$d"
+    return 1
+  fi
+}
