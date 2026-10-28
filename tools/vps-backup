@@ -9,8 +9,9 @@ if [[ ("${1:-}" == _run || "${1:-}" == _restore) && (-n "${SUDO_USER:-}" || -n "
   printf '{"ok":false,"error":"comando interno"}\n'
   exit 1
 fi
-# PHP-FPM gira con ProtectSystem=full: sudo lanciato dal pannello eredita il suo
-# spazio dei mount, dove /etc (il drop-in del timer) è in sola lettura. Ci si
+# Precauzione (vedi vps-site): sudo lanciato dal pannello eredita lo spazio dei mount
+# di PHP-FPM, che oggi su Debian 13 non ha ProtectSystem ma con ProtectSystem=full
+# (unità upstream) avrebbe /etc (il drop-in del timer) in sola lettura. Ci si
 # rilancia allora in un'unità systemd nuova: stdin (il token di Drive), stdout e
 # codice d'uscita passano intatti. Il percorso è assoluto e fisso.
 if [[ -n "${SUDO_USER:-}" && -z "${VPS_BACKUP_VIA_SYSTEMD:-}" ]]; then

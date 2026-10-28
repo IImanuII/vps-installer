@@ -2,9 +2,10 @@
 # vps-smtp show|set|test EMAIL|disable — configurazione email (JSON da stdin per set).
 # JSON: {"host","port","user","pass","from","alert_email"}; pass vuota = tieni quella salvata.
 # show non restituisce mai la password.
-# I comandi che scrivono in /etc: PHP-FPM gira con ProtectSystem=full, dove /etc è
-# in sola lettura, e sudo lanciato dal pannello ne eredita lo spazio dei mount. Ci si
-# rilancia allora in un'unità systemd nuova (come vps-site): stdin, stdout e codice
+# I comandi che scrivono in /etc (msmtprc, aliases). Precauzione (vedi vps-site): sudo
+# lanciato dal pannello eredita lo spazio dei mount di PHP-FPM, che oggi su Debian 13
+# non ha ProtectSystem ma con ProtectSystem=full (unità upstream) avrebbe /etc in sola
+# lettura. Ci si rilancia allora in un'unità systemd nuova: stdin, stdout e codice
 # d'uscita passano intatti. Il percorso è assoluto e fisso, mai preso dall'ambiente.
 case "${1:-}" in
   set | disable)

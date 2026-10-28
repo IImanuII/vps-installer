@@ -503,15 +503,19 @@ _sdrun_stub() {
   [ "$(cat "$BATS_TEST_TMPDIR/sdrun.stdin")" = 'Password-lunga-1' ]
 }
 
-@test "rilancio: già dentro l'unità (VIA_SYSTEMD, senza SUDO_USER) nessun nuovo systemd-run" {
+@test "rilancio: solo i comandi che scrivono in /etc; show, test e dbadmin sotto sudo restano qui" {
   _sdrun_stub
   for t in vps-cf-ips-update vps-smtp vps-pma-pass; do
     grep -q 'if \[\[ -n "${SUDO_USER:-}" && -z "${VPS_[A-Z]*_VIA_SYSTEMD:-}" \]\]; then' "$T/$t"
     # nell'unità l'ambiente si ripulisce come sotto sudo
     grep -q 'if \[\[ -n "${SUDO_USER:-}" || -n "${VPS_[A-Z]*_VIA_SYSTEMD:-}" \]\]; then' "$T/$t"
   done
-  # vps-smtp show e test, vps-pma-pass dbadmin non scrivono in /etc: niente rilancio
-  run bash -c "VPS_SMTP_VIA_SYSTEMD= bash '$T/vps-smtp' show"
-  [ "$status" -eq 0 ]
+  # Sotto sudo lo script usa i percorsi fissi (/opt/vps, /var/log): install e chmod finti
+  # perché il test non tocchi /var/log; l'esito non conta, conta che non si rilanci.
+  make_stub install 'exit 0'
+  make_stub chmod 'exit 0'
+  run bash -c "SUDO_USER=panel bash '$T/vps-smtp' show </dev/null; true"
+  run bash -c "SUDO_USER=panel bash '$T/vps-smtp' test a@b.it </dev/null; true"
+  run bash -c "printf 'Password-lunga-1' | SUDO_USER=panel bash '$T/vps-pma-pass' dbadmin; true"
   [ ! -e "$BATS_TEST_TMPDIR/sdrun.calls" ]
 }

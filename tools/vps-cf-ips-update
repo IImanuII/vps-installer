@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # vps-cf-ips-update — aggiorna real_ip di Nginx e regole UFW con gli IP Cloudflare.
-# PHP-FPM gira con ProtectSystem=full: sudo lanciato dal pannello eredita il suo
-# spazio dei mount, dove /etc è in sola lettura. Ci si rilancia allora in un'unità
-# systemd nuova, fuori da quella sandbox (come vps-site): stdin, stdout e codice
+# Scrive in /etc (snippet di Nginx, regole UFW). Precauzione (vedi vps-site): sudo
+# lanciato dal pannello eredita lo spazio dei mount di PHP-FPM, che oggi su Debian 13
+# non ha ProtectSystem ma con ProtectSystem=full (unità upstream) avrebbe /etc in sola
+# lettura. Ci si rilancia allora in un'unità systemd nuova: stdin, stdout e codice
 # d'uscita passano intatti. Il percorso è assoluto e fisso, mai preso dall'ambiente.
 if [[ -n "${SUDO_USER:-}" && -z "${VPS_CFIPS_VIA_SYSTEMD:-}" ]]; then
   exec systemd-run --wait --pipe --collect --quiet --service-type=exec \

@@ -8,11 +8,13 @@ if [[ ("${1:-}" == _run || "${1:-}" == _prune) && (-n "${SUDO_USER:-}" || -n "${
   printf '{"ok":false,"error":"comando interno"}\n'
   exit 1
 fi
-# PHP-FPM gira con ProtectSystem=full: sudo lanciato dal pannello eredita il suo
-# spazio dei mount, dove /etc (e quindi /etc/nginx/conf.d, i pool, logrotate) è
-# in sola lettura. Ci si rilancia allora in un'unità systemd nuova, fuori da
-# quella sandbox: stdin (la password), stdout e codice d'uscita passano intatti.
-# Il percorso è assoluto e fisso, mai preso dall'ambiente.
+# Precauzione: sudo lanciato dal pannello eredita lo spazio dei mount di PHP-FPM.
+# Su Debian 13 php8.4-fpm.service non ha ProtectSystem, ma l'unità upstream ha
+# ProtectSystem=full (un pacchetto futuro o un drop-in potrebbe attivarlo) e lì /etc
+# (vhost in /etc/nginx/conf.d, pool, logrotate) sarebbe in sola lettura. Ci si
+# rilancia allora in un'unità systemd nuova, fuori da qualunque sandbox di PHP-FPM:
+# stdin (la password), stdout e codice d'uscita passano intatti. Il percorso è
+# assoluto e fisso, mai preso dall'ambiente.
 if [[ -n "${SUDO_USER:-}" && -z "${VPS_SITE_VIA_SYSTEMD:-}" ]]; then
   exec systemd-run --wait --pipe --collect --quiet --service-type=exec \
     --setenv=VPS_SITE_VIA_SYSTEMD=1 /opt/vps/bin/vps-site "$@"

@@ -7,10 +7,10 @@
 usage="uso: vps-ssh-tunnel status|random|check-host LABEL|enable|add-user|remove-user|set-sudo|set-host LABEL|disable (JSON da stdin per enable, add-user, remove-user e set-sudo)"
 
 # I comandi che cambiano la macchina scrivono in /etc (sshd, unità systemd, apt):
-# PHP-FPM gira con ProtectSystem=full, dove /etc è in sola lettura, e sudo ne
-# eredita lo spazio dei mount. Ci si rilancia allora in un'unità systemd nuova
-# (come vps-site): stdin, stdout e codice d'uscita passano intatti. Il percorso
-# è assoluto e fisso, mai preso dall'ambiente.
+# per precauzione (vedi vps-site) non si eseguono nello spazio dei mount di PHP-FPM,
+# che con ProtectSystem=full (unità upstream; oggi su Debian 13 non c'è) avrebbe /etc
+# in sola lettura. Ci si rilancia in un'unità systemd nuova: stdin, stdout e codice
+# d'uscita passano intatti. Il percorso è assoluto e fisso, mai preso dall'ambiente.
 case "${1:-}" in
   enable | add-user | remove-user | set-sudo | set-host | disable)
     if [[ -n "${SUDO_USER:-}" && -z "${VPS_SSHT_VIA_SYSTEMD:-}" ]]; then
