@@ -393,12 +393,22 @@ site_vhost_add() {
     SITE_NAMES="$d www.$d"
     SITE_WWW_BLOCK="$(site_tmpl_text "$VPS_TEMPLATES/nginx-site-www.inc.tmpl" SITE_DOMAIN)"
   fi
+  # Regole a mano (solo siti PHP, in esercizio): il corpo è un include del file del
+  # sito, che porta anche l'access_log; nel vhost resta solo l'include a livello http.
+  SITE_HTTP_INCLUDE=""
+  SITE_ACCESS_LOG="    access_log ${SITE_ROOT}/logs/access.log main;"
+  if [[ "$mode" == normal ]] && site_custom_active "$d"; then
+    site_custom_files_add "$d" || return 1
+    SITE_BODY="    include $(site_custom_conf "$d");"
+    SITE_HTTP_INCLUDE="include $(site_custom_http "$d");"
+    SITE_ACCESS_LOG=""
+  fi
   if [[ -f "$f" ]]; then
     bak="$(mktemp)"
     cp -p "$f" "$bak"
   fi
   render_template "$VPS_TEMPLATES/nginx-site.conf.tmpl" "$f" 644 root:root \
-    SITE_DOMAIN SITE_NAMES SITE_ROOT SITE_BODY SITE_WWW_BLOCK SITE_HEADERS SITE_BURST || return 1
+    SITE_DOMAIN SITE_NAMES SITE_ROOT SITE_BODY SITE_WWW_BLOCK SITE_HEADERS SITE_BURST SITE_HTTP_INCLUDE SITE_ACCESS_LOG || return 1
   if nginx -t >>"$VPS_LOG" 2>&1; then
     rm -f "$bak"
     systemctl reload nginx || site_fail "Nginx non si è ricaricato"

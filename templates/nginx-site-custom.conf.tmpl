@@ -1,0 +1,20 @@
+# Regole Nginx a mano di ${SITE_DOMAIN}: questo file è del sito, vps-site non lo riscrive mai.
+# Sta dentro il blocco server 443. Dopo ogni modifica: nginx -t && systemctl reload nginx
+# Il socket PHP qui sotto è quello del sito: se cambia la versione di PHP va cambiato anche qui.
+# Non togliere access_log senza metterne uno con lo stesso percorso: logrotate lo ruota
+# e il pannello lo legge.
+# Per non registrare certe richieste: access_log ${SITE_ROOT}/logs/access.log main if=$variabile;
+# con la map che definisce $variabile nel file .http.conf.
+# Gli add_header messi qui si sommano a quelli della cornice del vhost.
+access_log ${SITE_ROOT}/logs/access.log main;
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~ \.php$ {
+        try_files $uri =404;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_pass unix:/run/php/php${PHP_VERSION}-fpm-${SITE_SLUG}.sock;
+    }

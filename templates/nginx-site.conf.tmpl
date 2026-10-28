@@ -1,4 +1,5 @@
 # vps-site: ${SITE_DOMAIN} — file generato, non modificarlo a mano
+${SITE_HTTP_INCLUDE}
 server {
     listen 80;
     listen [::]:80;
@@ -23,7 +24,7 @@ ${SITE_HEADERS}
     root ${SITE_ROOT}/public;
     index index.php index.html;
 
-    access_log ${SITE_ROOT}/logs/access.log main;
+${SITE_ACCESS_LOG}
     error_log ${SITE_ROOT}/logs/error.log error;
 
     limit_req zone=req_limit_per_ip burst=${SITE_BURST} nodelay;

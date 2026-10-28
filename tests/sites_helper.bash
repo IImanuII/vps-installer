@@ -6,6 +6,7 @@ sites_test_setup() {
   export SITES_DIR="$BATS_TEST_TMPDIR/sites" SITES_WWW="$BATS_TEST_TMPDIR/www"
   export SITES_BACKUPS="$BATS_TEST_TMPDIR/backups" SITES_LOCK="$BATS_TEST_TMPDIR/vps-site.lock"
   export SITES_RUN="$BATS_TEST_TMPDIR/run" NGINX_CONF_D="$BATS_TEST_TMPDIR/conf.d"
+  export NGINX_CUSTOM_D="$BATS_TEST_TMPDIR/vps-custom"
   export PHP_POOL_D="$BATS_TEST_TMPDIR/pool.d" LOGROTATE_D="$BATS_TEST_TMPDIR/logrotate.d"
   export VPS_SITE_SELF="$REPO_ROOT/tools/vps-site" VPS_LIB="$REPO_ROOT/lib"
   export CALLS="$BATS_TEST_TMPDIR/calls"
