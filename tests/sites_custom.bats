@@ -82,3 +82,27 @@ setup() {
   cmp "$NGINX_CONF_D/miosito.it.conf" "$BATS_TEST_TMPDIR/prima"
   [ "$(cat "$NGINX_CUSTOM_D/miosito.it.conf")" = "# mio" ]
 }
+
+@test "cartella delle regole non creabile: errore chiaro, vhost di prima" {
+  site_reg_new miosito.it php no no
+  site_vhost_add miosito.it
+  cp "$NGINX_CONF_D/miosito.it.conf" "$BATS_TEST_TMPDIR/prima"
+  site_reg_update miosito.it '.custom_rules = true'
+  printf 'file\n' >"$NGINX_CUSTOM_D"
+  export SITE_ERROR_FILE="$BATS_TEST_TMPDIR/err"
+  run site_vhost_add miosito.it
+  [ "$status" -eq 1 ]
+  [[ "$(cat "$SITE_ERROR_FILE")" == "file delle regole a mano di miosito.it non scritti (dettagli in $VPS_LOG)" ]]
+  cmp "$NGINX_CONF_D/miosito.it.conf" "$BATS_TEST_TMPDIR/prima"
+}
+
+@test "site_custom_files_add non tocca un link spezzato al posto del file" {
+  site_reg_new miosito.it php no no
+  site_reg_update miosito.it '.custom_rules = true'
+  mkdir -p "$NGINX_CUSTOM_D"
+  ln -s /non/esiste "$NGINX_CUSTOM_D/miosito.it.conf"
+  ln -s /non/esiste "$NGINX_CUSTOM_D/miosito.it.http.conf"
+  site_vhost_add miosito.it
+  [ "$(readlink "$NGINX_CUSTOM_D/miosito.it.conf")" = /non/esiste ]
+  [ "$(readlink "$NGINX_CUSTOM_D/miosito.it.http.conf")" = /non/esiste ]
+}
