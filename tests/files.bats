@@ -1085,6 +1085,47 @@ nothing_written() {
   [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
 }
 
+@test "vps-files download-zip --size-first: prima riga = byte dello zip che segue, poi lo zip" {
+  need_zip
+  mk_fm_site
+  mkdir -p "$R/public/sito/sub"
+  printf 'uno' >"$R/public/sito/a.txt"
+  printf 'due' >"$R/public/sito/sub/b"
+  bash "$REPO_ROOT/tools/vps-files" download-zip blog.miosito.it public/sito --size-first >"$BATS_TEST_TMPDIR/out" 2>/dev/null
+  n="$(head -n1 "$BATS_TEST_TMPDIR/out")"
+  [[ "$n" =~ ^[1-9][0-9]*$ ]]
+  tail -c +"$((${#n} + 2))" "$BATS_TEST_TMPDIR/out" >"$BATS_TEST_TMPDIR/dl.zip"
+  [ "$(stat -c %s "$BATS_TEST_TMPDIR/dl.zip")" -eq "$n" ]
+  unzip -tq "$BATS_TEST_TMPDIR/dl.zip"
+  run zipinfo -1 "$BATS_TEST_TMPDIR/dl.zip"
+  [[ "$output" == *"sito/sub/b"* ]]
+  [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
+  # senza opzione: solo lo zip, come prima
+  bash "$REPO_ROOT/tools/vps-files" download-zip blog.miosito.it public/sito >"$BATS_TEST_TMPDIR/plain.zip" 2>/dev/null
+  [ "$(head -c 2 "$BATS_TEST_TMPDIR/plain.zip")" = PK ]
+  unzip -tq "$BATS_TEST_TMPDIR/plain.zip"
+}
+
+@test "vps-files download-zip --size-first: errori come prima, nessuna riga di dimensione; altra opzione = uso" {
+  mk_fm_site
+  mkdir -p "$R/public/sito"
+  run vf download-zip blog.miosito.it public/nonesiste --size-first
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .ok <<<"$output")" = false ]
+  run vf download-zip blog.miosito.it public/sito --boh
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == uso:* ]]
+  run vf download-zip blog.miosito.it public/sito --size-first x
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r .error <<<"$output")" == uso:* ]]
+  # archivio oltre il tetto: nessuna riga di dimensione prima dell'errore
+  make_stub zip 'head -c 209715201 /dev/zero >"$5"'
+  run vf download-zip blog.miosito.it public/sito --size-first
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "il download supera i 200 MB" ]
+  [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
+}
+
 @test "vps-files download-zip: archivio oltre 200 MB (cresciuto dopo il controllo) -> errore e nessun temporaneo" {
   mk_fm_site
   mkdir -p "$R/public/sito"

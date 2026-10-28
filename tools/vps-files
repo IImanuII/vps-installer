@@ -30,8 +30,8 @@ tool_init
 #   delete DOM -- PERCORSO...                               almeno 4
 #   zip DOM DEST.zip -- PERCORSO...                         almeno 5
 #   unzip DOM ARCHIVIO DESTINAZIONE [--overwrite]           4 o 5
-#   download-zip DOM PERCORSO                               esattamente 3, zip su stdout
-USO="uso: vps-files list|stat|read|mkdir|download-zip DOM PERCORSO | write DOM PERCORSO [--overwrite] [--if-mtime SEC.NSEC --if-size N] | rename DOM DA NUOVONOME | move|copy DOM DEST [--overwrite] -- PERCORSO... | delete DOM -- PERCORSO... | zip DOM DEST.zip -- PERCORSO... | unzip DOM ARCHIVIO DESTINAZIONE [--overwrite]"
+#   download-zip DOM PERCORSO [--size-first]                3 o 4, zip su stdout (prima i byte)
+USO="uso: vps-files list|stat|read|mkdir DOM PERCORSO | download-zip DOM PERCORSO [--size-first] | write DOM PERCORSO [--overwrite] [--if-mtime SEC.NSEC --if-size N] | rename DOM DA NUOVONOME | move|copy DOM DEST [--overwrite] -- PERCORSO... | delete DOM -- PERCORSO... | zip DOM DEST.zip -- PERCORSO... | unzip DOM ARCHIVIO DESTINAZIONE [--overwrite]"
 FM_TEXT_MAX=2097152 # i limiti di scrittura (10 MB) e copia (200 MB) sono negli script sh
 FM_MAX_PATHS=500
 FM_LIST_MAX=10000
@@ -369,8 +369,9 @@ mv -n -T -- "$w/o.zip" "$final" || exit 1
 [ ! -e "$w/o.zip" ] || exit 70
 EOS
 
-# download-zip: PERCORSO. Zip su stdout, con il nome della cartella in testa; tetto 200 MB
-# prima (sui file) e dopo (sull'archivio, scritto in tmp/). Uscite: 65, 67, 68, 1.
+# download-zip: PERCORSO [1 = dimensione prima]. Zip su stdout, con il nome della cartella
+# in testa; tetto 200 MB prima (sui file) e dopo (sull'archivio, scritto in tmp/).
+# Uscite: 65, 67, 68, 1.
 read -r -d '' FM_SH_DLZIP <<'EOS' || true
 p="$1"
 chkp "$p" || exit 67
@@ -400,6 +401,13 @@ z="$w/z.zip"
 rc=$?
 [ "$(du -sb -- "$w" 2>/dev/null | cut -f1)" -le 209715200 ] || exit 68
 [ "$rc" = 0 ] && [ -f "$z" ] || exit 1
+# --size-first ($2 = 1): una riga con i byte dello zip prima dei byte, così il pannello
+# può mandare Content-Length e il browser si accorge di un invio interrotto. Si scrive
+# solo ora, a zip finito e controllato: un errore prima non lascia una riga a metà.
+if [ "${2:-0}" = 1 ]; then
+  s="$(stat -c %s -- "$z")" || exit 1
+  printf '%s\n' "$s" || exit 1
+fi
 cat -- "$z" || exit 1
 EOS
 
@@ -408,7 +416,8 @@ EOS
 cmd="$1"
 dom="$2"
 case "$cmd" in
-  list | stat | read | mkdir | download-zip) (($# == 3)) || json_err "$USO" ;;
+  list | stat | read | mkdir) (($# == 3)) || json_err "$USO" ;;
+  download-zip) (($# == 3)) || [[ $# -eq 4 && "$4" == --size-first ]] || json_err "$USO" ;;
   zip) (($# >= 5)) || json_err "$USO" ;;
   unzip) (($# >= 4 && $# <= 5)) || json_err "$USO" ;;
   write) (($# >= 3 && $# <= 8)) || json_err "$USO" ;;
@@ -829,7 +838,9 @@ exec cat <"$1"' sh "$p" || rc=$?
   download-zip)
     [[ "$area" == public ]] || json_err "percorso non consentito: $p"
     rc=0
-    site_sh 120 "$FM_SH_DLZIP" "$p" || rc=$?
+    sf=0
+    if [[ "${4:-}" == --size-first ]]; then sf=1; fi
+    site_sh 120 "$FM_SH_DLZIP" "$p" "$sf" || rc=$?
     case "$rc" in
       0) ;;
       66) json_err "non è una cartella: $p" ;;
