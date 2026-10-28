@@ -110,6 +110,8 @@ exit 0'
 }
 
 @test "una scrittura fallita a metà ripristina e non lascia lo snapshot" {
+  # la scrittura fallisce per chmod 555, che non ferma root (WSL): lì il test non dice nulla
+  if ((EUID == 0)); then skip "da root chmod 555 non impedisce la scrittura"; fi
   mkdir -p "$SSH_CF_PRINCIPALS" "$BATS_TEST_TMPDIR/tmp"
   echo CA-VECCHIA >"$SSH_CF_CA"
   echo vecchio >"$SSH_CF_PRINCIPALS/manu"
