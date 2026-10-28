@@ -759,8 +759,9 @@ bk_connect() {
     BK_ERR="file del collegamento non scritto: nulla è cambiato"
     return 1
   fi
-  # Collegamento nuovo (o, se Drive lo rifiuta, quello di prima rimesso): lo spazio
-  # in cache poteva essere di un altro account.
+  # Collegamento nuovo: lo spazio in cache poteva essere di un altro account. Si toglie
+  # qui, e di nuovo alla fine (riuscita o no): uno status durante la verifica (fino a
+  # ~75 s) lo rimetterebbe in cache letto con il file nuovo, non ancora verificato.
   bk_drive_cache_clear
 
   read -ra cmd <<<"$BK_RCLONE"
@@ -792,10 +793,12 @@ bk_connect() {
     else
       rm -f "$conf"
     fi
+    bk_drive_cache_clear
     log "vps-backup: collegamento non riuscito ($BK_ERR)"
     return 1
   fi
   [[ -z "$prev" ]] || rm -f "$prev"
+  bk_drive_cache_clear
   BK_FOLDER="$folder"
 }
 
@@ -950,7 +953,7 @@ bk_state_lock_file() {
 # quelli si potranno eliminare da Drive (una VPS ricostruita non cancella le copie di
 # altri). 1 se il lock non arriva entro BK_STATE_LOCK_WAIT secondi o il file non si scrive.
 _bk_state_set() {
-  local campi="$1" lf fd cur='{}' w="$BK_STATE_LOCK_WAIT" rc=0
+  local campi="$1" lf fd cur='{}' w="$BK_STATE_LOCK_WAIT" rc=0 nuovo
   [[ "$w" =~ ^[0-9]{1,4}$ ]] || w=30
   install -d -m 700 "$BK_DIR" || return 1
   lf="$(bk_state_lock_file)"
@@ -965,10 +968,17 @@ _bk_state_set() {
     cur="$(jq -cs 'if length == 1 and (.[0] | type) == "object" then .[0] else {} end' "$BK_STATE" 2>/dev/null)" || cur='{}'
     [[ -n "$cur" ]] || cur='{}'
   fi
-  jq -nc --argjson c "$cur" --argjson f "$campi" \
+  # Prima il contenuto, poi il file: un jq fallito (CAMPI non validi) non deve
+  # sostituire state.json con un file vuoto.
+  nuovo="$(jq -nc --argjson c "$cur" --argjson f "$campi" \
     '{job: ($c.job // null), last_run: ($c.last_run // null),
       known: (($c.known // []) | if type == "array" then map(select(type == "string")) else [] end),
-      last_restore: ($c.last_restore // null)} + $f' | write_file "$BK_STATE" 600 root:root || rc=1
+      last_restore: ($c.last_restore // null)} + $f' 2>/dev/null)" || nuovo=""
+  if [[ -n "$nuovo" ]]; then
+    printf '%s\n' "$nuovo" | write_file "$BK_STATE" 600 root:root || rc=1
+  else
+    rc=1
+  fi
   exec {fd}>&-
   return "$rc"
 }

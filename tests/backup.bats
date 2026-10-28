@@ -637,6 +637,32 @@ wait_for_file() {
   [ "$(ls -A "$VPS_OPT/secrets" | grep rclone)" = rclone.conf ]
 }
 
+@test "vps-backup connect: uno status durante la verifica non lascia in cache lo spazio dell'account non verificato" {
+  bk_tool_env
+  echo vecchio >"$VPS_OPT/secrets/rclone.conf"
+  chmod 600 "$VPS_OPT/secrets/rclone.conf"
+  # rclone finto: mentre si verifica il collegamento (mkdir) un poll di status mette in
+  # cache lo spazio letto con il rclone.conf nuovo
+  # shellcheck disable=SC2016
+  make_stub rclone 'T="$BATS_TEST_TMPDIR"
+for a in "$@"; do case "$a" in mkdir|rcat|deletefile) sub="$a";; esac; done
+if [[ "$sub" == mkdir ]]; then echo "{\"checked_at\":$(date +%s),\"drive\":{\"used\":1,\"total\":2}}" >"$BK_DIR/drive.json"; fi
+if [[ "$sub" == rcat ]]; then cat >/dev/null; fi
+if [[ -f "$T/rclone.fail" && "$(cat "$T/rclone.fail")" == "$sub" ]]; then echo "Drive pieno" >&2; exit 1; fi
+exit 0'
+  # verifica fallita: torna il rclone.conf di prima, la cache sbagliata non resta
+  echo rcat >"$BATS_TEST_TMPDIR/rclone.fail"
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -ne 0 ]
+  [ "$(cat "$VPS_OPT/secrets/rclone.conf")" = vecchio ]
+  [ ! -e "$BK_DIR/drive.json" ]
+  # verifica riuscita: nemmeno la cache scritta a metà resta
+  rm -f "$BATS_TEST_TMPDIR/rclone.fail"
+  bk_tool connect <<<"$TOKEN_OK"
+  [ "$status" -eq 0 ]
+  [ ! -e "$BK_DIR/drive.json" ]
+}
+
 @test "vps-backup connect: usa la cartella già configurata" {
   bk_tool_env
   echo '{"enabled":false,"time":"04:00","folder":"MieiBackup"}' >"$BK_CONFIG"
@@ -1340,6 +1366,17 @@ jq -c ".last_run = {ok: false, started: \"saltato\"} | .known += [\"z.it\"]" "$B
   jq -e '.job == null and .last_run.started == "saltato" and .known == ["a.it","z.it"]
     and .last_restore.domain == "a.it" and .last_restore.ok == true' "$BK_STATE"
   [ "$(stat -c %a "$BK_STATE")" = 600 ]
+}
+
+@test "_bk_state_set: campi non validi = 1 e state.json intatto, mai vuoto" {
+  BK_STATE="$BK_DIR/state.json"
+  mkdir -p "$BK_DIR"
+  echo '{"job":null,"last_run":{"ok":true},"known":["a.it"],"last_restore":null}' >"$BK_STATE"
+  run _bk_state_set 'non-json'
+  [ "$status" -eq 1 ]
+  jq -e '.last_run.ok == true and .known == ["a.it"]' "$BK_STATE"
+  _bk_state_set '{"job":{"op":"run"}}'
+  jq -e '.job.op == "run" and .last_run.ok == true and .known == ["a.it"]' "$BK_STATE"
 }
 
 @test "state.json: il lock di stato occupato troppo a lungo = stato non scritto e registrato, il lavoro va avanti" {
