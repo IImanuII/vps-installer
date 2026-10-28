@@ -404,9 +404,14 @@ rc=$?
 # --size-first ($2 = 1): una riga con i byte dello zip prima dei byte, così il pannello
 # può mandare Content-Length e il browser si accorge di un invio interrotto. Si scrive
 # solo ora, a zip finito e controllato: un errore prima non lascia una riga a metà.
+# Dalla riga in poi ogni errore, scadenza compresa, esce con 71: il chiamante non deve
+# accodare un JSON a byte che il pannello conterebbe nei N annunciati.
 if [ "${2:-0}" = 1 ]; then
   s="$(stat -c %s -- "$z")" || exit 1
-  printf '%s\n' "$s" || exit 1
+  trap 'exit 71' INT TERM
+  printf '%s\n' "$s" || exit 71
+  cat -- "$z" || exit 71
+  exit 0
 fi
 cat -- "$z" || exit 1
 EOS
@@ -840,7 +845,21 @@ exec cat <"$1"' sh "$p" || rc=$?
     rc=0
     sf=0
     if [[ "${4:-}" == --size-first ]]; then sf=1; fi
-    site_sh 120 "$FM_SH_DLZIP" "$p" "$sf" || rc=$?
+    if ((sf)); then
+      # --preserve-status: alla scadenza conta l'uscita dello script (124 prima della
+      # riga della dimensione, 71 dopo), non il 124 di timeout. -k: se non esce, KILL.
+      fm_as_site "$slug" "$root" timeout --preserve-status -k 5 120 sh -c "$FM_SH_LIB"$'\n'"$FM_SH_DLZIP" sh "$p" 1 || rc=$?
+      # 71 (dopo la riga) o 137 (ucciso, non si sa dove): la riga può essere già partita.
+      # Su stdout niente JSON, che il pannello leggerebbe come byte dello zip: errore
+      # solo nel registro e su stderr, uscita 1.
+      if ((rc == 71 || rc == 137)); then
+        # log scrive nel registro e su stderr
+        log "files download-zip $dom $p --size-first: invio interrotto dopo la riga della dimensione (uscita $rc)"
+        exit 1
+      fi
+    else
+      site_sh 120 "$FM_SH_DLZIP" "$p" "$sf" || rc=$?
+    fi
     case "$rc" in
       0) ;;
       66) json_err "non è una cartella: $p" ;;

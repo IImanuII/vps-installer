@@ -1126,6 +1126,48 @@ nothing_written() {
   [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
 }
 
+@test "vps-files download-zip --size-first: errore dopo la riga della dimensione = niente JSON su stdout, uscita 1" {
+  need_zip
+  mk_fm_site
+  mkdir -p "$R/public/sito"
+  head -c 5000 /dev/urandom >"$R/public/sito/a.bin"
+  # cat che manda 10 byte e poi fallisce (connessione caduta, disco)
+  # shellcheck disable=SC2016
+  make_stub cat 'case "$*" in *.zip) head -c 10 -- "${@: -1}"; exit 1 ;; esac; exec /bin/cat "$@"'
+  bash "$REPO_ROOT/tools/vps-files" download-zip blog.miosito.it public/sito --size-first >"$BATS_TEST_TMPDIR/out" 2>"$BATS_TEST_TMPDIR/err" && false
+  n="$(head -n1 "$BATS_TEST_TMPDIR/out")"
+  [[ "$n" =~ ^[1-9][0-9]*$ ]]
+  # solo la riga e i 10 byte: nessun JSON accodato che il pannello conterebbe nei N byte
+  [ "$(stat -c %s "$BATS_TEST_TMPDIR/out")" -eq "$((${#n} + 1 + 10))" ]
+  run ! grep -aq '"ok":false' "$BATS_TEST_TMPDIR/out"
+  grep -q 'download-zip' "$BATS_TEST_TMPDIR/err"
+  grep -q 'download-zip.*interrotto' "$VPS_LOG"
+  [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
+}
+
+@test "vps-files download-zip --size-first: scadenza durante l'invio = niente JSON su stdout; prima della riga = JSON" {
+  need_zip
+  mk_fm_site
+  mkdir -p "$R/public/sito"
+  printf 'uno' >"$R/public/sito/a.txt"
+  # timeout di 1 s (al posto di 120) e cat che resta appeso dopo la riga della dimensione
+  # shellcheck disable=SC2016
+  make_stub timeout 'a=(); for x; do case "$x" in 120) a+=(1) ;; *) a+=("$x") ;; esac; done; exec /usr/bin/timeout "${a[@]}"'
+  # shellcheck disable=SC2016
+  make_stub cat 'case "$*" in *.zip) sleep 5; exit 0 ;; esac; exec /bin/cat "$@"'
+  bash "$REPO_ROOT/tools/vps-files" download-zip blog.miosito.it public/sito --size-first >"$BATS_TEST_TMPDIR/out" 2>/dev/null && false
+  [ "$(wc -l <"$BATS_TEST_TMPDIR/out")" -eq 1 ]
+  head -n1 "$BATS_TEST_TMPDIR/out" | grep -qx '[1-9][0-9]*'
+  run ! grep -aq '"ok":false' "$BATS_TEST_TMPDIR/out"
+  [ "$(ls -A "$R/tmp" | wc -l)" -eq 0 ]
+  # scadenza prima della riga (zip lento): il solito JSON
+  # shellcheck disable=SC2016
+  make_stub zip 'sleep 5'
+  run vf download-zip blog.miosito.it public/sito --size-first
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "operazione scaduta" ]
+}
+
 @test "vps-files download-zip: archivio oltre 200 MB (cresciuto dopo il controllo) -> errore e nessun temporaneo" {
   mk_fm_site
   mkdir -p "$R/public/sito"
