@@ -844,6 +844,13 @@ site_job_delete() {
   (site_cert_remove "$d")
   (site_logrotate_remove "$d") || left+=("rotazione dei log")
   (site_wp_cron_remove "$d") || left+=("cron di WordPress")
+  # I file delle regole a mano solo a vhost tolto: se Nginx li includesse ancora,
+  # ogni nginx -t fallirebbe. Con il vhost rimasto restano e si riprova.
+  if [[ -e "$NGINX_CONF_D/$d.conf" ]]; then
+    left+=("regole Nginx a mano o cron del sito")
+  else
+    (site_custom_remove "$d") || left+=("regole Nginx a mano o cron del sito")
+  fi
   (site_redis_user_remove "$d") || left+=("utente Redis")
   (site_db_remove "$d") || left+=("database")
   (site_user_remove "$d") || left+=("utente o cartella $(site_root "$d")")

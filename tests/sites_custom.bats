@@ -106,3 +106,65 @@ setup() {
   [ "$(readlink "$NGINX_CUSTOM_D/miosito.it.conf")" = /non/esiste ]
   [ "$(readlink "$NGINX_CUSTOM_D/miosito.it.http.conf")" = /non/esiste ]
 }
+
+@test "site_run delete: via file delle regole, .cron-da-rivedere e cron del sito" {
+  site_reg_new blog.miosito.it php no no
+  site_run create blog.miosito.it
+  mkdir -p "$NGINX_CUSTOM_D"
+  for f in blog.miosito.it.conf blog.miosito.it.http.conf blog.miosito.it.cron-da-rivedere; do
+    echo x >"$NGINX_CUSTOM_D/$f"
+  done
+  echo x >"$CRON_D/vps-site-site_blog_miosito_it-backup"
+  site_reg_update blog.miosito.it '.prev_state = .state | .state = "deleting"'
+  site_run delete blog.miosito.it
+  run ! site_reg_exists blog.miosito.it
+  [ -z "$(ls -A "$NGINX_CUSTOM_D")" ]
+  [ ! -e "$CRON_D/vps-site-site_blog_miosito_it-backup" ]
+}
+
+@test "site_custom_remove: solo i file del sito, mai quelli di uno slug simile" {
+  site_reg_new blog.miosito.it php no no
+  mkdir -p "$NGINX_CUSTOM_D" "$CRON_D"
+  for f in vps-site-site_blog_miosito_it-cron vps-site-site_blog_miosito_it-backup \
+    vps-site-site_blog_miosito_it_x-cron vps-site-site_blog_miosito_itx vps-site-site_blog_miosito_it; do
+    echo x >"$CRON_D/$f"
+  done
+  echo x >"$NGINX_CUSTOM_D/blog.miosito.it.conf"
+  echo x >"$NGINX_CUSTOM_D/altro.it.conf"
+  echo x >"$NGINX_CUSTOM_D/altro.it.http.conf"
+  site_custom_remove blog.miosito.it
+  [ ! -e "$NGINX_CUSTOM_D/blog.miosito.it.conf" ]
+  [ -f "$NGINX_CUSTOM_D/altro.it.conf" ]
+  [ -f "$NGINX_CUSTOM_D/altro.it.http.conf" ]
+  # restano il cron di WordPress e quelli di slug più lunghi; via i due del sito
+  [ -f "$CRON_D/vps-site-site_blog_miosito_it" ]
+  [ -f "$CRON_D/vps-site-site_blog_miosito_it_x-cron" ]
+  [ -f "$CRON_D/vps-site-site_blog_miosito_itx" ]
+  [ ! -e "$CRON_D/vps-site-site_blog_miosito_it-cron" ]
+  [ ! -e "$CRON_D/vps-site-site_blog_miosito_it-backup" ]
+}
+
+@test "site_custom_remove: slug estraneo rifiutato" {
+  site_reg_new blog.miosito.it php no no
+  site_reg_update blog.miosito.it '.slug = "x*"'
+  mkdir -p "$NGINX_CUSTOM_D" "$CRON_D"
+  echo x >"$NGINX_CUSTOM_D/blog.miosito.it.conf"
+  echo x >"$CRON_D/vps-site-x-cron"
+  run site_custom_remove blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ -f "$NGINX_CUSTOM_D/blog.miosito.it.conf" ]
+  [ -f "$CRON_D/vps-site-x-cron" ]
+}
+
+@test "site_run delete: vhost non tolto, file delle regole lasciati e sito in errore" {
+  site_reg_new blog.miosito.it php no no
+  site_run create blog.miosito.it
+  mkdir -p "$NGINX_CUSTOM_D"
+  echo x >"$NGINX_CUSTOM_D/blog.miosito.it.conf"
+  site_vhost_remove() { return 1; }
+  site_reg_update blog.miosito.it '.prev_state = .state | .state = "deleting"'
+  run site_run delete blog.miosito.it
+  [ "$status" -eq 1 ]
+  [ -f "$NGINX_CUSTOM_D/blog.miosito.it.conf" ]
+  [[ "$(site_reg_get blog.miosito.it .job.error)" == *"regole Nginx a mano"* ]]
+}

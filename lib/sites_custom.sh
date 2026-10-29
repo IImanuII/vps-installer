@@ -81,3 +81,26 @@ site_custom_set() {
     return 1
   fi
 }
+
+# site_custom_remove DOMINIO — all'eliminazione toglie i file delle regole a mano, il
+# file dei cron da rivedere e i cron fatti a mano (vps-site-<slug>-*). Il cron di
+# WordPress (vps-site-<slug>, senza trattino finale) lo toglie site_wp_cron_remove.
+# Lo slug finisce in un glob di find: se non ha la forma attesa non si tocca niente,
+# così un registro rovinato non può portarsi via i file di altri siti. Il trattino
+# dopo lo slug evita che site_blog_x prenda anche i file di site_blog_x_y.
+# Da chiamare solo dopo aver tolto il vhost: finché lo include, Nginx ha bisogno
+# dei file. Rc 1 se qualcosa resta.
+site_custom_remove() {
+  local d="$1" slug
+  slug="$(site_reg_get "$d" .slug)"
+  if [[ ! "$slug" =~ ^site_[a-z0-9_]+$ ]]; then
+    log "ATTENZIONE: slug di $d non valido, regole a mano e cron non toccati"
+    return 1
+  fi
+  rm -f "$(site_custom_conf "$d")" "$(site_custom_http "$d")" "$(site_custom_review "$d")" || return 1
+  find "$CRON_D" -maxdepth 1 -type f -name "vps-site-$slug-*" -delete || return 1
+  [[ ! -e "$(site_custom_conf "$d")" && ! -L "$(site_custom_conf "$d")" &&
+    ! -e "$(site_custom_http "$d")" && ! -L "$(site_custom_http "$d")" &&
+    ! -e "$(site_custom_review "$d")" && ! -L "$(site_custom_review "$d")" ]] || return 1
+  [[ -z "$(find "$CRON_D" -maxdepth 1 -name "vps-site-$slug-*" -print -quit)" ]]
+}
