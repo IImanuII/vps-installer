@@ -978,6 +978,18 @@ sito_php() {
   : >"$d/blog.miosito.it.cron-da-rivedere"
   vs list
   [ "$(jq -r '.sites[0].custom_files.cron_review' <<<"$output")" = "$d/blog.miosito.it.cron-da-rivedere" ]
+  # `rules on` toglie custom_restored, ma il file dei cron c'è ancora: l'avviso resta
+  vs rules blog.miosito.it on
+  vs show blog.miosito.it
+  [ "$(jq -c '.site | [.custom_rules, .custom_restored, .custom_files.cron_review]' <<<"$output")" = "[true,false,\"$d/blog.miosito.it.cron-da-rivedere\"]" ]
+  # nessun flag, ma il file c'è: custom_files non è null; senza file torna null
+  site_reg_update blog.miosito.it '.custom_rules = false'
+  vs list
+  [ "$(jq -r '.sites[0].custom_files.cron_review' <<<"$output")" = "$d/blog.miosito.it.cron-da-rivedere" ]
+  [ "$(jq -r '.sites[0].custom_files.conf' <<<"$output")" = "$d/blog.miosito.it.conf" ]
+  rm "$d/blog.miosito.it.cron-da-rivedere"
+  vs list
+  [ "$(jq -c '.sites[0].custom_files' <<<"$output")" = null ]
 }
 
 # --- ricreazione da copia con regole a mano e cron ----------------------------------

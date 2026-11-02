@@ -1036,21 +1036,24 @@ site_refresh_locked() {
 # ammesso: per gli altri è false senza toccare il disco (il pannello chiede la
 # lista ogni 3 s).
 # Aggiunge anche le regole Nginx a mano: custom_rules e custom_restored (bool, assenti
-# = false) e custom_files, null se entrambi falsi. Il disco si guarda solo per
-# cron_review, e solo con custom_restored vero, per lo stesso motivo.
+# = false) e custom_files, null se entrambi falsi e non c'è un .cron-da-rivedere.
+# cron_review si segnala finché il file esiste, anche con le regole accese o con
+# custom_restored già spento (`rules on` toglie il flag, ma i cron messi da parte non
+# li ha spostati nessuno): il promemoria non deve sparire. Il disco si guarda con un
+# solo -e per sito, non per elenco dei file.
 site_reg_json_full() {
   local d p=false dom review=null
   d="$(jq -r 'select(.type == "php" and .state == "active") | .domain // empty' "$1")"
   if [[ -n "$d" ]] && site_placeholder_intact "$d"; then p=true; fi
   dom="$(jq -r '.domain' "$1")"
-  if [[ "$(jq -r '.custom_restored // false' "$1")" == true && -e "$(site_custom_review "$dom")" ]]; then
+  if [[ -e "$(site_custom_review "$dom")" ]]; then
     review="$(jq -n --arg r "$(site_custom_review "$dom")" '$r')"
   fi
   jq --argjson p "$p" --argjson review "$review" --arg conf "$(site_custom_conf "$dom")" \
     --arg http "$(site_custom_http "$dom")" --arg cron "$(site_custom_cron_prefix "$dom")" '
     (.custom_rules // false) as $c | (.custom_restored // false) as $r
     | . + {placeholder: $p, custom_rules: $c, custom_restored: $r,
-           custom_files: (if $c or $r then {conf: $conf, http_conf: $http, cron_prefix: $cron, cron_review: $review} else null end)}' "$1"
+           custom_files: (if $c or $r or $review != null then {conf: $conf, http_conf: $http, cron_prefix: $cron, cron_review: $review} else null end)}' "$1"
 }
 
 site_list_json() {
