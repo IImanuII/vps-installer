@@ -217,6 +217,44 @@ bk_archive() {
   fi
 }
 
+# Tetto dei membri custom.* dell'archivio (byte): sono testo scritto a mano, 1 MiB basta.
+BK_CUSTOM_MAX=1048576
+
+# _bk_custom_collect DOMINIO LAVORO — copia in LAVORO le regole Nginx a mano
+# (custom.conf, custom.http.conf) e i cron a mano (custom.cron, una riga
+# "# --- <percorso> ---" e poi il contenuto di ogni file). Solo file regolari: un link
+# non si legge mai (root lo seguirebbe fuori dal sito). Un file oltre BK_CUSTOM_MAX si
+# salta con un avviso: il backup del sito non deve fallire per un file di regole.
+_bk_custom_collect() {
+  local d="$1" w="$2" f size total=0
+  f="$(site_custom_conf "$d")"
+  if [[ -f "$f" && ! -L "$f" ]]; then
+    size="$(stat -c %s "$f")"
+    if ((size > BK_CUSTOM_MAX)); then log "ATTENZIONE: $f oltre 1 MiB, non incluso nella copia di $d"; else cp -- "$f" "$w/custom.conf" || return 1; fi
+  fi
+  f="$(site_custom_http "$d")"
+  if [[ -f "$f" && ! -L "$f" ]]; then
+    size="$(stat -c %s "$f")"
+    if ((size > BK_CUSTOM_MAX)); then log "ATTENZIONE: $f oltre 1 MiB, non incluso nella copia di $d"; else cp -- "$f" "$w/custom.http.conf" || return 1; fi
+  fi
+  while IFS= read -r f; do
+    # un nome con a capo falserebbe le righe "# --- … ---" del file unico
+    if [[ "$f" == *[[:cntrl:]]* ]]; then
+      log "ATTENZIONE: cron con caratteri di controllo nel nome, non incluso nella copia di $d"
+      continue
+    fi
+    size="$(stat -c %s "$f")" || continue
+    # il tetto vale anche per il file unico, o bk_verify rifiuterebbe la copia
+    if ((size + total + ${#f} + 16 > BK_CUSTOM_MAX)); then
+      log "ATTENZIONE: $f oltre il tetto di 1 MiB, non incluso nella copia di $d"
+      continue
+    fi
+    { printf '# --- %s ---\n' "$f"; cat -- "$f"; } >>"$w/custom.cron" || return 1
+    total=$((total + size + ${#f} + 16))
+  done < <(site_custom_cron_files "$d")
+  return 0
+}
+
 # _bk_archive_in DOMINIO OUT LAVORO — corpo di bk_archive (in una subshell: BK_ERR non
 # risale, quindi passa dal file LAVORO/err).
 _bk_archive_in() {
@@ -298,20 +336,41 @@ _bk_archive_in() {
     dbsha="$(sha256sum "$w/db.sql.gz" | cut -d' ' -f1)"
   fi
 
+  # Regole a mano e cron del sito: membri facoltativi, solo se c'è qualcosa da salvare.
+  local csha="" hsha="" ksha=""
+  if [[ "$parts" != db ]]; then
+    _bk_custom_collect "$d" "$w" || {
+      echo "regole a mano o cron del sito non copiati" >"$w/err"
+      return 1
+    }
+    [[ -f "$w/custom.conf" ]] && csha="$(sha256sum "$w/custom.conf" | cut -d' ' -f1)"
+    [[ -f "$w/custom.http.conf" ]] && hsha="$(sha256sum "$w/custom.http.conf" | cut -d' ' -f1)"
+    [[ -f "$w/custom.cron" ]] && ksha="$(sha256sum "$w/custom.cron" | cut -d' ' -f1)"
+  fi
+
   jq -n --arg d "$d" --arg t "$type" --arg slug "$slug" --arg login "$login" \
     --arg www "$www" --arg db "$hasdb" --arg at "$(date -Iseconds)" \
     --arg v "$VPS_INSTALLER_VERSION" --arg parts "$parts" --arg prefix "$prefix" \
-    --arg fsha "$(sha256sum "$w/files.tar.gz" | cut -d' ' -f1)" --arg dsha "$dbsha" '
+    --arg fsha "$(sha256sum "$w/files.tar.gz" | cut -d' ' -f1)" --arg dsha "$dbsha" \
+    --arg cr "$(site_reg_get "$d" .custom_rules)" --arg csha "$csha" --arg hsha "$hsha" --arg ksha "$ksha" '
     {domain: $d, type: $t, www: ($www == "true"), db: ($db == "true"), slug: $slug,
      login_path: (if $login == "" then null else $login end), date: $at,
      installer_version: $v, parts: $parts, table_prefix: (if $prefix == "" then null else $prefix end),
-     sha256: {files: $fsha, db: (if $dsha == "" then null else $dsha end)}}' >"$w/manifest.json" || {
+     custom_rules: ($cr == "true"),
+     sha256: {files: $fsha, db: (if $dsha == "" then null else $dsha end),
+              custom_conf: (if $csha == "" then null else $csha end),
+              custom_http: (if $hsha == "" then null else $hsha end),
+              custom_cron: (if $ksha == "" then null else $ksha end)}}' >"$w/manifest.json" || {
     echo "manifest non scritto" >"$w/err"
     return 1
   }
 
   local -a members=(manifest.json files.tar.gz)
   [[ -f "$w/db.sql.gz" ]] && members+=(db.sql.gz)
+  local m
+  for m in custom.conf custom.http.conf custom.cron; do
+    [[ -f "$w/$m" ]] && members+=("$m")
+  done
   tar -czf "$w/out.tar.gz" -C "$w" "${members[@]}" 2>>"$VPS_LOG" || {
     echo "archivio finale non scritto" >"$w/err"
     return 1
@@ -434,7 +493,7 @@ bk_verify_names() {
 }
 
 # bk_verify ARCHIVIO — 0 se l'archivio è integro e sicuro da estrarre: contiene solo
-# manifest.json, files.tar.gz e (opzionale) db.sql.gz come file regolari senza doppioni,
+# manifest.json, files.tar.gz e (opzionali) db.sql.gz, custom.conf, custom.http.conf, custom.cron (non oltre 1 MiB) come file regolari senza doppioni,
 # i sha256 del manifest tornano, e files.tar.gz non ha nomi assoluti, "..", né link che
 # escono dalla cartella del sito (vedi bk_verify_names). Non estrae nulla nel sito.
 # 1 con BK_ERR altrimenti.
@@ -458,9 +517,10 @@ bk_verify() {
 }
 
 _bk_verify_in() {
-  local a="$1" w="$2" line t name have_db=0 want got dom
+  local a="$1" w="$2" line t name size have_db=0 want got dom
   local -A seen=()
-  local re='^(.)[rwxsStT-]{9} [0-9]+/[0-9]+ +[0-9]+ [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} "([^"\\]*)"$'
+  local -A cust=([custom.conf]=custom_conf [custom.http.conf]=custom_http [custom.cron]=custom_cron)
+  local re='^(.)[rwxsStT-]{9} [0-9]+/[0-9]+ +([0-9]+) [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} "([^"\\]*)"$'
   # 1. l'archivio esterno ha solo le tre voci previste, una volta, file regolari
   LC_ALL=C.UTF-8 tar -P --numeric-owner --quoting-style=c -tvzf "$a" >"$w/outer.lst" 2>/dev/null || {
     echo "archivio illeggibile" >"$w/err"
@@ -472,13 +532,21 @@ _bk_verify_in() {
       return 1
     fi
     t="${BASH_REMATCH[1]}"
-    name="${BASH_REMATCH[2]}"
+    size="${BASH_REMATCH[2]}"
+    name="${BASH_REMATCH[3]}"
     if [[ "$t" != - ]]; then
       echo "voce non ammessa nell'archivio: $name" >"$w/err"
       return 1
     fi
     case "$name" in
       manifest.json | files.tar.gz | db.sql.gz) ;;
+      custom.conf | custom.http.conf | custom.cron)
+        # testo scritto a mano: oltre il tetto non è roba nostra
+        if ((size > BK_CUSTOM_MAX)); then
+          echo "voce troppo grande nell'archivio: $name" >"$w/err"
+          return 1
+        fi
+        ;;
       *)
         echo "voce non ammessa nell'archivio: $name" >"$w/err"
         return 1
@@ -501,6 +569,16 @@ _bk_verify_in() {
       return 1
     }
   fi
+  # I membri custom.* si estraggono solo qui, nella cartella di lavoro, per leggerne il
+  # sha256: mai in /etc o nel sito. Rimetterli a posto è compito della ricreazione, che
+  # dopo bk_verify li rilegge e controlla da sé (testo, non file di sistema).
+  for name in "${!cust[@]}"; do
+    [[ -n "${seen[$name]-}" ]] || continue
+    tar -xzf "$a" -C "$w" --no-same-owner --no-same-permissions "$name" 2>/dev/null || {
+      echo "$name illeggibile" >"$w/err"
+      return 1
+    }
+  done
   # 2. manifest e checksum
   jq -e . "$w/manifest.json" >/dev/null 2>&1 || {
     echo "manifest non valido" >"$w/err"
@@ -528,6 +606,21 @@ _bk_verify_in() {
     echo "db.sql.gz dichiarato nel manifest ma assente" >"$w/err"
     return 1
   fi
+  # membro custom presente <=> sha256 nel manifest, e deve coincidere; una copia
+  # vecchia, senza membri né chiavi, passa come prima
+  for name in "${!cust[@]}"; do
+    want="$(jq -r --arg k "${cust[$name]}" '.sha256[$k] // ""' "$w/manifest.json")"
+    if [[ -n "${seen[$name]-}" ]]; then
+      got="$(sha256sum "$w/$name" | cut -d' ' -f1)"
+      if [[ ! "$want" =~ ^[0-9a-f]{64}$ || "$want" != "$got" ]]; then
+        echo "checksum di $name non corrisponde" >"$w/err"
+        return 1
+      fi
+    elif [[ -n "$want" ]]; then
+      echo "$name dichiarato nel manifest ma assente" >"$w/err"
+      return 1
+    fi
+  done
   # 3. nomi e link di files.tar.gz
   LC_ALL=C.UTF-8 tar -P --numeric-owner --quoting-style=c -tvzf "$w/files.tar.gz" >"$w/files.lst" 2>/dev/null || {
     echo "files.tar.gz illeggibile" >"$w/err"

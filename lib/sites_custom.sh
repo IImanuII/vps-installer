@@ -104,3 +104,15 @@ site_custom_remove() {
     ! -e "$(site_custom_review "$d")" && ! -L "$(site_custom_review "$d")" ]] || return 1
   [[ -z "$(find "$CRON_D" -maxdepth 1 -name "vps-site-$slug-*" -print -quit)" ]]
 }
+
+# site_custom_cron_files DOMINIO — stampa, in ordine, i cron fatti a mano del sito:
+# i file regolari vps-site-<slug>-* in cron.d. I link non contano (non si seguono mai) e
+# il cron di WordPress (vps-site-<slug>, senza trattino) non c'è: lo rigenera il sito.
+# Stesso controllo dello slug e stesso trattino finale di site_custom_remove: i file di
+# site_blog_x_y non finiscono nella copia di site_blog_x. Slug non valido: niente, rc 1.
+site_custom_cron_files() {
+  local slug
+  slug="$(site_reg_get "$1" .slug)"
+  [[ "$slug" =~ ^site_[a-z0-9_]+$ ]] || return 1
+  find "$CRON_D" -maxdepth 1 -type f -name "vps-site-$slug-*" -print | LC_ALL=C sort
+}

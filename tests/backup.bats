@@ -4119,3 +4119,134 @@ FW_MSG='regola del firewall per la porta 53682 non attiva: esegui install.sh --t
 @test "vps-backup: BK_AUTH_HTTP_DEADLINE non entra dall'ambiente del chiamante sotto sudo" {
   grep -q 'BK_AUTH_HTTP_DEADLINE' "$REPO_ROOT/tools/vps-backup"
 }
+
+# mk_custom DOMINIO — regole a mano e due cron del sito (più uno di uno slug simile e uno WordPress).
+mk_custom() {
+  local d="$1" slug
+  slug="$(site_reg_get "$d" .slug)"
+  site_reg_update "$d" '.custom_rules = true'
+  mkdir -p "$NGINX_CUSTOM_D" "$CRON_D"
+  echo 'location /a { return 200; }' >"$(site_custom_conf "$d")"
+  echo 'map $a $b { default 1; }' >"$(site_custom_http "$d")"
+  echo "* * * * * root /bin/true # uno" >"$CRON_D/vps-site-$slug-cron"
+  echo "0 * * * * root /bin/true # due" >"$CRON_D/vps-site-$slug-altro"
+  echo "ALTRO-SITO" >"$CRON_D/vps-site-${slug}_x-cron"
+  echo "WP-CRON" >"$CRON_D/vps-site-$slug"
+}
+
+@test "bk_archive: regole a mano e cron del sito nell'archivio" {
+  mk_site blog.miosito.it no
+  mk_custom blog.miosito.it
+  ln -s /etc/passwd "$CRON_D/vps-site-site_blog_miosito_it-link"
+  run bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz"
+  [ "$status" -eq 0 ]
+  [ "$(tar -tzf "$BATS_TEST_TMPDIR/out.tar.gz" | head -n1)" = manifest.json ]
+  local w="$BATS_TEST_TMPDIR/x"
+  mkdir -p "$w"
+  tar -xzf "$BATS_TEST_TMPDIR/out.tar.gz" -C "$w"
+  [ -f "$w/custom.conf" ]
+  [ -f "$w/custom.http.conf" ]
+  [ -f "$w/custom.cron" ]
+  m="$(cat "$w/manifest.json")"
+  [ "$(jq -r .custom_rules <<<"$m")" = true ]
+  [ "$(jq -r .sha256.custom_conf <<<"$m")" = "$(sha256sum "$w/custom.conf" | cut -d' ' -f1)" ]
+  [ "$(jq -r .sha256.custom_http <<<"$m")" = "$(sha256sum "$w/custom.http.conf" | cut -d' ' -f1)" ]
+  [ "$(jq -r .sha256.custom_cron <<<"$m")" = "$(sha256sum "$w/custom.cron" | cut -d' ' -f1)" ]
+  grep -qxF "# --- $CRON_D/vps-site-site_blog_miosito_it-cron ---" "$w/custom.cron"
+  grep -qF '# uno' "$w/custom.cron"
+  grep -qF '# due' "$w/custom.cron"
+  ! grep -q 'ALTRO-SITO' "$w/custom.cron"
+  ! grep -q 'WP-CRON' "$w/custom.cron"
+  ! grep -q 'link' "$w/custom.cron"
+  run bk_verify "$BATS_TEST_TMPDIR/out.tar.gz"
+  [ "$status" -eq 0 ]
+}
+
+@test "bk_archive: sito senza regole a mano, nessun membro nuovo" {
+  mk_site blog.miosito.it yes
+  run bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz"
+  [ "$status" -eq 0 ]
+  [ "$(tar -tzf "$BATS_TEST_TMPDIR/out.tar.gz" | sort | tr '\n' ' ')" = "db.sql.gz files.tar.gz manifest.json " ]
+  m="$(bk_manifest "$BATS_TEST_TMPDIR/out.tar.gz")"
+  [ "$(jq -r .sha256.custom_conf <<<"$m")" = null ]
+  [ "$(jq -r .sha256.custom_http <<<"$m")" = null ]
+  [ "$(jq -r .sha256.custom_cron <<<"$m")" = null ]
+  [ "$(jq -r .custom_rules <<<"$m")" = false ]
+}
+
+@test "bk_archive: parts db senza membri custom" {
+  mk_site blog.miosito.it yes
+  mk_custom blog.miosito.it
+  run bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz" db
+  [ "$status" -eq 0 ]
+  run tar -tzf "$BATS_TEST_TMPDIR/out.tar.gz"
+  [[ "$output" != *custom* ]]
+  [ "$(jq -r .sha256.custom_conf <<<"$(bk_manifest "$BATS_TEST_TMPDIR/out.tar.gz")")" = null ]
+}
+
+@test "bk_archive: file di regole oltre 1 MiB saltato, il backup riesce" {
+  mk_site blog.miosito.it no
+  mk_custom blog.miosito.it
+  head -c 1048577 /dev/zero | tr '\0' a >"$(site_custom_conf blog.miosito.it)"
+  run bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz"
+  [ "$status" -eq 0 ]
+  run tar -tzf "$BATS_TEST_TMPDIR/out.tar.gz"
+  [[ "$output" != *custom.conf* ]]
+  [[ "$output" == *custom.http.conf* ]]
+}
+
+@test "bk_verify: membri custom accettati; senza sha, sha diverso, nome estraneo (custom.evil), doppione o oltre 1 MiB rifiutati" {
+  mk_site blog.miosito.it no
+  mk_custom blog.miosito.it
+  bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz"
+  local w="$BATS_TEST_TMPDIR/w" o="$BATS_TEST_TMPDIR/out.tar.gz"
+  mkdir -p "$w"
+  tar -xzf "$o" -C "$w"
+  run bk_verify "$o"
+  [ "$status" -eq 0 ]
+  # membro senza sha nel manifest
+  jq '.sha256.custom_cron = null' "$w/manifest.json" >"$w/m2"
+  cp "$w/manifest.json" "$w/m.orig"
+  cp "$w/m2" "$w/manifest.json"
+  tar -czf "$w/b1.tar.gz" -C "$w" manifest.json files.tar.gz custom.conf custom.http.conf custom.cron
+  bk_verify "$w/b1.tar.gz" && false
+  [[ "$BK_ERR" == *custom.cron* ]]
+  # sha diverso
+  jq '.sha256.custom_conf = "0000000000000000000000000000000000000000000000000000000000000000"' "$w/m.orig" >"$w/manifest.json"
+  tar -czf "$w/b2.tar.gz" -C "$w" manifest.json files.tar.gz custom.conf custom.http.conf custom.cron
+  bk_verify "$w/b2.tar.gz" && false
+  [[ "$BK_ERR" == *custom.conf* ]]
+  # sha dichiarato ma membro assente
+  cp "$w/m.orig" "$w/manifest.json"
+  tar -czf "$w/b3.tar.gz" -C "$w" manifest.json files.tar.gz custom.conf custom.http.conf
+  bk_verify "$w/b3.tar.gz" && false
+  [[ "$BK_ERR" == *custom.cron* ]]
+  # nome estraneo
+  echo e >"$w/custom.evil"
+  tar -czf "$w/b4.tar.gz" -C "$w" manifest.json files.tar.gz custom.conf custom.http.conf custom.cron custom.evil
+  bk_verify "$w/b4.tar.gz" && false
+  [[ "$BK_ERR" == *custom.evil* ]]
+  # doppione
+  tar -czf "$w/b5.tar.gz" --hard-dereference -C "$w" manifest.json files.tar.gz custom.conf custom.conf custom.http.conf custom.cron
+  bk_verify "$w/b5.tar.gz" && false
+  [[ "$BK_ERR" == *duplicata* ]]
+  # oltre 1 MiB (sha coerente)
+  head -c 1048577 /dev/zero | tr '\0' a >"$w/custom.conf"
+  jq --arg s "$(sha256sum "$w/custom.conf" | cut -d' ' -f1)" '.sha256.custom_conf = $s' "$w/m.orig" >"$w/manifest.json"
+  tar -czf "$w/b6.tar.gz" -C "$w" manifest.json files.tar.gz custom.conf custom.http.conf custom.cron
+  bk_verify "$w/b6.tar.gz" && false
+  [[ "$BK_ERR" == *custom.conf* ]]
+}
+
+@test "bk_verify: copia vecchia senza chiavi custom passa" {
+  mk_site blog.miosito.it no
+  bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz"
+  local w="$BATS_TEST_TMPDIR/w"
+  mkdir -p "$w"
+  tar -xzf "$BATS_TEST_TMPDIR/out.tar.gz" -C "$w"
+  jq 'del(.custom_rules) | .sha256 |= with_entries(select(.key == "files" or .key == "db"))' "$w/manifest.json" >"$w/m2"
+  mv "$w/m2" "$w/manifest.json"
+  tar -czf "$w/old.tar.gz" -C "$w" manifest.json files.tar.gz
+  run bk_verify "$w/old.tar.gz"
+  [ "$status" -eq 0 ]
+}
