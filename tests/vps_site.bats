@@ -917,6 +917,39 @@ sito_php() {
   [ "$(site_reg_get blog.miosito.it '.custom_restored // "assente"')" = assente ]
 }
 
+@test "rules off su sito non PHP con custom_restored: toglie solo l'avviso, il resto resta rifiutato" {
+  vs create fisso.miosito.it --type static
+  bash "$T" _run create fisso.miosito.it
+  local tipo prima dopo
+  for tipo in static wordpress; do
+    # il tipo wordpress si imposta nel registro: creare un sito vero richiede WordPress e il database
+    site_reg_update fisso.miosito.it '.type = $t' --arg t "$tipo"
+    prima="$(cksum <"$NGINX_CONF_D/fisso.miosito.it.conf")"
+    site_reg_update fisso.miosito.it '.custom_restored = true'
+    : >"$BATS_TEST_TMPDIR/nginx-chiamate"
+    # shellcheck disable=SC2016
+    make_stub nginx 'echo chiamato >>"'"$BATS_TEST_TMPDIR"'/nginx-chiamate"; exit 0'
+    # on resta rifiutato e non tocca il registro
+    vs rules fisso.miosito.it on
+    [ "$status" -eq 1 ]
+    [ "$(jq -r .error <<<"$output")" = "le regole Nginx a mano valgono solo per i siti PHP" ]
+    [ "$(site_reg_get fisso.miosito.it .custom_restored)" = true ]
+    # off chiude l'avviso
+    vs rules fisso.miosito.it off
+    [ "$status" -eq 0 ]
+    [ "$(jq -c . <<<"$output")" = '{"ok":true,"custom_rules":false}' ]
+    [ "$(site_reg_get fisso.miosito.it '.custom_restored // "assente"')" = assente ]
+    dopo="$(cksum <"$NGINX_CONF_D/fisso.miosito.it.conf")"
+    [ "$prima" = "$dopo" ]
+    [ ! -s "$BATS_TEST_TMPDIR/nginx-chiamate" ]
+    [ ! -e "$NGINX_CUSTOM_D/fisso.miosito.it.conf" ]
+    # senza custom_restored anche off è rifiutato
+    vs rules fisso.miosito.it off
+    [ "$status" -eq 1 ]
+    [ "$(jq -r .error <<<"$output")" = "le regole Nginx a mano valgono solo per i siti PHP" ]
+  done
+}
+
 @test "wp-install rifiutato con le regole a mano" {
   run bash -c "printf 'Password-db-1234567890\n' | bash '$T' create blog.miosito.it --type php --db --custom-rules"
   bash "$T" _run create blog.miosito.it

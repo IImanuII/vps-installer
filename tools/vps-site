@@ -363,7 +363,15 @@ case "$cmd" in
     lock_now
     state="$(site_reg_get "$d" .state)"
     [[ "$state" == active || "$state" == disabled ]] || json_err "il sito non è pronto"
-    [[ "$(site_reg_get "$d" .type)" == php ]] || json_err "le regole Nginx a mano valgono solo per i siti PHP"
+    if [[ "$(site_reg_get "$d" .type)" != php ]]; then
+      # Una ricreazione da copia con cron può lasciare custom_restored anche su un sito
+      # statico o WordPress: off chiude l'avviso senza toccare vhost né file; tutto il
+      # resto resta rifiutato.
+      [[ "$2" == off && "$(site_reg_get "$d" '.custom_restored // false')" == true ]]         || json_err "le regole Nginx a mano valgono solo per i siti PHP"
+      site_reg_update "$d" 'del(.custom_restored)' || json_err "registro del sito non scritto"
+      json_ok '{ok: true, custom_rules: false}'
+      exit 0
+    fi
     SITE_ERROR_FILE="$(mktemp)"
     if ! site_custom_set "$d" "$2"; then
       msg="$(site_error_text nginx)"
