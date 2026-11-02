@@ -4230,6 +4230,62 @@ mk_custom() {
   [[ "$output" == *custom.http.conf* ]]
 }
 
+@test "bk_archive: il .cron-da-rivedere entra in custom.cron con la sua intestazione, anche da solo" {
+  mk_site blog.miosito.it no
+  mk_custom blog.miosito.it
+  local slug=site_blog_miosito_it rev w="$BATS_TEST_TMPDIR/x"
+  rev="$(site_custom_review blog.miosito.it)"
+  printf '# Cron della copia: NON attivi
+*/5 * * * * root /bin/true # da rivedere
+' >"$rev"
+  chmod 600 "$rev"
+  run bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz"
+  [ "$status" -eq 0 ]
+  mkdir -p "$w"
+  tar -xzf "$BATS_TEST_TMPDIR/out.tar.gz" -C "$w"
+  grep -qxF "# --- $rev ---" "$w/custom.cron"
+  grep -qxF '*/5 * * * * root /bin/true # da rivedere' "$w/custom.cron"
+  # i cron veri ci sono ancora, prima
+  grep -qxF "# --- $CRON_D/vps-site-$slug-cron ---" "$w/custom.cron"
+  run bk_verify "$BATS_TEST_TMPDIR/out.tar.gz"
+  [ "$status" -eq 0 ]
+  # senza altri cron: custom.cron c'è lo stesso
+  rm -f "$CRON_D/vps-site-$slug-cron" "$CRON_D/vps-site-$slug-altro"
+  rm -rf "$w"
+  mkdir -p "$w"
+  run bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out2.tar.gz"
+  [ "$status" -eq 0 ]
+  tar -xzf "$BATS_TEST_TMPDIR/out2.tar.gz" -C "$w"
+  [ "$(grep -c '^# --- ' "$w/custom.cron")" = 1 ]
+  grep -qxF "# --- $rev ---" "$w/custom.cron"
+  # un collegamento al suo posto non si legge
+  rm -f "$rev"
+  ln -s /etc/passwd "$rev"
+  run bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out3.tar.gz"
+  [ "$status" -eq 0 ]
+  run tar -tzf "$BATS_TEST_TMPDIR/out3.tar.gz"
+  [[ "$output" != *custom.cron* ]]
+}
+
+@test "bk_archive: il .cron-da-rivedere sta nel tetto cumulativo dei cron" {
+  mk_site blog.miosito.it no
+  mk_custom blog.miosito.it
+  local slug=site_blog_miosito_it rev w="$BATS_TEST_TMPDIR/x"
+  rev="$(site_custom_review blog.miosito.it)"
+  head -c 600000 /dev/zero | tr '\0' a >"$CRON_D/vps-site-$slug-cron"
+  head -c 600000 /dev/zero | tr '\0' b >"$rev"
+  run bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz"
+  [ "$status" -eq 0 ]
+  mkdir -p "$w"
+  tar -xzf "$BATS_TEST_TMPDIR/out.tar.gz" -C "$w"
+  [ "$(stat -c %s "$w/custom.cron")" -le "$BK_CUSTOM_MAX" ]
+  run grep -qxF "# --- $rev ---" "$w/custom.cron"
+  [ "$status" -ne 0 ]
+  grep -qF "$rev oltre il tetto" "$VPS_LOG"
+  run bk_verify "$BATS_TEST_TMPDIR/out.tar.gz"
+  [ "$status" -eq 0 ]
+}
+
 @test "bk_archive: cron senza a capo finale, l'intestazione del successivo resta su una riga sua" {
   mk_site blog.miosito.it no
   mk_custom blog.miosito.it

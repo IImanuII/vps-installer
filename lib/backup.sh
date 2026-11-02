@@ -222,7 +222,8 @@ BK_CUSTOM_MAX=1048576
 
 # _bk_custom_collect DOMINIO LAVORO — copia in LAVORO le regole Nginx a mano
 # (custom.conf, custom.http.conf) e i cron a mano (custom.cron, una riga
-# "# --- <percorso> ---" e poi il contenuto di ogni file). Solo file regolari: un link
+# "# --- <percorso> ---" e poi il contenuto di ogni file, compreso il .cron-da-rivedere
+# se c'è). Solo file regolari: un link
 # non si legge mai (root lo seguirebbe fuori dal sito). Un file oltre BK_CUSTOM_MAX si
 # salta con un avviso: il backup del sito non deve fallire per un file di regole.
 _bk_custom_collect() {
@@ -266,7 +267,15 @@ _bk_custom_collect() {
 '; fi
     } >>"$w/custom.cron" || return 1
     total=$((total + size + nl + hb))
-  done < <(site_custom_cron_files "$d")
+  done < <(
+    site_custom_cron_files "$d"
+    # I cron messi da parte dalla ricreazione (.cron-da-rivedere) non sono in cron.d ma
+    # nessuno li ha ancora spostati: senza questo un ricrea-elimina-ricrea o la rotazione
+    # delle copie li perderebbe. Stesso formato, stesso tetto, stesso salto dei controlli.
+    f="$(site_custom_review "$d")"
+    if [[ -f "$f" && ! -L "$f" ]]; then printf '%s
+' "$f"; fi
+  )
   return 0
 }
 
