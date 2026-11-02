@@ -4432,3 +4432,29 @@ mk_custom() {
     cmp "$w/custom.http.conf" "$(site_custom_http "$d")" || { echo "giro $i: custom.http.conf perso"; false; }
   done
 }
+
+@test "_bk_custom_recreate_do: .cron-da-rivedere 600, regole 644, cartella 750" {
+  mk_site blog.miosito.it no
+  local d=blog.miosito.it w="$BATS_TEST_TMPDIR/arc"
+  mkdir -p "$w"
+  echo 'location /a { return 200; }' >"$w/custom.conf"
+  echo '*/5 * * * * root /bin/true # da rivedere' >"$w/custom.cron"
+  jq -n --arg a "$(sha256sum "$w/custom.conf" | cut -d' ' -f1)" --arg c "$(sha256sum "$w/custom.cron" | cut -d' ' -f1)" \
+    '{sha256: {custom_conf: $a, custom_cron: $c}}' >"$w/manifest.json"
+  tar -czf "$w/a.tar.gz" -C "$w" custom.conf custom.cron
+  BK_RUN_DIR="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$BK_RUN_DIR/x"
+  cp "$w/manifest.json" "$BK_RUN_DIR/x/manifest.json"
+  _BK_R_BDATE=""
+  site_reg_update "$d" '.state = "creating" | .from_backup = {source: "local", name: "x"}'
+  _bk_custom_recreate_do "$d" "$w/a.tar.gz"
+  [ "$(stat -c %a "$(site_custom_review "$d")")" = 600 ]
+  [ "$(stat -c %a "$(site_custom_conf "$d")")" = 644 ]
+  [ "$(stat -c %a "$NGINX_CUSTOM_D")" = 750 ]
+}
+
+@test "vps-backup: CRON_D e NGINX_CUSTOM_D non entrano dall'ambiente del chiamante sotto sudo" {
+  # i nomi stanno nella lista del unset (riga di continuazione): altrove nello script non compaiono
+  grep -qE ' CRON_D ' "$REPO_ROOT/tools/vps-backup"
+  grep -qE ' NGINX_CUSTOM_D ' "$REPO_ROOT/tools/vps-backup"
+}
