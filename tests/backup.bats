@@ -4190,9 +4190,9 @@ mk_custom() {
   grep -qxF "# --- $CRON_D/vps-site-site_blog_miosito_it-cron ---" "$w/custom.cron"
   grep -qF '# uno' "$w/custom.cron"
   grep -qF '# due' "$w/custom.cron"
-  ! grep -q 'ALTRO-SITO' "$w/custom.cron"
-  ! grep -q 'WP-CRON' "$w/custom.cron"
-  ! grep -q 'link' "$w/custom.cron"
+  run ! grep -q 'ALTRO-SITO' "$w/custom.cron"
+  run ! grep -q 'WP-CRON' "$w/custom.cron"
+  run ! grep -q 'link' "$w/custom.cron"
   run bk_verify "$BATS_TEST_TMPDIR/out.tar.gz"
   [ "$status" -eq 0 ]
 }

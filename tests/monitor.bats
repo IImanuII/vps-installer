@@ -688,7 +688,7 @@ sent() {
   # giro sano: l'uscita di nginx -t non finisce nel registro (un giro al minuto)
   : >"$VPS_LOG"
   run round "$NOW"
-  ! grep -qE 'syntax is ok|test is successful' "$VPS_LOG"
+  run ! grep -qE 'syntax is ok|test is successful' "$VPS_LOG"
   NGINX_FAIL=1 run round $((NOW + 60))
   [ "$status" -eq 0 ]
   grep -q 'test failed' "$VPS_LOG"
