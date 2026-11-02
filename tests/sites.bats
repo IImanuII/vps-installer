@@ -780,3 +780,40 @@ nginx_riga_stub() {
     [[ "$(cat "$SITE_ERROR_FILE")" == *"un altro file, non in a.miosito.it"* ]]
   done
 }
+
+@test "site_vhost_add: errore senza file nominato, nessuna colpa attribuita" {
+  site_reg_new a.miosito.it php no no
+  site_vhost_add a.miosito.it
+  nginx_riga_stub
+  export STUB_RC_nginx=1 SITE_ERROR_FILE="$BATS_TEST_TMPDIR/err"
+  for riga in "nginx -t non riuscito" "[emerg] bind() to 0.0.0.0:80 failed (98: Address already in use)"; do
+    export STUB_NGINX_LINE="$riga"
+    run site_vhost_add a.miosito.it maintenance
+    [ "$status" -eq 1 ]
+    [[ "$(cat "$SITE_ERROR_FILE")" == "Nginx rifiuta la configurazione: "* ]]
+    [[ "$(cat "$SITE_ERROR_FILE")" != *"altro file"* ]]
+  done
+}
+
+@test "site_vhost_add: vhost e file http.conf del sito sono suoi" {
+  site_reg_new a.miosito.it php no no
+  site_vhost_add a.miosito.it
+  nginx_riga_stub
+  export STUB_RC_nginx=1 SITE_ERROR_FILE="$BATS_TEST_TMPDIR/err"
+  for f in "$NGINX_CUSTOM_D/a.miosito.it.http.conf" "$NGINX_CONF_D/a.miosito.it.conf"; do
+    export STUB_NGINX_LINE="[emerg] unknown directive \"foo\" in $f:7"
+    run site_vhost_add a.miosito.it maintenance
+    [ "$status" -eq 1 ]
+    [[ "$(cat "$SITE_ERROR_FILE")" == "la configurazione Nginx di a.miosito.it non è valida: "*"$f:7" ]]
+  done
+}
+
+@test "site_vhost_remove: la riga d'errore entra nel registro" {
+  site_reg_new a.miosito.it php no no
+  site_vhost_add a.miosito.it
+  nginx_riga_stub
+  export STUB_RC_nginx=1 STUB_NGINX_LINE='[emerg] unknown directive "foo" in /etc/nginx/vps-custom/b.miosito.it.conf:3'
+  run site_vhost_remove a.miosito.it
+  [ "$status" -eq 0 ]
+  grep -qF 'ATTENZIONE: Nginx non ricaricato dopo la rimozione del vhost di a.miosito.it: [emerg] unknown directive "foo" in /etc/nginx/vps-custom/b.miosito.it.conf:3' "$VPS_LOG"
+}

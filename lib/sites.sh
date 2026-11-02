@@ -434,8 +434,12 @@ site_vhost_add() {
   fi
   if _site_nginx_line_names "$d" "$err"; then
     site_fail "la configurazione Nginx di $d non è valida: $err"
-  else
+  elif [[ "$err" =~ (^|[\ \"])/[^\ \"]+:[0-9]+ ]]; then
     site_fail "Nginx rifiuta la configurazione per un errore in un altro file, non in $d: $err"
+  else
+    # Nessun file nominato (bind() fallito, riga tagliata, nginx -t senza [emerg]):
+    # non si dice dove sta la colpa, non lo sappiamo.
+    site_fail "Nginx rifiuta la configurazione: $err"
   fi
 }
 

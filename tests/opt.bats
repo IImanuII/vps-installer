@@ -394,3 +394,19 @@ sys_setup() {
   opt_system_files
   [ -f "$LOGROTATE_D/vps" ]
 }
+
+@test "opt: la riga di nginx -t entra nei due messaggi ATTENZIONE" {
+  riga='[emerg] unknown directive "foo" in /etc/nginx/vps-custom/a.miosito.it.conf:3'
+  make_stub nginx 'echo "nginx: $RIGA" >&2; exit 1'
+  export RIGA="$riga"
+  jq -n '{panel:{domain:"p.test"}}' >"$VPS_OPT/manifest.json"
+  export PANEL_VHOST_FILE="$BATS_TEST_TMPDIR/p.test.conf"
+  printf '    fastcgi_pass unix:/run/php/php8.4-fpm-panel.sock;\n' >"$PANEL_VHOST_FILE"
+  opt_panel_vhost
+  grep -qF "vhost del pannello non aggiornato (nginx -t o reload falliti: $riga)" "$VPS_LOG"
+  export NGINX_SNIPPETS="$BATS_TEST_TMPDIR/snip"
+  mkdir -p "$NGINX_SNIPPETS/panel.d"
+  echo vecchio >"$NGINX_SNIPPETS/panel.d/pma.conf"
+  opt_pma_snippet
+  grep -qF "blocco nginx di phpMyAdmin non aggiornato (nginx -t o reload falliti: $riga)" "$VPS_LOG"
+}
