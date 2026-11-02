@@ -65,7 +65,7 @@ opt_panel_pool() {
 # si verifica con nginx -t e si ricarica; se qualcosa non va torna il file di
 # prima e --tools-only prosegue.
 opt_panel_vhost() {
-  local m dom f bak
+  local m dom f bak err
   m="$(manifest_path)"
   dom="$(jq -r '.panel.domain // empty' "$m")"
   [[ -n "$dom" ]] || return 0
@@ -76,12 +76,12 @@ opt_panel_vhost() {
   bak="$(mktemp)"
   cp -p "$f" "$bak"
   sed -i 's/^\([[:space:]]*\)\(fastcgi_pass .*-fpm-panel\.sock;\)/&\n\1fastcgi_read_timeout 150s;/' "$f"
-  if nginx -t >>"$VPS_LOG" 2>&1 && systemctl reload nginx >>"$VPS_LOG" 2>&1; then
+  if err="$(nginx_check)" && systemctl reload nginx >>"$VPS_LOG" 2>&1; then
     rm -f "$bak"
     log "Vhost del pannello: aggiunto fastcgi_read_timeout 150s"
   else
     mv -f "$bak" "$f"
-    log "ATTENZIONE: vhost del pannello non aggiornato (nginx -t o reload falliti), lasciato com'era"
+    log "ATTENZIONE: vhost del pannello non aggiornato (nginx -t o reload falliti${err:+: $err}), lasciato com'era"
   fi
 }
 
@@ -90,7 +90,7 @@ opt_panel_vhost() {
 # respingeva con 429: pagina bianca). Si riscrive solo se diverso, nginx -t prima del reload,
 # altrimenti torna il file di prima. Senza phpMyAdmin installato non si crea niente.
 opt_pma_snippet() {
-  local f="$NGINX_SNIPPETS/panel.d/pma.conf" new bak
+  local f="$NGINX_SNIPPETS/panel.d/pma.conf" new bak err
   [[ -f "$f" ]] || return 0
   new="$(mktemp)"
   render_template "$VPS_TEMPLATES/nginx-pma.conf.tmpl" "$new" 644 root:root VPS_OPT PHP_VERSION
@@ -103,12 +103,12 @@ opt_pma_snippet() {
   install -m 644 "$new" "$f"
   own root:root "$f"
   rm -f "$new"
-  if nginx -t >>"$VPS_LOG" 2>&1 && systemctl reload nginx >>"$VPS_LOG" 2>&1; then
+  if err="$(nginx_check)" && systemctl reload nginx >>"$VPS_LOG" 2>&1; then
     rm -f "$bak"
     log "phpMyAdmin: blocco nginx aggiornato"
   else
     mv -f "$bak" "$f"
-    log "ATTENZIONE: blocco nginx di phpMyAdmin non aggiornato (nginx -t o reload falliti), lasciato com'era"
+    log "ATTENZIONE: blocco nginx di phpMyAdmin non aggiornato (nginx -t o reload falliti${err:+: $err}), lasciato com'era"
   fi
 }
 

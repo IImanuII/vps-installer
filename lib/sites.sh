@@ -357,13 +357,25 @@ site_tmpl_text() {
   envsubst "$fmt" <"$src"
 }
 
+# _site_nginx_line_names DOMINIO RIGA — 0 se la riga d'errore di nginx nomina un
+# file di questo sito: il vhost o i due file a mano. Confronto letterale sul
+# percorso intero (i punti del dominio non sono jolly) con ":riga" o virgolette
+# subito dopo, così a.it non si prende le righe di a.it.evil.conf né di xa.it.conf.
+_site_nginx_line_names() {
+  local d="$1" line="$2" p
+  for p in "$NGINX_CONF_D/$d.conf" "$NGINX_CUSTOM_D/$d.conf" "$NGINX_CUSTOM_D/$d.http.conf"; do
+    [[ "$line" == *" $p:"[0-9]* || "$line" == *"\"$p\""* ]] && return 0
+  done
+  return 1
+}
+
 # site_vhost_add DOMINIO [normal|maintenance] — scrive il vhost e ricarica Nginx.
 # Se nginx -t lo rifiuta rimette il file di prima (o nessuno): un vhost rotto
 # bloccherebbe i reload di tutti i siti e del pannello.
 # Le variabili SITE_* le legge render_template (envsubst), non lo vede shellcheck.
 # shellcheck disable=SC2034
 site_vhost_add() {
-  local d="$1" mode="${2:-normal}" f bak="" variant
+  local d="$1" mode="${2:-normal}" f bak="" variant err
   f="$NGINX_CONF_D/$d.conf"
   SITE_DOMAIN="$d"
   SITE_SLUG="$(site_reg_get "$d" .slug)"
@@ -410,7 +422,7 @@ site_vhost_add() {
   fi
   render_template "$VPS_TEMPLATES/nginx-site.conf.tmpl" "$f" 644 root:root \
     SITE_DOMAIN SITE_NAMES SITE_ROOT SITE_BODY SITE_WWW_BLOCK SITE_HEADERS SITE_BURST SITE_HTTP_INCLUDE SITE_ACCESS_LOG || return 1
-  if nginx -t >>"$VPS_LOG" 2>&1; then
+  if err="$(nginx_check)"; then
     rm -f "$bak"
     systemctl reload nginx || site_fail "Nginx non si è ricaricato"
     return
@@ -420,15 +432,20 @@ site_vhost_add() {
   else
     rm -f "$f"
   fi
-  site_fail "la configurazione Nginx di $d non è valida (dettagli in $VPS_LOG)"
+  if _site_nginx_line_names "$d" "$err"; then
+    site_fail "la configurazione Nginx di $d non è valida: $err"
+  else
+    site_fail "Nginx rifiuta la configurazione per un errore in un altro file, non in $d: $err"
+  fi
 }
 
 site_vhost_remove() {
   local f="$NGINX_CONF_D/$1.conf"
   [[ -f "$f" ]] || return 0
   rm -f "$f" || return 1
-  if ! { nginx -t >>"$VPS_LOG" 2>&1 && systemctl reload nginx; }; then
-    log "ATTENZIONE: Nginx non ricaricato dopo la rimozione del vhost di $1"
+  local err=""
+  if ! { err="$(nginx_check)" && systemctl reload nginx; }; then
+    log "ATTENZIONE: Nginx non ricaricato dopo la rimozione del vhost di $1${err:+: $err}"
   fi
 }
 

@@ -885,7 +885,7 @@ sito_php() {
   sito_php blog.miosito.it
   STUB_RC_nginx=1 vs rules blog.miosito.it on
   [ "$status" -eq 1 ]
-  [[ "$(jq -r .error <<<"$output")" == *"configurazione Nginx"* ]]
+  [[ "$(jq -r .error <<<"$output")" == *"Nginx rifiuta la configurazione"* ]]
   [ "$(site_reg_get blog.miosito.it .custom_rules)" = false ]
   run grep -c vps-custom "$NGINX_CONF_D/blog.miosito.it.conf"
   [ "$output" = 0 ]

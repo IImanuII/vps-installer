@@ -736,3 +736,47 @@ nuovo() { # DOMINIO TIPO WWW DB [PASSWORD]
   site_run create blog.miosito.it
   [ "$(site_reg_get blog.miosito.it '"\(.state) \(.job.op) \(.job.step) \(.job.error)"')" = "active create done null" ]
 }
+
+# Stub di nginx che fallisce con la riga data (STUB_NGINX_LINE) quando c'è STUB_RC_nginx.
+nginx_riga_stub() {
+  # shellcheck disable=SC2016
+  make_stub nginx 'echo "nginx $*" >>"$CALLS"; if [ "${STUB_RC_nginx:-0}" != 0 ]; then echo "nginx: $STUB_NGINX_LINE" >&2; echo "nginx: configuration file /etc/nginx/nginx.conf test failed" >&2; exit 1; fi'
+}
+
+@test "site_vhost_add: errore in un altro file nominato, vhost di prima" {
+  site_reg_new b.miosito.it php no no
+  site_vhost_add b.miosito.it
+  cp "$NGINX_CONF_D/b.miosito.it.conf" "$BATS_TEST_TMPDIR/prima"
+  nginx_riga_stub
+  export STUB_RC_nginx=1 SITE_ERROR_FILE="$BATS_TEST_TMPDIR/err"
+  export STUB_NGINX_LINE="[emerg] unknown directive \"foo\" in $NGINX_CUSTOM_D/a.miosito.it.conf:3"
+  run site_vhost_add b.miosito.it maintenance
+  [ "$status" -eq 1 ]
+  [[ "$(cat "$SITE_ERROR_FILE")" == *"un altro file, non in b.miosito.it"* ]]
+  [[ "$(cat "$SITE_ERROR_FILE")" == *"a.miosito.it.conf:3"* ]]
+  cmp "$NGINX_CONF_D/b.miosito.it.conf" "$BATS_TEST_TMPDIR/prima"
+}
+
+@test "site_vhost_add: errore nel file a mano del sito stesso" {
+  site_reg_new a.miosito.it php no no
+  site_vhost_add a.miosito.it
+  nginx_riga_stub
+  export STUB_RC_nginx=1 SITE_ERROR_FILE="$BATS_TEST_TMPDIR/err"
+  export STUB_NGINX_LINE="[emerg] unknown directive \"foo\" in $NGINX_CUSTOM_D/a.miosito.it.conf:3"
+  run site_vhost_add a.miosito.it maintenance
+  [ "$status" -eq 1 ]
+  [[ "$(cat "$SITE_ERROR_FILE")" == *"la configurazione Nginx di a.miosito.it non è valida: "*"a.miosito.it.conf:3" ]]
+}
+
+@test "site_vhost_add: il nome del file è letterale, nessun prefisso o jolly" {
+  site_reg_new a.miosito.it php no no
+  site_vhost_add a.miosito.it
+  nginx_riga_stub
+  export STUB_RC_nginx=1 SITE_ERROR_FILE="$BATS_TEST_TMPDIR/err"
+  for altro in "$NGINX_CUSTOM_D/a.miosito.it.evil.conf" "$NGINX_CUSTOM_D/xa.miosito.it.conf" "$NGINX_CUSTOM_D/aXmiosito.it.conf"; do
+    export STUB_NGINX_LINE="[emerg] unknown directive \"foo\" in $altro:3"
+    run site_vhost_add a.miosito.it maintenance
+    [ "$status" -eq 1 ]
+    [[ "$(cat "$SITE_ERROR_FILE")" == *"un altro file, non in a.miosito.it"* ]]
+  done
+}

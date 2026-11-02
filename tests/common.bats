@@ -92,3 +92,35 @@ setup() {
   [ "$(cat "$BATS_TEST_TMPDIR/f")" = "vecchio" ]
   [ -z "$(find "$BATS_TEST_TMPDIR" -name '.tmp.*')" ]
 }
+
+@test "nginx_check: riga d'errore pulita, uscita completa nel registro" {
+  make_stub nginx 'if [ -n "$NGINX_FAIL" ]; then
+  echo "nginx: [emerg] unknown directive \"foo\" in /etc/nginx/vps-custom/a.miosito.it.conf:3" >&2
+  echo "nginx: configuration file /etc/nginx/nginx.conf test failed" >&2
+  exit 1
+fi
+echo "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok" >&2'
+  run nginx_check
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+
+  export NGINX_FAIL=1
+  run nginx_check
+  [ "$status" -eq 1 ]
+  [ "$output" = '[emerg] unknown directive "foo" in /etc/nginx/vps-custom/a.miosito.it.conf:3' ]
+  grep -q 'test failed' "$VPS_LOG"
+
+  # Con set -e il chiamante non muore dentro nginx_check ma legge l'rc.
+  run bash -c 'set -eu; source "$REPO_ROOT/lib/common.sh"; if e="$(nginx_check)"; then echo ok; else echo "ko:$e"; fi'
+  [[ "$output" == ko:* ]]
+
+  make_stub nginx 'echo "nginx: qualcosa di strano" >&2; exit 1'
+  run nginx_check
+  [ "$status" -eq 1 ]
+  [ "$output" = "nginx -t non riuscito" ]
+
+  make_stub nginx 'printf "nginx: [alert] x\001y %0400d\n" 0 >&2; exit 1'
+  run nginx_check
+  [ "${#output}" -eq 300 ]
+  [[ "$output" == "[alert] x?y "* ]]
+}

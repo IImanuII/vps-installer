@@ -20,6 +20,29 @@ log() {
   printf '%s\n' "$line" >>"$VPS_LOG" 2>/dev/null || true
 }
 
+# nginx_check — esegue nginx -t; tutta l'uscita va nel registro. Rc 0 se la
+# configurazione è valida. Altrimenti rc 1 e UNA riga su stdout: la prima con
+# [emerg], [alert] o [crit] (nomina file e riga colpevoli), senza il prefisso
+# "nginx: ", non stampabili → ?, al massimo 300 caratteri. Lo stato di nginx -t
+# si legge dentro un `if`, così regge i chiamanti con set -e.
+nginx_check() {
+  local out line
+  if out="$(nginx -t 2>&1)"; then
+    printf '%s\n' "$out" >>"$VPS_LOG" 2>/dev/null || true
+    return 0
+  fi
+  printf '%s\n' "$out" >>"$VPS_LOG" 2>/dev/null || true
+  line="$(printf '%s\n' "$out" | grep -m1 -E '\[(emerg|alert|crit)\]' || true)"
+  line="${line#nginx: }"
+  if [[ -z "$line" ]]; then
+    printf '%s\n' "nginx -t non riuscito"
+    return 1
+  fi
+  line="$(printf '%s' "$line" | LC_ALL=C tr -c '[:print:]' '?')"
+  printf '%s\n' "${line:0:300}"
+  return 1
+}
+
 die() {
   log "ERRORE: $*"
   exit 1
