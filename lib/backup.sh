@@ -2251,7 +2251,7 @@ _bk_custom_recreate_do() {
     present+=("$m")
   done
   ((${#present[@]})) || return "$rc"
-  install -d -m 755 "$NGINX_CUSTOM_D" || return 1
+  install -d -m 750 "$NGINX_CUSTOM_D" || return 1
   type="$(site_reg_get "$d" .type)"
   for m in "${present[@]}"; do
     case "$m" in

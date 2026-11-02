@@ -48,7 +48,11 @@ site_custom_files_add() {
 
 _site_custom_files_write() {
   local d="$1" f
-  install -d -m 755 "$NGINX_CUSTOM_D" || return 1
+  # 750: Nginx legge come root, e un utente di un altro sito (compromesso) non deve poter
+  # leggere le regole di questo, che possono contenere segreti (postback, chiavi). I file
+  # dentro restano 644 perché la protezione sta nella cartella. install -d rimette il
+  # modo anche su una cartella già esistente.
+  install -d -m 750 "$NGINX_CUSTOM_D" || return 1
   f="$(site_custom_conf "$d")"
   if [[ ! -e "$f" && ! -L "$f" ]]; then
     site_tmpl_text "$VPS_TEMPLATES/nginx-site-custom.conf.tmpl" SITE_DOMAIN SITE_ROOT SITE_SLUG PHP_VERSION |

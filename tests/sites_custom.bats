@@ -33,8 +33,17 @@ setup() {
   grep -q "fastcgi_pass unix:/run/php/php$PHP_VERSION-fpm-site_miosito_it.sock;" "$c"
   grep -q 'try_files $uri $uri/ /index.php?$query_string;' "$c"
   [ "$(stat -c %a "$c")" = 644 ]
-  [ "$(stat -c %a "$NGINX_CUSTOM_D")" = 755 ]
+  [ "$(stat -c %a "$NGINX_CUSTOM_D")" = 750 ]
   [ "$(grep -v '^\s*#' "$NGINX_CUSTOM_D/miosito.it.http.conf" | grep -cv '^\s*$')" = 0 ]
+}
+
+@test "site_custom_files_add: la cartella diventa 750 anche se esisteva con 755" {
+  site_reg_new miosito.it php no no
+  site_reg_update miosito.it '.custom_rules = true'
+  mkdir -p "$NGINX_CUSTOM_D"
+  chmod 755 "$NGINX_CUSTOM_D"
+  site_vhost_add miosito.it
+  [ "$(stat -c %a "$NGINX_CUSTOM_D")" = 750 ]
 }
 
 @test "site_custom_files_add non riscrive file esistenti" {

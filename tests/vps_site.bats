@@ -1008,6 +1008,7 @@ fb_real_restore() {
   [ "$(cat "$NGINX_CUSTOM_D/blog.miosito.it.conf")" = '# regola a mano della copia' ]
   [ "$(cat "$NGINX_CUSTOM_D/blog.miosito.it.http.conf")" = '# regola http della copia' ]
   [ "$(stat -c %a "$NGINX_CUSTOM_D/blog.miosito.it.conf")" = 644 ]
+  [ "$(stat -c %a "$NGINX_CUSTOM_D")" = 750 ]
   local rev="$NGINX_CUSTOM_D/blog.miosito.it.cron-da-rivedere"
   [ "$(stat -c %a "$rev")" = 600 ]
   head -n1 "$rev" | grep -q '^# Cron della copia del .*: NON attivi\. Controllali, poi spostali in .*/vps-site-site_blog_miosito_it-<nome>'
