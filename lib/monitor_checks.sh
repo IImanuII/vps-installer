@@ -292,6 +292,26 @@ mon_check_services() {
   done < <(mon_services)
 }
 
+# ---------------------------------------------------------------- Nginx
+
+# mon_check_nginx — `nginx -t` a ogni giro (meno di un secondo). Il servizio
+# può essere attivo con una configurazione rotta (si è ricaricata prima del
+# guasto): il guasto esplode al prossimo reload, rinnovo di certificato o
+# riavvio, e senza questo controllo nessuno se ne accorge prima. Senza nginx
+# installato non c'è niente da controllare e il controllo non entra nello stato.
+mon_check_nginx() {
+  local err lvl=ok
+  command -v nginx >/dev/null 2>&1 || return 0
+  err="$(nginx_check)" || lvl=down
+  _mon_level nginx_conf "$lvl" '{"kind":"nginx_conf","label":"configurazione Nginx"}'
+  case "$MON_EV" in
+    new | remind)
+      _mon_say down "configurazione di Nginx non valida: $err. Le modifiche ai siti e i rinnovi dei certificati falliscono e al riavvio Nginx non partirebbe: correggi il file e prova con nginx -t"
+      ;;
+    up) _mon_say up "configurazione di Nginx di nuovo valida" ;;
+  esac
+}
+
 # ---------------------------------------------------------------- risorse
 
 # _mon_over ID SOPRA — contatore dei giri consecutivi oltre soglia.
@@ -518,6 +538,7 @@ mon_run() {
 
   mon_check_urls
   mon_check_services
+  mon_check_nginx
   mon_check_resources
   mon_check_ssh
   mon_check_f2b

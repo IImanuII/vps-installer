@@ -464,6 +464,16 @@ tool_env() {
   make_stub apt 'cat "$BATS_TEST_TMPDIR/apt.out" 2>/dev/null; exit 0'
   make_stub systemctl "$(cat "$BATS_TEST_DIRNAME/monitor_stub_systemctl.bash")"
   make_stub curl "$(cat "$BATS_TEST_DIRNAME/monitor_stub_curl.bash")"
+  # nginx finto: valido, a meno che NGINX_FAIL sia impostata. Senza lo stub un
+  # nginx vero della macchina di test (che da non-root non può aprire pid e log)
+  # darebbe un falso avviso in tutti i giri.
+  make_stub nginx 'if [ -n "${NGINX_FAIL:-}" ]; then
+  echo "nginx: [emerg] unknown directive \"foo\" in /etc/nginx/sites-enabled/a.miosito.it.conf:3" >&2
+  echo "nginx: configuration file /etc/nginx/nginx.conf test failed" >&2
+  exit 1
+fi
+echo "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok" >&2
+echo "nginx: configuration file /etc/nginx/nginx.conf test is successful" >&2'
 }
 
 # set_url URL CODICE TEMPO [CORPO] — risposta del curl finto per URL
@@ -670,6 +680,42 @@ sent() {
   touch "$T/down.mariadb" "$T/norestart.mariadb"
   run round "$NOW"
   [ "$(sent)" = '🔴 vps-test: mariadb fermo, riavvio non riuscito' ]
+}
+
+@test "mon_check_nginx: avviso con la riga, niente doppioni, rientro" {
+  tool_env
+  mon_cfg '.urls = []'
+  NGINX_FAIL=1 run round "$NOW"
+  [ "$status" -eq 0 ]
+  [ "$(sent | wc -l)" -eq 1 ]
+  [[ "$(sent)" == '🔴 vps-test: configurazione di Nginx non valida: '*'a.miosito.it.conf:3'* ]]
+  [[ "$(sent)" == *'correggi il file e prova con nginx -t' ]]
+  run bash -c "bash '$TOOL' status 2>/dev/null"
+  jq -e '.checks | map(select(.id == "nginx_conf"))[0] | .kind == "nginx_conf" and .state == "down" and .label == "configurazione Nginx"' <<<"$output"
+  # entro remind_min niente doppioni
+  NGINX_FAIL=1 run round $((NOW + 60))
+  [ "$(sent | wc -l)" -eq 1 ]
+  # rientro
+  run round $((NOW + 120))
+  [ "$(sent | wc -l)" -eq 2 ]
+  [ "$(sent | tail -n1)" = '🟢 vps-test: configurazione di Nginx di nuovo valida' ]
+  run bash -c "bash '$TOOL' status 2>/dev/null"
+  jq -e '.checks | map(select(.id == "nginx_conf"))[0].state == "ok"' <<<"$output"
+}
+
+@test "mon_check_nginx: senza nginx nessun controllo" {
+  tool_env
+  mon_cfg '.urls = []'
+  # PATH senza le cartelle dove sta un nginx vero (non quella dello stub)
+  local d p=""
+  while IFS= read -r d; do
+    if [[ "$d" == "$T/bin" || ! -x "$d/nginx" ]]; then p+="${p:+:}$d"; fi
+  done < <(tr ':' '\n' <<<"$PATH")
+  rm "$T/bin/nginx"
+  PATH="$p" run round "$NOW"
+  [ "$status" -eq 0 ]
+  run bash -c "bash '$TOOL' status 2>/dev/null"
+  jq -e '[.checks[].id] | index("nginx_conf") == null' <<<"$output"
 }
 
 @test "giro: disco 87% giallo, 96% rosso; RAM al 5% per 5 giri avvisa al quinto" {
