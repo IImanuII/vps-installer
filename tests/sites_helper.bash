@@ -106,9 +106,20 @@ fb_archive() {
   mkdir -p "$root/public/wp-content" "$root/logs" "$root/tmp" "$BK_BACKUPS/sites"
   echo "contenuto di $d" >"$root/public/index.php"
   printf '<?php // wp-config vecchio\n$table_prefix = '"'%s'"';\n' "${FB_PREFIX:-wp_}" >"$root/wp-config.php"
+  # FB_CUSTOM=1: regole Nginx a mano (solo PHP) e un cron a mano, che finiscono nella copia
+  # e poi spariscono con il sito, come alla sua eliminazione.
+  local slug cust=()
+  slug="$(site_reg_get "$d" .slug)"
+  if [[ -n "${FB_CUSTOM:-}" ]]; then
+    mkdir -p "$NGINX_CUSTOM_D" "$CRON_D"
+    echo '# regola a mano della copia' >"$(site_custom_conf "$d")"
+    echo '# regola http della copia' >"$(site_custom_http "$d")"
+    echo '*/5 * * * * root /bin/true # cron della copia' >"$CRON_D/vps-site-$slug-lavoro"
+    cust=("$(site_custom_conf "$d")" "$(site_custom_http "$d")" "$CRON_D/vps-site-$slug-lavoro")
+  fi
   FB_ARC="sites/$d-20261001-040000.tar.gz"
   bk_archive "$d" "$BK_BACKUPS/$FB_ARC" "${FB_PARTS:-all}" || return 1
-  rm -f "$(site_reg_path "$d")"
+  rm -f "$(site_reg_path "$d")" "${cust[@]}"
   rm -rf "$root"
 }
 

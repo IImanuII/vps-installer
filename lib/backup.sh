@@ -226,7 +226,7 @@ BK_CUSTOM_MAX=1048576
 # non si legge mai (root lo seguirebbe fuori dal sito). Un file oltre BK_CUSTOM_MAX si
 # salta con un avviso: il backup del sito non deve fallire per un file di regole.
 _bk_custom_collect() {
-  local d="$1" w="$2" f size total=0
+  local d="$1" w="$2" f size total=0 nl hb
   f="$(site_custom_conf "$d")"
   if [[ -f "$f" && ! -L "$f" ]]; then
     size="$(stat -c %s "$f")"
@@ -244,13 +244,28 @@ _bk_custom_collect() {
       continue
     fi
     size="$(stat -c %s "$f")" || continue
+    # Un file senza a capo finale incollerebbe l'intestazione del successivo alla sua
+    # ultima riga: chi rivede il file a mano la leggerebbe come parte del cron. L'a capo si
+    # aggiunge, ed entra nel conto (ultimo byte letto da $(…), che toglie solo gli a capo).
+    nl=0
+    if ((size > 0)) && [[ -n "$(tail -c 1 -- "$f")" ]]; then nl=1; fi
+    # byte esatti dell'intestazione "# --- <percorso> ---" con il suo a capo (il percorso può
+    # avere caratteri multibyte: ${#f} conterebbe caratteri)
+    hb="$(printf '# --- %s ---
+' "$f" | wc -c)"
     # il tetto vale anche per il file unico, o bk_verify rifiuterebbe la copia
-    if ((size + total + ${#f} + 16 > BK_CUSTOM_MAX)); then
+    if ((size + nl + hb + total > BK_CUSTOM_MAX)); then
       log "ATTENZIONE: $f oltre il tetto di 1 MiB, non incluso nella copia di $d"
       continue
     fi
-    { printf '# --- %s ---\n' "$f"; cat -- "$f"; } >>"$w/custom.cron" || return 1
-    total=$((total + size + ${#f} + 16))
+    {
+      printf '# --- %s ---
+' "$f"
+      cat -- "$f"
+      if ((nl)); then printf '
+'; fi
+    } >>"$w/custom.cron" || return 1
+    total=$((total + size + nl + hb))
   done < <(site_custom_cron_files "$d")
   return 0
 }
@@ -1856,7 +1871,7 @@ _bk_walk_staging() {
   fi
 }
 
-_BK_STAGE="" _BK_OLD="" _BK_SAFETY="" _BK_R_DOM="" _BK_R_NOTE="" _BK_R_BDATE=""
+_BK_STAGE="" _BK_OLD="" _BK_SAFETY="" _BK_R_DOM="" _BK_R_NOTE="" _BK_R_BDATE="" _BK_R_CUSTOM=0
 
 # bk_space_free_ok DIR BYTES — 0 se su DIR restano più di BYTES + 256 MB.
 bk_space_free_ok() {
@@ -2187,6 +2202,93 @@ _bk_rprogress() {
   _bk_state_set "$(jq -nc --argjson j "$job" '{job: $j}')" || log "vps-backup: state.json non scritto"
 }
 
+# _bk_custom_recreate DOMINIO ARCHIVIO — solo nella ricreazione di un sito da una copia
+# (registro "creating" con from_backup: from_backup resta anche dopo, quindi è lo stato
+# che dice se è ancora la ricreazione): rimette sul disco le regole Nginx a mano e i cron
+# della copia, ma NON attivi. Un ripristino su un sito esistente non passa di qui: le
+# regole e i cron di chi lo gestisce non si toccano mai. Le regole non entrano nel vhost
+# (custom_rules resta false: si accendono con `vps-site rules on`, dopo averle riviste) e
+# i cron non vanno in cron.d, dove girerebbero come root senza che nessuno li abbia letti:
+# restano in un file di testo accanto alle regole, da leggere e spostare a mano.
+# Un file delle regole già presente non si sovrascrive. Un errore di scrittura va nel
+# registro e non fa fallire il ripristino (il sito è già tornato). Imposta _BK_R_CUSTOM=1
+# e custom_restored nel registro se ha scritto qualcosa.
+_bk_custom_recreate() {
+  [[ "$(site_reg_get "$1" '.state == "creating" and .from_backup != null' 2>/dev/null || true)" == true ]] || return 0
+  _bk_custom_recreate_do "$@" || log "ATTENZIONE: regole a mano o cron della copia di $1 non (tutti) rimessi a posto"
+  return 0
+}
+
+_bk_custom_recreate_do() {
+  local d="$1" arc="$2" c="$BK_RUN_DIR/custom" m want got f rev bdate wrote=0 rc=0 type
+  local -A key=([custom.conf]=custom_conf [custom.http.conf]=custom_http [custom.cron]=custom_cron)
+  local -a present=()
+  mkdir -p "$c" || return 1
+  # Solo i membri presenti, estratti in una cartella nostra. bk_verify li ha già
+  # controllati, ma qui si rileggono: sha256 del manifest, file regolare, tetto di grandezza.
+  for m in custom.conf custom.http.conf custom.cron; do
+    tar -tzf "$arc" 2>/dev/null | grep -qxF "$m" || continue
+    tar -xzf "$arc" -C "$c" --no-same-owner --no-same-permissions "$m" 2>/dev/null || {
+      log "ATTENZIONE: $m della copia illeggibile, non rimesso"
+      rc=1
+      continue
+    }
+    want="$(jq -r --arg k "${key[$m]}" '.sha256[$k] // ""' "$BK_RUN_DIR/x/manifest.json")"
+    got="$(sha256sum "$c/$m" | cut -d' ' -f1)"
+    if [[ ! -f "$c/$m" || -L "$c/$m" || "$(stat -c %s "$c/$m")" -gt "$BK_CUSTOM_MAX" || "$want" != "$got" ]]; then
+      log "ATTENZIONE: $m della copia non valido, non rimesso"
+      rc=1
+      continue
+    fi
+    present+=("$m")
+  done
+  ((${#present[@]})) || return "$rc"
+  install -d -m 755 "$NGINX_CUSTOM_D" || return 1
+  type="$(site_reg_get "$d" .type)"
+  for m in "${present[@]}"; do
+    case "$m" in
+      custom.conf | custom.http.conf)
+        # le regole valgono solo per i siti PHP
+        [[ "$type" == php ]] || continue
+        if [[ "$m" == custom.conf ]]; then f="$(site_custom_conf "$d")"; else f="$(site_custom_http "$d")"; fi
+        if [[ -e "$f" || -L "$f" ]]; then
+          log "ATTENZIONE: $f esiste già, non sovrascritto dalla copia"
+          continue
+        fi
+        if write_file "$f" 644 root:root <"$c/$m"; then wrote=1; else
+          log "ATTENZIONE: $f non scritto"
+          rc=1
+        fi
+        ;;
+      custom.cron)
+        rev="$(site_custom_review "$d")"
+        if [[ -e "$rev" || -L "$rev" ]]; then
+          log "ATTENZIONE: $rev esiste già, cron della copia non messi da parte"
+          continue
+        fi
+        bdate=""
+        if [[ -n "$_BK_R_BDATE" ]]; then bdate="$(date -d "$_BK_R_BDATE" '+%d/%m/%Y %H:%M' 2>/dev/null || true)"; fi
+        if {
+          printf '# Cron della copia del %s: NON attivi. Controllali, poi spostali in %s<nome> (nome senza punti).
+'             "${bdate:-data sconosciuta}" "$(site_custom_cron_prefix "$d")"
+          cat -- "$c/$m"
+        } | write_file "$rev" 600 root:root; then wrote=1; else
+          log "ATTENZIONE: $rev non scritto"
+          rc=1
+        fi
+        ;;
+    esac
+  done
+  if ((wrote)); then
+    _BK_R_CUSTOM=1
+    site_reg_update "$d" '.custom_restored = true' || {
+      log "ATTENZIONE: custom_restored di $d non scritto nel registro"
+      rc=1
+    }
+  fi
+  return "$rc"
+}
+
 # _bk_restore_do SRC DOMINIO NOME MODO SLUG RADICE — i passi. Prima tutto ciò che non
 # tocca il sito (scarico, controlli, estrazione nell'area, prova del dump), poi la
 # copia di sicurezza, poi gli scambi. Un archivio rifiutato prima non lascia quindi
@@ -2353,6 +2455,7 @@ _bk_restore_do() {
     fi
   fi
   _bk_files_commit "$slug" "$root"
+  if [[ "$mode" != db ]]; then _bk_custom_recreate "$d" "$arc"; fi
   # Un WordPress ricreato da una copia il cui ripristino era fallito non ha il suo cron:
   # un ripristino riuscito di file lo mette.
   if [[ "$mode" != db && "$(site_reg_get "$d" .type)" == wordpress && ! -e "$(site_wp_cron_file "$d")" ]]; then
@@ -2372,6 +2475,7 @@ _bk_restore_do() {
 bk_restore_run() {
   local src="${1-}" d="${2-}" name="${3-}" mode="${4-}" info slug root lrc=0 ok=true label text alert fin bdate extra
   _BK_R_DOM="$d"
+  _BK_R_CUSTOM=0
   if [[ "$src" != local && "$src" != remote ]] || [[ ! "$mode" =~ ^(all|db|files)$ ]]; then
     printf '{"ok":false,"error":"argomenti non validi"}\n'
     return 1
@@ -2430,6 +2534,9 @@ bk_restore_run() {
   if [[ -n "$_BK_R_BDATE" ]]; then bdate="$(date -d "$_BK_R_BDATE" '+%d/%m %H:%M' 2>/dev/null || true)"; fi
   if [[ "$ok" == true ]]; then
     text="♻️ $(hostname): $d ripristinato al ${bdate:-data sconosciuta}: $label"
+    if [[ "$_BK_R_CUSTOM" == 1 ]]; then
+      text+=$'\n'"Regole Nginx e cron della copia ripristinati ma NON attivi: controllali in $NGINX_CUSTOM_D/, poi riattiva le regole a mano e sposta i cron in ${CRON_D}/vps-site-${slug}-..."
+    fi
   else
     text="♻️ $(hostname): ripristino di $d NON riuscito ($label): ${BK_ERR:-errore}"
     if [[ "$_BK_R_NOTE" == hard ]]; then
@@ -2443,10 +2550,10 @@ bk_restore_run() {
   _BK_LAST_RESTORE="$(jq -nc --arg d "$d" --arg m "$mode" --arg s "$src" --arg n "$name" --arg st "$_BK_STARTED" --arg f "$fin" \
     --argjson ok "$ok" --arg e "$([[ "$ok" == true ]] && echo "" || echo "${BK_ERR:-errore}")" \
     --arg sf "$([[ -n "$_BK_SAFETY" && -f "$_BK_SAFETY" ]] && basename -- "$_BK_SAFETY" || echo "")" \
-    --arg bd "$_BK_R_BDATE" --argjson al "$alert" \
+    --arg bd "$_BK_R_BDATE" --argjson al "$alert" --argjson cr "$([[ "$_BK_R_CUSTOM" == 1 ]] && echo true || echo false)" \
     '{domain: $d, mode: $m, source: $s, name: $n, started: $st, finished: $f, ok: $ok,
       error: (if $e == "" then null else $e end), safety: (if $sf == "" then null else $sf end),
-      backup_date: (if $bd == "" then null else $bd end), alert: $al}')"
+      backup_date: (if $bd == "" then null else $bd end), alert: $al, custom_restored: $cr}')"
   _bk_state_set "$(jq -nc --argjson r "$_BK_LAST_RESTORE" '{job: null, last_restore: $r}')" || log "vps-backup: state.json non scritto"
   log "vps-backup: ripristino di $d finito (ok=$ok)"
   jq -nc --argjson ok "$ok" '{ok: true, finished: true, restore_ok: $ok}'

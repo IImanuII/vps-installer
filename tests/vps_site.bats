@@ -945,3 +945,90 @@ sito_php() {
   vs list
   [ "$(jq -r '.sites[0].custom_files.cron_review' <<<"$output")" = "$d/blog.miosito.it.cron-da-rivedere" ]
 }
+
+# --- ricreazione da copia con regole a mano e cron ----------------------------------
+
+# fb_real_restore — il ripristino vero (tools/vps-backup) al posto dello stub: serve a
+# vedere che cosa la ricreazione lascia sul disco. Database e Drive non servono (copie
+# senza database, sorgente locale).
+fb_real_restore() {
+  # shellcheck disable=SC2016
+  make_stub vps-backup-real 'exec env VPS_NO_CHOWN=1 SYSTEMD_DIR="$BATS_TEST_TMPDIR/systemd" BK_DIR="$BATS_TEST_TMPDIR/bkcfg" bash "$REPO_ROOT/tools/vps-backup" "$@"'
+  export VPS_BACKUP_SELF="$BATS_TEST_TMPDIR/bin/vps-backup-real"
+  mkdir -p "$BATS_TEST_TMPDIR/systemd" "$BATS_TEST_TMPDIR/bkcfg"
+}
+
+@test "_run create da archivio PHP con regole e cron: sito standard, file messi da parte" {
+  fb_real_restore
+  FB_CUSTOM=1 fb_archive blog.miosito.it php no no
+  vs create blog.miosito.it --from-backup "$FB_ARC"
+  [ "$status" -eq 0 ]
+  run bash "$T" _run create blog.miosito.it
+  [ "$status" -eq 0 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  # vhost standard: niente include delle regole a mano, la cornice dei registri c'è
+  run grep -c vps-custom "$NGINX_CONF_D/blog.miosito.it.conf"
+  [ "$output" = 0 ]
+  grep -q access_log "$NGINX_CONF_D/blog.miosito.it.conf"
+  # i file dell'archivio, così come erano
+  [ "$(cat "$NGINX_CUSTOM_D/blog.miosito.it.conf")" = '# regola a mano della copia' ]
+  [ "$(cat "$NGINX_CUSTOM_D/blog.miosito.it.http.conf")" = '# regola http della copia' ]
+  [ "$(stat -c %a "$NGINX_CUSTOM_D/blog.miosito.it.conf")" = 644 ]
+  local rev="$NGINX_CUSTOM_D/blog.miosito.it.cron-da-rivedere"
+  [ "$(stat -c %a "$rev")" = 600 ]
+  head -n1 "$rev" | grep -q '^# Cron della copia del .*: NON attivi\. Controllali, poi spostali in .*/vps-site-site_blog_miosito_it-<nome>'
+  grep -qxF '*/5 * * * * root /bin/true # cron della copia' "$rev"
+  # mai un cron attivo, mai le regole accese da sole
+  [ -z "$(find "$CRON_D" -name 'vps-site-*-*')" ]
+  [ "$(site_reg_get blog.miosito.it .custom_rules)" = false ]
+  [ "$(site_reg_get blog.miosito.it .custom_restored)" = true ]
+  jq -e '.last_restore.ok == true and .last_restore.custom_restored == true' "$BATS_TEST_TMPDIR/bkcfg/state.json"
+  # accenderle è una scelta di chi gestisce il sito, e usa quei file
+  vs rules blog.miosito.it on
+  [ "$status" -eq 0 ]
+  grep -q "include $NGINX_CUSTOM_D/blog.miosito.it.conf;" "$NGINX_CONF_D/blog.miosito.it.conf"
+  [ "$(cat "$NGINX_CUSTOM_D/blog.miosito.it.conf")" = '# regola a mano della copia' ]
+}
+
+@test "_run create da archivio vecchio senza membri custom: niente in vps-custom, niente custom_restored" {
+  fb_real_restore
+  fb_archive blog.miosito.it php no no
+  vs create blog.miosito.it --from-backup "$FB_ARC"
+  run bash "$T" _run create blog.miosito.it
+  [ "$status" -eq 0 ]
+  [ "$(site_reg_get blog.miosito.it .state)" = active ]
+  [ -z "$(ls -A "$NGINX_CUSTOM_D" 2>/dev/null)" ]
+  [ "$(site_reg_get blog.miosito.it .custom_restored)" = null ]
+  [ "$(site_reg_get blog.miosito.it .custom_rules)" = false ]
+}
+
+@test "_run create da archivio: file delle regole già presenti non sovrascritti" {
+  fb_real_restore
+  FB_CUSTOM=1 fb_archive blog.miosito.it php no no
+  vs create blog.miosito.it --from-backup "$FB_ARC"
+  mkdir -p "$NGINX_CUSTOM_D"
+  echo '# del gestore' >"$NGINX_CUSTOM_D/blog.miosito.it.conf"
+  ln -s /non/esiste "$NGINX_CUSTOM_D/blog.miosito.it.http.conf"
+  run bash "$T" _run create blog.miosito.it
+  [ "$status" -eq 0 ]
+  [ "$(cat "$NGINX_CUSTOM_D/blog.miosito.it.conf")" = '# del gestore' ]
+  [ "$(readlink "$NGINX_CUSTOM_D/blog.miosito.it.http.conf")" = /non/esiste ]
+  # il cron da rivedere invece c'è: qualcosa è stato messo da parte
+  grep -qF '# cron della copia' "$NGINX_CUSTOM_D/blog.miosito.it.cron-da-rivedere"
+  [ "$(site_reg_get blog.miosito.it .custom_restored)" = true ]
+}
+
+@test "_run create da archivio statico con cron: solo .cron-da-rivedere" {
+  fb_real_restore
+  # un sito statico non ha regole a mano; il cron però può esserci (lo mette fb_archive)
+  FB_CUSTOM=1 fb_archive fisso.miosito.it static no no
+  vs create fisso.miosito.it --from-backup "$FB_ARC"
+  run bash "$T" _run create fisso.miosito.it
+  [ "$status" -eq 0 ]
+  [ ! -e "$NGINX_CUSTOM_D/fisso.miosito.it.conf" ]
+  [ ! -e "$NGINX_CUSTOM_D/fisso.miosito.it.http.conf" ]
+  grep -qF '# cron della copia' "$NGINX_CUSTOM_D/fisso.miosito.it.cron-da-rivedere"
+  [ -z "$(find "$CRON_D" -name 'vps-site-*-*')" ]
+  [ "$(site_reg_get fisso.miosito.it .custom_restored)" = true ]
+  [ "$(site_reg_get fisso.miosito.it .custom_rules)" = false ]
+}

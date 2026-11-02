@@ -2226,6 +2226,38 @@ rs_run() { bk_tool _restore "$@"; }
   [ "$status" -eq 0 ]
 }
 
+@test "restore su sito esistente (tutto, file, database): regole, cron e registro intatti" {
+  rs_env
+  rs_site
+  local d=a.it slug=site_a_it m
+  # la copia con regole e cron diversi da quelli che il sito ha oggi
+  mk_custom "$d"
+  bk_archive "$d" "$BK_BACKUPS/sites/a.it-20261002-0400.tar.gz"
+  echo '# del gestore' >"$(site_custom_conf "$d")"
+  echo '# http del gestore' >"$(site_custom_http "$d")"
+  echo '0 3 * * * root /bin/true # solo mio' >"$CRON_D/vps-site-$slug-mio"
+  rm -f "$CRON_D/vps-site-$slug-altro"
+  # il sito ha anche from_backup nel registro, come uno ricreato da una copia
+  site_reg_update "$d" '.from_backup = {source: "local", name: "x"} | .custom_restored = false | .custom_rules = true'
+  local before="$BATS_TEST_TMPDIR/before" after="$BATS_TEST_TMPDIR/after"
+  snap() {
+    {
+      ls -A "$NGINX_CUSTOM_D" "$CRON_D"
+      sha256sum "$NGINX_CUSTOM_D"/* "$CRON_D"/*
+      jq -c '[.custom_rules, .custom_restored, .from_backup, .state]' "$(site_reg_path "$d")"
+    } >"$1"
+  }
+  snap "$before"
+  for m in all files db; do
+    rs_run local "$d" sites/a.it-20261002-0400.tar.gz "$m"
+    [ "$status" -eq 0 ] || { echo "modo $m: $output"; false; }
+    snap "$after"
+    cmp "$before" "$after" || { echo "modo $m"; diff "$before" "$after"; false; }
+    [ ! -e "$(site_custom_review "$d")" ]
+    jq -e '.last_restore.ok == true and .last_restore.custom_restored == false' "$BK_STATE" || { echo "modo $m"; cat "$BK_STATE"; false; }
+  done
+}
+
 @test "_restore: sito sconosciuto o non attivo, modo sbagliato, nome non valido = rifiutati" {
   rs_env
   rs_site
@@ -4196,6 +4228,66 @@ mk_custom() {
   run tar -tzf "$BATS_TEST_TMPDIR/out.tar.gz"
   [[ "$output" != *custom.conf* ]]
   [[ "$output" == *custom.http.conf* ]]
+}
+
+@test "bk_archive: cron senza a capo finale, l'intestazione del successivo resta su una riga sua" {
+  mk_site blog.miosito.it no
+  mk_custom blog.miosito.it
+  local slug=site_blog_miosito_it
+  printf '* * * * * root /bin/true # senza-a-capo' >"$CRON_D/vps-site-$slug-altro"
+  run bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz"
+  [ "$status" -eq 0 ]
+  local w="$BATS_TEST_TMPDIR/x"
+  mkdir -p "$w"
+  tar -xzf "$BATS_TEST_TMPDIR/out.tar.gz" -C "$w"
+  grep -qxF '* * * * * root /bin/true # senza-a-capo' "$w/custom.cron"
+  grep -qxF "# --- $CRON_D/vps-site-$slug-cron ---" "$w/custom.cron"
+  # niente righe a capo in più dove l'a capo c'era già
+  [ "$(grep -c '^$' "$w/custom.cron" || true)" = 0 ]
+  run bk_verify "$BATS_TEST_TMPDIR/out.tar.gz"
+  [ "$status" -eq 0 ]
+}
+
+@test "bk_archive: tetto cumulativo dei cron, due file sotto 1 MiB ma insieme oltre: il secondo saltato, la copia riesce" {
+  mk_site blog.miosito.it no
+  mk_custom blog.miosito.it
+  local slug=site_blog_miosito_it
+  head -c 600000 /dev/zero | tr '\0' a >"$CRON_D/vps-site-$slug-cron"
+  head -c 600000 /dev/zero | tr '\0' b >"$CRON_D/vps-site-$slug-altro"
+  run bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz"
+  [ "$status" -eq 0 ]
+  local w="$BATS_TEST_TMPDIR/x"
+  mkdir -p "$w"
+  tar -xzf "$BATS_TEST_TMPDIR/out.tar.gz" -C "$w"
+  [ "$(stat -c %s "$w/custom.cron")" -le "$BK_CUSTOM_MAX" ]
+  grep -q 'oltre il tetto' "$VPS_LOG"
+  run bk_verify "$BATS_TEST_TMPDIR/out.tar.gz"
+  [ "$status" -eq 0 ]
+}
+
+@test "bk_archive: tetto dei cron esatto con l'a capo aggiunto: un file che ci sta in pieno entra, uno di un byte in più no" {
+  mk_site blog.miosito.it no
+  mk_custom blog.miosito.it
+  local slug=site_blog_miosito_it f hb
+  rm -f "$CRON_D/vps-site-$slug-altro"
+  f="$CRON_D/vps-site-$slug-cron"
+  # intestazione "# --- <percorso> ---" + a capo, poi il contenuto, poi l'a capo aggiunto
+  hb=$((${#f} + 11))
+  head -c $((BK_CUSTOM_MAX - hb - 1)) /dev/zero | tr '\0' a >"$f"
+  run bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out.tar.gz"
+  [ "$status" -eq 0 ]
+  local w="$BATS_TEST_TMPDIR/x"
+  mkdir -p "$w"
+  tar -xzf "$BATS_TEST_TMPDIR/out.tar.gz" -C "$w"
+  [ "$(stat -c %s "$w/custom.cron")" = "$BK_CUSTOM_MAX" ]
+  run bk_verify "$BATS_TEST_TMPDIR/out.tar.gz"
+  [ "$status" -eq 0 ]
+  # un byte in più: il file si salta, non c'è custom.cron
+  head -c $((BK_CUSTOM_MAX - hb)) /dev/zero | tr '\0' a >"$f"
+  run bk_archive blog.miosito.it "$BATS_TEST_TMPDIR/out2.tar.gz"
+  [ "$status" -eq 0 ]
+  run tar -tzf "$BATS_TEST_TMPDIR/out2.tar.gz"
+  [[ "$output" != *custom.cron* ]]
 }
 
 @test "bk_verify: membri custom accettati; senza sha, sha diverso, nome estraneo (custom.evil), doppione o oltre 1 MiB rifiutati" {
