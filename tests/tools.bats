@@ -519,3 +519,27 @@ _sdrun_stub() {
   run bash -c "printf 'Password-lunga-1' | SUDO_USER=panel bash '$T/vps-pma-pass' dbadmin; true"
   [ ! -e "$BATS_TEST_TMPDIR/sdrun.calls" ]
 }
+
+@test "vps-cf-ips-update: file a mano rotto, messaggio con il file, niente reload, ips_updated_at com'era" {
+  export NGINX_SNIPPETS="$BATS_TEST_TMPDIR/snippets"
+  make_stub curl 'case "$*" in *ips-v6*) printf "2400:cb00::/32\n2606:4700::/32\n2803:f800::/32\n2405:b500::/32\n2405:8100::/32\n2a06:98c0::/29\n2c0f:f248::/32\n" ;; *) printf "173.245.48.0/20\n103.21.244.0/22\n103.22.200.0/22\n103.31.4.0/22\n141.101.64.0/18\n108.162.192.0/18\n190.93.240.0/20\n188.114.96.0/20\n" ;; esac'
+  make_stub systemctl 'echo "systemctl $*" >>"$BATS_TEST_TMPDIR/sc.log"; exit 0'
+  make_stub nginx 'echo "2026/11/02 12:39:01 [emerg] 4806#4806: unknown directive \"foo\" in /etc/nginx/vps-custom/a.miosito.it.conf:3" >&2; echo "nginx: configuration file /etc/nginx/nginx.conf test failed" >&2; exit 1'
+  run --separate-stderr bash "$T/vps-cf-ips-update" </dev/null
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .ok <<<"$output")" = false ]
+  [[ "$(jq -r .error <<<"$output")" == *'[emerg] unknown directive "foo" in /etc/nginx/vps-custom/a.miosito.it.conf:3'* ]]
+  [[ "$(jq -r .error <<<"$output")" != *"errore interno"* ]]
+  # snippet aggiornato, nessun reload, ora dell'ultimo aggiornamento intatta
+  grep -q 'set_real_ip_from 173.245.48.0/20;' "$NGINX_SNIPPETS/cloudflare-realip.conf"
+  run ! grep -q 'reload' "$BATS_TEST_TMPDIR/sc.log"
+  [ "$(jq -r '.cloudflare.ips_updated_at // "nessuna"' "$VPS_OPT/manifest.json")" = nessuna ]
+  grep -q 'Nginx non ricaricato dopo l.aggiornamento degli IP Cloudflare: \[emerg\] unknown directive' "$VPS_LOG"
+
+  # configurazione sana: reload e ora scritta
+  make_stub nginx 'echo "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok" >&2'
+  run --separate-stderr bash "$T/vps-cf-ips-update" </dev/null
+  [ "$status" -eq 0 ]
+  grep -q 'reload nginx' "$BATS_TEST_TMPDIR/sc.log"
+  [ "$(jq -r '.cloudflare.ips_updated_at' "$VPS_OPT/manifest.json")" != null ]
+}

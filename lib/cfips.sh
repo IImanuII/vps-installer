@@ -50,8 +50,20 @@ cf_apply_ips() {
       ufw --force delete "$n" >/dev/null
     done
   fi
+}
+
+# cf_reload_nginx — prova la configurazione e ricarica Nginx (se c'è ed è attivo). Sta a
+# parte da cf_apply_ips perché un file a mano rotto (le regole dei siti in vps-custom)
+# non deve far morire lo script con "errore interno": con nginx_check la riga nomina il
+# file colpevole. Se la prova fallisce non ricarica (Nginx tiene la configurazione di
+# prima) e il chiamante lascia com'è l'ora dell'ultimo aggiornamento. Rc 1 e CF_RELOAD_ERR.
+cf_reload_nginx() {
+  CF_RELOAD_ERR=""
   if command -v nginx >/dev/null 2>&1 && systemctl is-active --quiet nginx; then
-    nginx -t >>"$VPS_LOG" 2>&1
+    if ! CF_RELOAD_ERR="$(nginx_check)"; then
+      log "ATTENZIONE: Nginx non ricaricato dopo l'aggiornamento degli IP Cloudflare: $CF_RELOAD_ERR"
+      return 1
+    fi
     systemctl reload nginx
   fi
 }

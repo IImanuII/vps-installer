@@ -35,6 +35,10 @@ if [[ "$(jq -r '.cloudflare.origin_locked' "$m")" == true ]]; then
   lock=yes
 fi
 cf_apply_ips "$lock"
+# Snippet e regole già aggiornati; se Nginx rifiuta la configurazione (un file a mano
+# rotto) non si ricarica, l'ora dell'aggiornamento resta quella di prima e l'errore
+# nomina il file.
+cf_reload_nginx || json_err "IP Cloudflare aggiornati, ma Nginx non è stato ricaricato: $CF_RELOAD_ERR"
 now="$(date -Iseconds)"
 manifest_set '.cloudflare.ips_updated_at = $t' --arg t "$now"
 json_ok --arg t "$now" '{ok: true, updated_at: $t}'
