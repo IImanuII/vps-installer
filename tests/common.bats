@@ -124,3 +124,27 @@ echo "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok" >&2'
   [ "${#output}" -eq 300 ]
   [[ "$output" == "[alert] x?y "* ]]
 }
+
+@test "nginx_check quiet: da sano non scrive nel registro, da rotto sì; senza argomento scrive sempre" {
+  make_stub nginx 'if [ -n "$NGINX_FAIL" ]; then
+  echo "nginx: [emerg] unknown directive \"foo\" in /etc/nginx/vps-custom/a.miosito.it.conf:3" >&2
+  echo "nginx: configuration file /etc/nginx/nginx.conf test failed" >&2
+  exit 1
+fi
+echo "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok" >&2'
+  : >"$VPS_LOG"
+  run nginx_check quiet
+  [ "$status" -eq 0 ]
+  [ ! -s "$VPS_LOG" ]
+
+  run nginx_check
+  [ "$status" -eq 0 ]
+  grep -q 'syntax is ok' "$VPS_LOG"
+
+  : >"$VPS_LOG"
+  export NGINX_FAIL=1
+  run nginx_check quiet
+  [ "$status" -eq 1 ]
+  [ "$output" = '[emerg] unknown directive "foo" in /etc/nginx/vps-custom/a.miosito.it.conf:3' ]
+  grep -q 'test failed' "$VPS_LOG"
+}

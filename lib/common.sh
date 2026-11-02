@@ -25,10 +25,15 @@ log() {
 # [emerg], [alert] o [crit] (nomina file e riga colpevoli), senza il prefisso
 # "nginx: ", non stampabili → ?, al massimo 300 caratteri. Lo stato di nginx -t
 # si legge dentro un `if`, così regge i chiamanti con set -e.
+# Con l'argomento `quiet` una configurazione valida non scrive nulla nel registro
+# (per i controlli ripetuti, come il giro al minuto di vps-monitor: 2 righe a
+# giro sommergerebbero le righe utili); se non è valida registra tutto come sempre.
 nginx_check() {
   local out line
   if out="$(nginx -t 2>&1)"; then
-    printf '%s\n' "$out" >>"$VPS_LOG" 2>/dev/null || true
+    if [[ "${1:-}" != quiet ]]; then
+      printf '%s\n' "$out" >>"$VPS_LOG" 2>/dev/null || true
+    fi
     return 0
   fi
   printf '%s\n' "$out" >>"$VPS_LOG" 2>/dev/null || true

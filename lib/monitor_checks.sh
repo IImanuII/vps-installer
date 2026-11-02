@@ -302,7 +302,8 @@ mon_check_services() {
 mon_check_nginx() {
   local err lvl=ok
   command -v nginx >/dev/null 2>&1 || return 0
-  err="$(nginx_check)" || lvl=down
+  # quiet: un giro al minuto, da sano l'uscita di nginx -t non va nel registro.
+  err="$(nginx_check quiet)" || lvl=down
   _mon_level nginx_conf "$lvl" '{"kind":"nginx_conf","label":"configurazione Nginx"}'
   case "$MON_EV" in
     new | remind)
