@@ -1479,6 +1479,9 @@ exec /usr/bin/mv "$@"'
 
 @test "_run: known sopravvive ai giri e un sito eliminato esce da known dopo la pulizia" {
   bk_run_env
+  # La pulizia confronta le date delle copie con l'orologio vero: con la data fissa di bk_run_env
+  # la copia sarebbe vecchia dopo BK_PURGE_DAYS e il test fallirebbe da solo col passare dei giorni.
+  export BK_NOW="$(date +%Y%m%d)-0400"
   mk_site a.it no
   mk_site b.it no
   bk_tool _run
