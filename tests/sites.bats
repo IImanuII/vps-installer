@@ -740,7 +740,7 @@ nuovo() { # DOMINIO TIPO WWW DB [PASSWORD]
 # Stub di nginx che fallisce con la riga data (STUB_NGINX_LINE) quando c'è STUB_RC_nginx.
 nginx_riga_stub() {
   # shellcheck disable=SC2016
-  make_stub nginx 'echo "nginx $*" >>"$CALLS"; if [ "${STUB_RC_nginx:-0}" != 0 ]; then echo "nginx: $STUB_NGINX_LINE" >&2; echo "nginx: configuration file /etc/nginx/nginx.conf test failed" >&2; exit 1; fi'
+  make_stub nginx 'echo "nginx $*" >>"$CALLS"; if [ "${STUB_RC_nginx:-0}" != 0 ]; then echo "2026/11/02 12:39:01 $(echo "$STUB_NGINX_LINE" | sed -E "s/^(\[[a-z]+\]) /\1 4806#4806: /")" >&2; echo "nginx: configuration file /etc/nginx/nginx.conf test failed" >&2; exit 1; fi'
 }
 
 @test "site_vhost_add: errore in un altro file nominato, vhost di prima" {

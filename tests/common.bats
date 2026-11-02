@@ -95,7 +95,7 @@ setup() {
 
 @test "nginx_check: riga d'errore pulita, uscita completa nel registro" {
   make_stub nginx 'if [ -n "$NGINX_FAIL" ]; then
-  echo "nginx: [emerg] unknown directive \"foo\" in /etc/nginx/vps-custom/a.miosito.it.conf:3" >&2
+  echo "2026/11/02 12:39:01 [emerg] 4806#4806: unknown directive \"foo\" in /etc/nginx/vps-custom/a.miosito.it.conf:3" >&2
   echo "nginx: configuration file /etc/nginx/nginx.conf test failed" >&2
   exit 1
 fi
@@ -114,6 +114,12 @@ echo "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok" >&2'
   run bash -c 'set -eu; source "$REPO_ROOT/lib/common.sh"; if e="$(nginx_check)"; then echo ok; else echo "ko:$e"; fi'
   [[ "$output" == ko:* ]]
 
+  # la forma "nginx: [emerg] ..." (senza data né pid) si legge allo stesso modo
+  make_stub nginx 'echo "nginx: [emerg] unknown directive \"foo\" in /etc/nginx/vps-custom/a.miosito.it.conf:3" >&2; exit 1'
+  run nginx_check
+  [ "$status" -eq 1 ]
+  [ "$output" = '[emerg] unknown directive "foo" in /etc/nginx/vps-custom/a.miosito.it.conf:3' ]
+
   make_stub nginx 'echo "nginx: qualcosa di strano" >&2; exit 1'
   run nginx_check
   [ "$status" -eq 1 ]
@@ -127,7 +133,7 @@ echo "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok" >&2'
 
 @test "nginx_check quiet: da sano non scrive nel registro, da rotto sì; senza argomento scrive sempre" {
   make_stub nginx 'if [ -n "$NGINX_FAIL" ]; then
-  echo "nginx: [emerg] unknown directive \"foo\" in /etc/nginx/vps-custom/a.miosito.it.conf:3" >&2
+  echo "2026/11/02 12:39:01 [emerg] 4806#4806: unknown directive \"foo\" in /etc/nginx/vps-custom/a.miosito.it.conf:3" >&2
   echo "nginx: configuration file /etc/nginx/nginx.conf test failed" >&2
   exit 1
 fi

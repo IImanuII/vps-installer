@@ -468,7 +468,7 @@ tool_env() {
   # nginx vero della macchina di test (che da non-root non può aprire pid e log)
   # darebbe un falso avviso in tutti i giri.
   make_stub nginx 'if [ -n "${NGINX_FAIL:-}" ]; then
-  echo "nginx: [emerg] unknown directive \"foo\" in /etc/nginx/sites-enabled/a.miosito.it.conf:3" >&2
+  echo "2026/11/02 12:39:01 [emerg] 4806#4806: unknown directive \"foo\" in /etc/nginx/sites-enabled/a.miosito.it.conf:3" >&2
   echo "nginx: configuration file /etc/nginx/nginx.conf test failed" >&2
   exit 1
 fi

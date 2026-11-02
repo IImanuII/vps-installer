@@ -22,7 +22,7 @@ log() {
 
 # nginx_check — esegue nginx -t; tutta l'uscita va nel registro. Rc 0 se la
 # configurazione è valida. Altrimenti rc 1 e UNA riga su stdout: la prima con
-# [emerg], [alert] o [crit] (nomina file e riga colpevoli), senza il prefisso
+# [emerg], [alert] o [crit] (nomina file e riga colpevoli), senza data, pid e prefisso
 # "nginx: ", non stampabili → ?, al massimo 300 caratteri. Lo stato di nginx -t
 # si legge dentro un `if`, così regge i chiamanti con set -e.
 # Con l'argomento `quiet` una configurazione valida non scrive nulla nel registro
@@ -38,7 +38,11 @@ nginx_check() {
   fi
   printf '%s\n' "$out" >>"$VPS_LOG" 2>/dev/null || true
   line="$(printf '%s\n' "$out" | grep -m1 -E '\[(emerg|alert|crit)\]' || true)"
-  line="${line#nginx: }"
+  # La riga vera di nginx con l'error_log del file di configurazione è
+  # "2026/11/02 12:39:01 [emerg] 4806#4806: messaggio" (senza "nginx: " davanti): si
+  # tiene da "[livello]" in poi e si toglie il "pid#tid: ", che al gestore non serve.
+  if [[ "$line" =~ (\[(emerg|alert|crit)\].*) ]]; then line="${BASH_REMATCH[1]}"; fi
+  if [[ "$line" =~ ^(\[[a-z]+\])\ [0-9]+#[0-9]+:\ (.*)$ ]]; then line="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"; fi
   if [[ -z "$line" ]]; then
     printf '%s\n' "nginx -t non riuscito"
     return 1
