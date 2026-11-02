@@ -2223,11 +2223,19 @@ _bk_custom_recreate_do() {
   local d="$1" arc="$2" c="$BK_RUN_DIR/custom" m want got f rev bdate wrote=0 rc=0 type
   local -A key=([custom.conf]=custom_conf [custom.http.conf]=custom_http [custom.cron]=custom_cron)
   local -a present=()
+  local list
   mkdir -p "$c" || return 1
+  # L'elenco si legge una volta in una variabile: con `tar -t | grep -q` sotto pipefail
+  # grep esce al primo riscontro, tar muore di SIGPIPE, la pipeline vale 141 e il membro
+  # sembra assente (un custom.conf grosso si perdeva una volta su due, in silenzio).
+  list="$(tar -tzf "$arc" 2>/dev/null)" || {
+    log "ATTENZIONE: elenco della copia illeggibile, regole e cron non rimessi"
+    return 1
+  }
   # Solo i membri presenti, estratti in una cartella nostra. bk_verify li ha già
   # controllati, ma qui si rileggono: sha256 del manifest, file regolare, tetto di grandezza.
   for m in custom.conf custom.http.conf custom.cron; do
-    tar -tzf "$arc" 2>/dev/null | grep -qxF "$m" || continue
+    grep -qxF "$m" <<<"$list" || continue
     tar -xzf "$arc" -C "$c" --no-same-owner --no-same-permissions "$m" 2>/dev/null || {
       log "ATTENZIONE: $m della copia illeggibile, non rimesso"
       rc=1

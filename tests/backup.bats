@@ -4345,3 +4345,34 @@ mk_custom() {
   run bk_verify "$w/old.tar.gz"
   [ "$status" -eq 0 ]
 }
+
+# La ricreazione rilegge i membri dell'archivio. Con `tar -t | grep -q` sotto pipefail,
+# grep esce al primo riscontro, tar muore di SIGPIPE e la pipeline vale 141: il membro
+# sembrava assente e veniva perso in silenzio (a volte sì, a volte no). Qui l'archivio
+# ha custom.conf grosso e in testa, poi altri membri e un po' di riempitivo, così tar
+# ha ancora nomi da scrivere quando grep se ne è già andato; si ripete per non
+# dipendere dalla fortuna del momento.
+@test "_bk_custom_recreate_do: i membri di un archivio grosso non si perdono (SIGPIPE di tar | grep -q)" {
+  set -o pipefail
+  mk_site blog.miosito.it no
+  local d=blog.miosito.it w="$BATS_TEST_TMPDIR/arc" i
+  mkdir -p "$w/pad"
+  head -c 153600 /dev/urandom | base64 -w0 >"$w/custom.conf"
+  echo 'map $a $b { default 1; }' >"$w/custom.http.conf"
+  for i in $(seq 1 1500); do : >"$w/pad/riempitivo-$i"; done
+  jq -n --arg a "$(sha256sum "$w/custom.conf" | cut -d' ' -f1)" --arg b "$(sha256sum "$w/custom.http.conf" | cut -d' ' -f1)" \
+    '{sha256: {custom_conf: $a, custom_http: $b}}' >"$w/manifest.json"
+  tar -czf "$w/a.tar.gz" -C "$w" custom.conf custom.http.conf pad
+  BK_RUN_DIR="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$BK_RUN_DIR/x"
+  cp "$w/manifest.json" "$BK_RUN_DIR/x/manifest.json"
+  _BK_R_BDATE=""
+  site_reg_update "$d" '.state = "creating" | .from_backup = {source: "local", name: "x"}'
+  for i in $(seq 1 25); do
+    rm -rf "$BK_RUN_DIR/custom"
+    rm -f "$(site_custom_conf "$d")" "$(site_custom_http "$d")"
+    _bk_custom_recreate_do "$d" "$w/a.tar.gz"
+    cmp "$w/custom.conf" "$(site_custom_conf "$d")" || { echo "giro $i: custom.conf perso"; false; }
+    cmp "$w/custom.http.conf" "$(site_custom_http "$d")" || { echo "giro $i: custom.http.conf perso"; false; }
+  done
+}
