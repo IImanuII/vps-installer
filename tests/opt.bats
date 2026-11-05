@@ -382,11 +382,11 @@ sys_setup() {
   jq -n '{}' >"$VPS_OPT/manifest.json"
   opt_logrotate
   grep -qF '/var/log/vps-tools.log' "$LOGROTATE_D/vps"
-  ! grep -qF 'su panel' "$LOGROTATE_D/vps"
+  ! grep -qF 'su panel' "$LOGROTATE_D/vps" || false
   mkdir -p "$BATS_TEST_TMPDIR/a b/logs"
   jq -n --arg p "$BATS_TEST_TMPDIR/a b" '{panel:{path:$p}}' >"$VPS_OPT/manifest.json"
   opt_logrotate
-  ! grep -qF 'su panel' "$LOGROTATE_D/vps"
+  ! grep -qF 'su panel' "$LOGROTATE_D/vps" || false
 }
 
 @test "opt_system_files scrive anche la rotazione dei log" {

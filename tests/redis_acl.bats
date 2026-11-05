@@ -63,7 +63,7 @@ n=$(grep -c "systemctl restart" "$BATS_TEST_TMPDIR/calls"); [ "$n" -ge 2 ]'
 [ "$1" != is-active ]'
   redis_acl_setup
   grep -q 'systemctl restart redis-server' "$BATS_TEST_TMPDIR/calls"
-  ! grep -q 'redis-cli' "$BATS_TEST_TMPDIR/calls"
+  ! grep -q 'redis-cli' "$BATS_TEST_TMPDIR/calls" || false
 }
 
 @test "ACL LOAD che fallisce: file ACL di prima ripristinato, ritorno 1" {
@@ -107,7 +107,7 @@ n=$(grep -c "systemctl restart" "$BATS_TEST_TMPDIR/calls"); [ "$n" -ge 2 ]'
   printf 'port 6379\nmaxmemory 1gb\n' >"$REDIS_CONF"
   redis_acl_setup
   grep -qx 'maxmemory 1gb' "$REDIS_CONF"
-  ! grep -q '256mb\|maxmemory-policy' "$REDIS_CONF"
+  ! grep -q '256mb\|maxmemory-policy' "$REDIS_CONF" || false
 }
 
 @test "riavvio fallito: il ripristino toglie anche maxmemory" {
@@ -116,7 +116,7 @@ n=$(grep -c "systemctl restart" "$BATS_TEST_TMPDIR/calls"); [ "$n" -ge 2 ]'
 n=$(grep -c "systemctl restart" "$BATS_TEST_TMPDIR/calls"); [ "$n" -ge 2 ]'
   run redis_acl_setup
   [ "$status" -eq 1 ]
-  ! grep -q maxmemory "$REDIS_CONF"
+  ! grep -q maxmemory "$REDIS_CONF" || false
 }
 
 @test "lucchetto dei lavori occupato: niente toccato, ritorno 1 con un messaggio" {
@@ -154,7 +154,7 @@ n=$(grep -c "systemctl restart" "$BATS_TEST_TMPDIR/calls"); [ "$n" -ge 2 ]'
     cmp "$REDIS_ACL_FILE" "$BATS_TEST_TMPDIR/acl.prima"
     [ -z "$(ls -A "$TMPDIR")" ]
   done
-  ! grep -q 'systemctl restart\|redis-cli' "$BATS_TEST_TMPDIR/calls"
+  ! grep -q 'systemctl restart\|redis-cli' "$BATS_TEST_TMPDIR/calls" || false
 }
 
 @test "file ACL: il temporaneo nasce nella cartella sopra, di root" {

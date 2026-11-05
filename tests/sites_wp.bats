@@ -640,7 +640,7 @@ exec "$BATS_TEST_TMPDIR/bin/wp.orig" "$@"'
   : >"$CALLS"
   run ! site_placeholder_intact blog.miosito.it
   grep -q -- '-print -quit' "$CALLS"
-  ! grep -q '^runuser' "$CALLS"
+  ! grep -q '^runuser' "$CALLS" || false
 }
 
 @test "utente Redis: il file temporaneo nasce fuori dalla cartella di Redis" {

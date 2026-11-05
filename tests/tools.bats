@@ -248,7 +248,7 @@ esac'
   grep -qF '/zones/zid1/purge_cache' "$BATS_TEST_TMPDIR/curl.args"
   grep -qF '{"purge_everything":true}' "$BATS_TEST_TMPDIR/curl.args"
   run ! grep -qF "$CF_TOK" "$BATS_TEST_TMPDIR/curl.args"
-  ! grep -qF "$CF_TOK" "$VPS_LOG"
+  ! grep -qF "$CF_TOK" "$VPS_LOG" || false
 }
 
 @test "vps-cf-purge con indirizzi da stdin, righe vuote ignorate" {
@@ -274,7 +274,7 @@ esac'
   [ "$(jq -r .error <<<"$output")" = "zona non valida" ]
   run bash "$T/vps-cf-purge" miosito.it --boh </dev/null
   [[ "$(jq -r .error <<<"$output")" == uso:* ]]
-  ! grep -qF purge_cache "$BATS_TEST_TMPDIR/curl.args"
+  ! grep -qF purge_cache "$BATS_TEST_TMPDIR/curl.args" || false
 }
 
 @test "vps-cf-purge: rifiuto di Cloudflare riportato, senza Cloudflare attivo errore" {
@@ -293,7 +293,7 @@ esac'
   run bash -c "{ echo https://miosito.it/a; head -c 40010 /dev/zero | tr '\0' x; } | bash '$T/vps-cf-purge' miosito.it 2>/dev/null"
   [ "$status" -eq 1 ]
   [ "$(jq -r .error <<<"$output")" = "troppi indirizzi: il limite è 30" ]
-  ! grep -qF purge_cache "$BATS_TEST_TMPDIR/curl.args"
+  ! grep -qF purge_cache "$BATS_TEST_TMPDIR/curl.args" || false
 }
 
 @test "vps-cf-purge: rete assente e zona assente hanno errori diversi" {
@@ -328,7 +328,7 @@ esac'
   [ "$(jq -r .error <<<"$output")" = "nessun host" ]
   run bash -c "for i in \$(seq 31); do echo s\$i.miosito.it; done | bash '$T/vps-cf-purge' miosito.it --host"
   [ "$(jq -r .error <<<"$output")" = "troppi host: il limite è 30" ]
-  ! grep -qF purge_cache "$BATS_TEST_TMPDIR/curl.args"
+  ! grep -qF purge_cache "$BATS_TEST_TMPDIR/curl.args" || false
 }
 
 @test "vps-cf-purge --host: rifiuto di Cloudflare riportato senza ricadere su purge_everything" {
@@ -385,7 +385,7 @@ _cf_sito() {
   [ "$status" -eq 0 ]
   [ "$(jq -r .zones <<<"$output")" = 3 ]
   run ! grep -qF "$tok" "$BATS_TEST_TMPDIR/curl.args"
-  ! grep -qF "$tok" "$VPS_LOG"
+  ! grep -qF "$tok" "$VPS_LOG" || false
 }
 
 @test "vps-cf-token test segnala le zone dei siti non più visibili" {
@@ -462,7 +462,7 @@ exit 0'
   export SSHT_DENY_TOKEN="$tok" SSHT_DENY=cfd_tunnel/tun1
   run bash -c "printf '%s' '$tok' | bash '$T/vps-cf-token' set"
   [ "$status" -eq 0 ]
-  ! grep -q cfd_tunnel "$BATS_TEST_TMPDIR/curl.urls"
+  ! grep -q cfd_tunnel "$BATS_TEST_TMPDIR/curl.urls" || false
 }
 
 # --- rilancio in un'unità systemd (ProtectSystem=full di PHP-FPM) ------------------

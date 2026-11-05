@@ -160,5 +160,5 @@ exit 1'
   rm -f "$BATS_TEST_TMPDIR/menu"
   MISSING=tunnel run wizard_cloudflare
   [ "$status" -eq 1 ]
-  ! grep -q "Zero Trust non è ancora attivo" "$BATS_TEST_TMPDIR/menu"
+  ! grep -q "Zero Trust non è ancora attivo" "$BATS_TEST_TMPDIR/menu" || false
 }

@@ -62,7 +62,7 @@ exit 0'
   [ "$(cat "$SSHD_CONFIG_D/20-vps-cfaccess.conf")" = VECCHIO ]
   [ ! -e "$SSH_CF_CA" ]
   [ ! -e "$SSH_CF_PRINCIPALS/manu" ]
-  ! grep -q "reload" "$CALLS"
+  ! grep -q "reload" "$CALLS" || false
 }
 
 @test "st_sshd_remove toglie i file e ricarica" {
@@ -123,7 +123,7 @@ exit 0'
   [ "$(cat "$SSH_CF_PRINCIPALS/manu")" = vecchio ]
   [ ! -e "$SSHD_CONFIG_D/20-vps-cfaccess.conf" ]
   [ -z "$(ls -A "$BATS_TEST_TMPDIR/tmp")" ]
-  ! grep -q reload "$CALLS"
+  ! grep -q reload "$CALLS" || false
 }
 
 # ---------------------------------------------------------------------------
@@ -269,8 +269,8 @@ in_order() {
   grep -q 'tun1.cfargotunnel.com' "$CALLS"
   # Nessun token in stato, log, argomenti di processo o output.
   for f in "$SSHTUNNEL_STATE" "$VPS_LOG" "$CALLS"; do
-    ! grep -q TUNNELTOKEN "$f"
-    ! grep -q SYSTOKEN "$f"
+    ! grep -q TUNNELTOKEN "$f" || false
+    ! grep -q SYSTOKEN "$f" || false
   done
   [[ "$output" != *TUNNELTOKEN* && "$output" != *SYSTOKEN* ]]
 }
@@ -293,7 +293,7 @@ in_order() {
   cf_env
   CF_OTP=1 run st_enable ssh-k3f9x2 manu@x.it true
   [ "$status" -eq 0 ]
-  ! grep -q "POST /accounts/acc1/access/identity_providers" "$CFLOG"
+  ! grep -q "POST /accounts/acc1/access/identity_providers" "$CFLOG" || false
 }
 
 @test "st_enable: CA rifiutata → annulla tutto, niente DNS né sshd né stato" {
@@ -303,7 +303,7 @@ in_order() {
   [ "$rc" -eq 1 ]
   [ -n "$ST_ERR" ]
   [[ "$ST_ERR" != *TOKEN* ]]
-  ! grep -q "POST /zones/zone123/dns_records" "$CFLOG"
+  ! grep -q "POST /zones/zone123/dns_records" "$CFLOG" || false
   grep -qx "DELETE /accounts/acc1/access/apps/app1" "$CFLOG"
   grep -qx "DELETE /accounts/acc1/access/policies/pol1" "$CFLOG"
   grep -qx "DELETE /accounts/acc1/cfd_tunnel/tun1" "$CFLOG"
@@ -333,15 +333,15 @@ in_order() {
   st_enable ssh-k3f9x2 manu@x.it true
   : >"$CFLOG"
   run st_enable ssh-altro1 manu@x.it; [ "$status" -eq 1 ]
-  ! grep -q "^POST" "$CFLOG"
+  ! grep -q "^POST" "$CFLOG" || false
   rm -f "${SSHTUNNEL_STATE:?}"
   : >"$PASSWD_FAKE"
   CF_DNS_EXISTS=1 run st_enable ssh-altro1 manu@x.it; [ "$status" -eq 1 ]
-  ! grep -q "^POST" "$CFLOG"
+  ! grep -q "^POST" "$CFLOG" || false
   run st_enable ssh-altro1 "non-una-email"; [ "$status" -eq 1 ]
   run st_enable "Bad_Label" manu@x.it; [ "$status" -eq 1 ]
   CF_DENY="GET:/accounts/acc1/cfd_tunnel/*" run st_enable ssh-altro1 manu@x.it; [ "$status" -eq 1 ]
-  ! grep -q "^POST" "$CFLOG"
+  ! grep -q "^POST" "$CFLOG" || false
 }
 
 @test "st_enable: Cloudflare spento nel manifest → errore senza chiamate" {
@@ -375,7 +375,7 @@ in_order() {
   cf_enabled
   CF_FAIL="POST:/zones/zone123/dns_records" run st_set_host ssh-nuovo1
   [ "$status" -eq 1 ]
-  ! grep -q "DELETE /zones/zone123/dns_records/dns1" "$CFLOG"
+  ! grep -q "DELETE /zones/zone123/dns_records/dns1" "$CFLOG" || false
   [ "$(grep -c "PUT /accounts/acc1/access/apps/app1" "$CFLOG")" -eq 2 ]
   last_app="$(grep -- '"type":"ssh"' "$CALLS" | tail -1)"
   [[ "$last_app" == *'"domain":"ssh-k3f9x2.example.it"'* ]]
@@ -389,8 +389,8 @@ in_order() {
   CF_DNS_ORPHAN=1 CF_FAIL="POST:/zones/zone123/dns_records" run st_set_host ssh-nuovo1
   [ "$status" -eq 1 ]
   grep -qx "DELETE /zones/zone123/dns_records/orphan9" "$CFLOG"
-  ! grep -q "DELETE /zones/zone123/dns_records/altrui" "$CFLOG"
-  ! grep -q "DELETE /zones/zone123/dns_records/dns1" "$CFLOG"
+  ! grep -q "DELETE /zones/zone123/dns_records/altrui" "$CFLOG" || false
+  ! grep -q "DELETE /zones/zone123/dns_records/dns1" "$CFLOG" || false
 }
 
 @test "st_disable con l'app già cancellata (404) completa" {
@@ -410,7 +410,7 @@ in_order() {
   CF_FAIL="DELETE:/accounts/acc1/access/apps/app1" run st_disable
   [ "$status" -eq 1 ]
   [ -f "$SSHTUNNEL_STATE" ]
-  ! grep -q "DELETE /accounts/acc1/cfd_tunnel/tun1" "$CFLOG"
+  ! grep -q "DELETE /accounts/acc1/cfd_tunnel/tun1" "$CFLOG" || false
 }
 
 @test "unità vps-cloudflared: token nell'ambiente, non negli argomenti" {
@@ -422,14 +422,14 @@ in_order() {
   grep -qx 'Restart=on-failure' "$u"
   grep -qx 'After=network-online.target' "$u"
   grep -qx 'Wants=network-online.target' "$u"
-  ! grep -q -- '--token' "$u"
+  ! grep -q -- '--token' "$u" || false
 }
 
 @test "st_cloudflared_install: già presente → niente apt" {
   cf_env
   run st_cloudflared_install
   [ "$status" -eq 0 ]
-  ! grep -q apt-get "$CALLS"
+  ! grep -q apt-get "$CALLS" || false
 }
 
 @test "st_cloudflared_install: repository Cloudflare con chiave verificata" {
@@ -551,7 +551,7 @@ in_order() {
   CF_OTP=1 CF_DNS_ORPHAN=1 CF_FAIL="POST:/zones/zone123/dns_records" run st_enable ssh-k3f9x2 manu@x.it true
   [ "$status" -eq 1 ]
   grep -qx "DELETE /zones/zone123/dns_records/orphan9" "$CFLOG"
-  ! grep -q "DELETE /zones/zone123/dns_records/altrui" "$CFLOG"
+  ! grep -q "DELETE /zones/zone123/dns_records/altrui" "$CFLOG" || false
   in_order "$CFLOG" "DELETE /zones/zone123/dns_records/orphan9" "DELETE /accounts/acc1/access/apps/app1"
 }
 
@@ -589,7 +589,7 @@ in_order() {
   cf_env
   CF_DENY="GET:/accounts/acc1/access/organizations" run st_enable ssh-altro1 manu@x.it true
   [ "$status" -eq 1 ]
-  ! grep -q "^POST" "$CFLOG"
+  ! grep -q "^POST" "$CFLOG" || false
 }
 
 @test "st_status_json: policy mancante (404) → drift app, senza duplicati" {
@@ -692,7 +692,7 @@ cli_env() {
   [ "$status" -eq 1 ]
   jq -e '.ok == false and (.error | length > 0)' <<<"$output"
   [ ! -s "$CFLOG" ]
-  ! grep -q '^curl' "$CALLS"
+  ! grep -q '^curl' "$CALLS" || false
 }
 
 @test "vps-ssh-tunnel enable: JSON non valido → errore" {
@@ -756,8 +756,8 @@ cli_env() {
   [ ! -e "$SSHTUNNEL_STATE" ]
   [ ! -e "$SUDOERS_D/vps-ssh-manu" ]
   for f in "$VPS_LOG" "$CALLS"; do
-    ! grep -q TUNNELTOKEN "$f"
-    ! grep -q SYSTOKEN "$f"
+    ! grep -q TUNNELTOKEN "$f" || false
+    ! grep -q SYSTOKEN "$f" || false
   done
 }
 
@@ -784,7 +784,7 @@ cli_env() {
     [ "$(jq -r .error <<<"$output")" = "sudo deve essere true o false" ]
   done
   [ ! -s "$CFLOG" ]
-  ! grep -qE '^(useradd|userdel)' "$CALLS"
+  ! grep -qE '^(useradd|userdel)' "$CALLS" || false
 }
 
 @test "vps-ssh-tunnel add-user e remove-user: errori in italiano come json_err" {
@@ -1030,7 +1030,7 @@ echo $((n + 1)) >"$BATS_TEST_TMPDIR/pgrep.n"; exit 0'
   user_stubs
   USERADD_FAIL=1 run st_user_create mario
   [ "$status" -eq 1 ]
-  ! grep -q "^usermod" "$CALLS"
+  ! grep -q "^usermod" "$CALLS" || false
   : >"$CALLS"
   USERMOD_FAIL=1 run st_user_create mario
   [ "$status" -eq 1 ]
@@ -1057,7 +1057,7 @@ echo $((n + 1)) >"$BATS_TEST_TMPDIR/pgrep.n"; exit 0'
   echo "root:x:0:0:root:/root:/bin/bash" >>"$PASSWD_FAKE"
   run st_user_delete root
   [ "$status" -eq 2 ]
-  ! grep -qE "^(userdel|pkill|loginctl|crontab|find|atrm)" "$CALLS"
+  ! grep -qE "^(userdel|pkill|loginctl|crontab|find|atrm)" "$CALLS" || false
 }
 
 @test "st_user_delete di un nostro utente: ordine, at, find, file" {
@@ -1080,7 +1080,7 @@ atrm 7
 find /tmp /var/tmp /dev/shm -xdev -user mario -delete
 userdel -r mario'
   [ "$(grep -E '^(loginctl|pkill|crontab|atrm|find|userdel)' "$CALLS")" = "$expected" ]
-  ! grep -qx "atrm 8" "$CALLS"
+  ! grep -qx "atrm 8" "$CALLS" || false
 }
 
 @test "st_user_delete aspetta che i processi escano; userdel -r esce con 8 (in uso) → userdel -f -r" {
@@ -1101,7 +1101,7 @@ userdel -r mario'
   echo "mario ALL=(ALL) NOPASSWD:ALL" >"$SUDOERS_D/vps-ssh-mario"
   USERDEL_FAIL=1 run st_user_delete mario
   [ "$status" -eq 1 ]
-  ! grep -q "userdel -f" "$CALLS"
+  ! grep -q "userdel -f" "$CALLS" || false
   # L'account c'è ancora: sudoers coerente con lui.
   [ -e "$SUDOERS_D/vps-ssh-mario" ]
 }
@@ -1116,7 +1116,7 @@ userdel -r mario'
   [ "$status" -eq 0 ]
   [ ! -e "$SUDOERS_D/vps-ssh-mario" ]
   [ ! -e "$SSH_CF_PRINCIPALS/mario" ]
-  ! grep -q "userdel -f" "$CALLS"
+  ! grep -q "userdel -f" "$CALLS" || false
 }
 
 @test "st_user_delete: il principal sparisce PRIMA di fermare i processi" {
@@ -1130,7 +1130,7 @@ userdel -r mario'
   make_stub loginctl 'if [ -e "$SSH_CF_PRINCIPALS/mario" ]; then echo "loginctl con principal presente" >>"$CALLS"; else echo "loginctl $*" >>"$CALLS"; fi; exit 0'
   run st_user_delete mario
   [ "$status" -eq 0 ]
-  ! grep -q "principal presente" "$CALLS"
+  ! grep -q "principal presente" "$CALLS" || false
   grep -q "^pkill -KILL -u mario" "$CALLS"
 }
 
@@ -1154,7 +1154,7 @@ userdel -r mario'
   [ ! -e "$SSHD_CONFIG_D/20-vps-cfaccess.conf" ]
   [ ! -e "$SSH_CF_CA" ]
   [ ! -e "$SSH_CF_PRINCIPALS" ]
-  ! grep -qE "sshd|reload" "$CALLS"
+  ! grep -qE "sshd|reload" "$CALLS" || false
 }
 
 @test "st_sudo_set true rifiuta un utente estraneo" {
@@ -1169,7 +1169,7 @@ userdel -r mario'
   user_stubs
   run st_user_delete anna
   [ "$status" -eq 0 ]
-  ! grep -q "^userdel" "$CALLS"
+  ! grep -q "^userdel" "$CALLS" || false
 }
 
 @test "st_sudo_set true scrive il file 440 validato, false lo toglie" {
@@ -1204,7 +1204,7 @@ userdel -r mario'
   # Match per ultimo e uno solo; niente utente dell'installazione.
   [ "$(grep -c '^Match' "$d")" -eq 1 ]
   [ "$(tail -n 1 "$d")" = "    AuthorizedKeysFile none" ]
-  ! grep -q iimanuii "$d"
+  ! grep -q iimanuii "$d" || false
   [ "$(cat "$SSH_CF_PRINCIPALS/mario")" = mario ]
   [ "$(cat "$SSH_CF_PRINCIPALS/anna")" = anna ]
   [ ! -e "$SSH_CF_PRINCIPALS/iimanuii" ]
@@ -1224,7 +1224,7 @@ userdel -r mario'
   [ ! -e "$SSH_CF_PRINCIPALS/anna" ]
   [ "$(cat "$SSHD_CONFIG_D/20-vps-cfaccess.conf")" = VECCHIO ]
   [ "$(cat "$SSH_CF_CA")" = CA-VECCHIA ]
-  ! grep -q "reload" "$CALLS"
+  ! grep -q "reload" "$CALLS" || false
 }
 
 @test "st_sshd_remove con più nomi toglie drop-in, CA e i loro principal" {
@@ -1261,7 +1261,7 @@ call_line() {
   grep -qx "useradd -m -s /bin/bash -c vps-ssh-tunnel manu" "$CALLS"
   [ "$(cat "$SUDOERS_D/vps-ssh-manu")" = "manu ALL=(ALL) NOPASSWD:ALL" ]
   [ "$(jq -c .users "$SSHTUNNEL_STATE")" = '[{"email":"manu@x.it","user":"manu","sudo":true}]' ]
-  ! jq -e 'has("emails") or has("user")' "$SSHTUNNEL_STATE"
+  ! jq -e 'has("emails") or has("user")' "$SSHTUNNEL_STATE" || false
   grep -- '--data' "$CALLS" | grep '"decision":"allow"' | grep -q '{"email":{"email":"manu@x.it"}}'
   [ "$(call_line '^useradd')" -lt "$(call_line '^sshd -t')" ]
   grep -qx "AllowUsers manu" "$SSHD_CONFIG_D/20-vps-cfaccess.conf"
@@ -1283,7 +1283,7 @@ enable_fails() {
   [ "$rc" -eq 1 ]
   grep -qx "useradd -m -s /bin/bash -c vps-ssh-tunnel manu" "$CALLS"
   grep -qx "userdel -r manu" "$CALLS"
-  ! grep -q '^manu:' "$PASSWD_FAKE"
+  ! grep -q '^manu:' "$PASSWD_FAKE" || false
   [ -z "$(ls -A "$SUDOERS_D")" ]
   [ ! -e "$SSHD_CONFIG_D/20-vps-cfaccess.conf" ]
   [ ! -e "$SSH_CF_PRINCIPALS/manu" ]
@@ -1333,7 +1333,7 @@ enable_fails() {
     [ "$ST_ERR" = "l'utente ${e%%@*} esiste già sulla VPS e non è stato creato dall'accesso SSH" ]
   done
   [ ! -s "$CFLOG" ]
-  ! grep -qE '^(useradd|userdel|usermod)' "$CALLS"
+  ! grep -qE '^(useradd|userdel|usermod)' "$CALLS" || false
 }
 
 @test "st_enable: sudo non booleano o nome utente non valido → rifiutato" {
@@ -1342,7 +1342,7 @@ enable_fails() {
   rc=0; st_enable ssh-k3f9x2 manu@x.it || rc=$?; [ "$rc" -eq 1 ]
   rc=0; st_enable ssh-k3f9x2 'mario+x@x.it' true || rc=$?; [ "$rc" -eq 1 ]
   [ ! -s "$CFLOG" ]
-  ! grep -q '^useradd' "$CALLS"
+  ! grep -q '^useradd' "$CALLS" || false
 }
 
 @test "st_add_user: utente senza sudoers, drop-in con tutti, policy con due email DOPO useradd" {
@@ -1378,7 +1378,7 @@ enable_fails() {
   [ "$rc" -eq 1 ]
   [ -n "$ST_ERR" ]
   grep -qx "userdel -r anna" "$CALLS"
-  ! grep -q '^anna:' "$PASSWD_FAKE"
+  ! grep -q '^anna:' "$PASSWD_FAKE" || false
   [ ! -e "$SUDOERS_D/vps-ssh-anna" ]
   [ ! -e "$SSH_CF_PRINCIPALS/anna" ]
   grep -qx "AllowUsers manu" "$SSHD_CONFIG_D/20-vps-cfaccess.conf"
@@ -1393,15 +1393,15 @@ enable_fails() {
   SSHD_FAIL=1 st_add_user anna@y.it true || rc=$?
   [ "$rc" -eq 1 ]
   grep -qx "userdel -r anna" "$CALLS"
-  ! grep -q 'policies/pol1' "$CALLS"
+  ! grep -q 'policies/pol1' "$CALLS" || false
   grep -qx "AllowUsers manu" "$SSHD_CONFIG_D/20-vps-cfaccess.conf"
   : >"$CALLS"
   rc=0
   VISUDO_FAIL=1 st_add_user anna@y.it true || rc=$?
   [ "$rc" -eq 1 ]
   grep -qx "userdel -r anna" "$CALLS"
-  ! grep -q '^anna:' "$PASSWD_FAKE"
-  ! grep -q 'policies/pol1' "$CALLS"
+  ! grep -q '^anna:' "$PASSWD_FAKE" || false
+  ! grep -q 'policies/pol1' "$CALLS" || false
 }
 
 @test "st_add_user: duplicato, utente estraneo, nome non valido, 6ª persona → rifiutati senza modifiche" {
@@ -1428,7 +1428,7 @@ enable_fails() {
   [ "$rc" -eq 1 ]
   [ "$ST_ERR" = "massimo 5 persone" ]
   [ ! -s "$CFLOG" ]
-  ! grep -qE '^(useradd|userdel|usermod|sshd|systemctl)' "$CALLS"
+  ! grep -qE '^(useradd|userdel|usermod|sshd|systemctl)' "$CALLS" || false
   [ "$(jq '.users | length' "$SSHTUNNEL_STATE")" -eq 5 ]
 }
 
@@ -1438,7 +1438,7 @@ enable_fails() {
   rc=0; st_add_user anna@y.it false || rc=$?
   [ "$rc" -eq 1 ]
   [[ "$ST_ERR" == *"versione precedente"* ]]
-  ! grep -q '^useradd' "$CALLS"
+  ! grep -q '^useradd' "$CALLS" || false
 }
 
 @test "st_remove_user: policy aggiornata PRIMA di userdel; stato con solo manu" {
@@ -1453,7 +1453,7 @@ enable_fails() {
   [[ "$pol" == *'"manu@x.it"'* && "$pol" != *'anna@y.it'* ]]
   [ "$(call_line 'policies/pol1')" -lt "$(call_line '^userdel')" ]
   [ "$(call_line 'policies/pol1')" -lt "$(call_line '^pkill')" ]
-  ! grep -q '^anna:' "$PASSWD_FAKE"
+  ! grep -q '^anna:' "$PASSWD_FAKE" || false
   [ ! -e "$SUDOERS_D/vps-ssh-anna" ]
   [ ! -e "$SSH_CF_PRINCIPALS/anna" ]
   grep -qx "AllowUsers manu" "$SSHD_CONFIG_D/20-vps-cfaccess.conf"
@@ -1467,7 +1467,7 @@ enable_fails() {
   CF_FAIL="PUT:/accounts/acc1/access/policies/pol1" st_remove_user anna@y.it || rc=$?
   [ "$rc" -eq 1 ]
   [ -n "$ST_ERR" ]
-  ! grep -qE '^(userdel|pkill|loginctl|sshd|systemctl)' "$CALLS"
+  ! grep -qE '^(userdel|pkill|loginctl|sshd|systemctl)' "$CALLS" || false
   grep -q '^anna:' "$PASSWD_FAKE"
   [ "$(cat "$SSH_CF_PRINCIPALS/anna")" = anna ]
   grep -qx "AllowUsers manu anna" "$SSHD_CONFIG_D/20-vps-cfaccess.conf"
@@ -1502,7 +1502,7 @@ enable_fails() {
   rc=0; st_remove_user anna@y.it || rc=$?
   [ "$rc" -eq 1 ]
   [ ! -s "$CFLOG" ]
-  ! grep -qE '^(userdel|pkill|loginctl)' "$CALLS"
+  ! grep -qE '^(userdel|pkill|loginctl)' "$CALLS" || false
   [ "$(jq '.users | length' "$SSHTUNNEL_STATE")" -eq 2 ]
 }
 
@@ -1549,7 +1549,7 @@ enable_fails() {
   done
   [ ! -s "$CFLOG" ]
   [ "$(cat "$SSHTUNNEL_STATE")" = "$before" ]
-  ! grep -qE '^(useradd|userdel)' "$CALLS"
+  ! grep -qE '^(useradd|userdel)' "$CALLS" || false
   [ ! -e "$SSH_CF_PRINCIPALS/bob" ]
 }
 
@@ -1575,7 +1575,7 @@ enable_fails() {
   [ "$status" -eq 0 ]
   grep -qx "userdel -r manu" "$CALLS"
   grep -qx "userdel -r anna" "$CALLS"
-  ! grep -qE '^(userdel|pkill|loginctl|crontab).* root( |$)' "$CALLS"
+  ! grep -qE '^(userdel|pkill|loginctl|crontab).* root( |$)' "$CALLS" || false
   grep -q '^root:' "$PASSWD_FAKE"
   [ ! -e "$SUDOERS_D/vps-ssh-anna" ]
   [ ! -e "$SSHD_CONFIG_D/20-vps-cfaccess.conf" ]
@@ -1591,7 +1591,7 @@ enable_fails() {
   run st_disable
   [ "$status" -eq 0 ]
   [ ! -e "$SSH_CF_PRINCIPALS/manuele" ]
-  ! grep -q '^userdel' "$CALLS"
+  ! grep -q '^userdel' "$CALLS" || false
   grep -q '^manu:' "$PASSWD_FAKE"
   [ ! -e "$SSHTUNNEL_STATE" ]
 }
@@ -1636,7 +1636,7 @@ enable_fails() {
   [ ! -e "$SUDOERS_D/vps-ssh-anna" ]
   [ ! -e "$SSH_CF_PRINCIPALS/anna" ]
   grep -q '^anna:' "$PASSWD_FAKE"
-  ! grep -qE '^(userdel|pkill|loginctl|crontab|find|atrm|usermod)' "$CALLS"
+  ! grep -qE '^(userdel|pkill|loginctl|crontab|find|atrm|usermod)' "$CALLS" || false
 }
 
 @test "st_disable con un account estraneo omonimo: lo lascia, ma il nostro sudoers non sopravvive" {
@@ -1647,7 +1647,7 @@ enable_fails() {
   run st_disable
   [ "$status" -eq 0 ]
   grep -q '^anna:' "$PASSWD_FAKE"
-  ! grep -qx "userdel -r anna" "$CALLS"
+  ! grep -qx "userdel -r anna" "$CALLS" || false
   [ ! -e "$SUDOERS_D/vps-ssh-anna" ]
   [ ! -e "$SSHTUNNEL_STATE" ]
 }
@@ -1657,14 +1657,14 @@ enable_fails() {
   mkdir -p "$HOME_BASE/mario"
   run st_user_create mario
   [ "$status" -eq 1 ]
-  ! grep -q '^useradd' "$CALLS"
+  ! grep -q '^useradd' "$CALLS" || false
   [ -d "$HOME_BASE/mario" ]
   cf_enabled
   mkdir -p "$HOME_BASE/anna"
   rc=0; st_add_user anna@y.it false || rc=$?
   [ "$rc" -eq 1 ]
   [[ "$ST_ERR" == *"esiste già sulla VPS"* ]]
-  ! grep -q '^useradd' "$CALLS"
+  ! grep -q '^useradd' "$CALLS" || false
   [ -d "$HOME_BASE/anna" ]
 }
 

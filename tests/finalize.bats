@@ -26,7 +26,7 @@ setup() {
 @test "il riepilogo non finisce nel log" {
   summary_set PMA_BASIC_PASS 'Pma-Segreta-1'
   finalize_summary_text >/dev/null
-  ! grep -q 'Pma-Segreta-1' "$VPS_LOG" 2>/dev/null
+  ! grep -q 'Pma-Segreta-1' "$VPS_LOG" 2>/dev/null || false
 }
 
 ssh_env() {

@@ -629,7 +629,7 @@ sent() {
   jq -e '.checks | map(select(.id == "url:https://a.test/"))[0] | .kind == "url" and .state == "ok" and .code == 200 and .time_ms == 100' <<<"$output"
   jq -e '(.alerts | length) == 2 and (.last_run | test("^2026-10-16T"))' <<<"$output"
   run ! grep -qF "$TOK" "$T/curl.args"
-  ! grep -qF "$TOK" "$VPS_LOG"
+  ! grep -qF "$TOK" "$VPS_LOG" || false
 }
 
 @test "giro: indirizzo lento dopo 5 giri e parola attesa assente" {
@@ -880,7 +880,7 @@ sent() {
   tool_env
   mon_cfg '.urls = []'
   touch "$T/down.nginx"
-  echo 30 >"$T/restart.sleep"
+  echo 4171 >"$T/restart.sleep"
   SECONDS=0
   MON_RESTART_TIMEOUT=1 run round "$NOW"
   [ "$status" -eq 0 ]
@@ -888,7 +888,8 @@ sent() {
   grep -qxF 'restart nginx' "$T/systemctl.calls"
   jq -e --argjson n "$NOW" '.checks["service:nginx"].restarts == [$n]' "$T/state.snap"
   jq -e --argjson n "$NOW" '.checks["service:nginx"].restarts == [$n]' "$MON_STATE"
-  ! pgrep -f 'sleep 30' >/dev/null
+  # durata usata solo qui: altri test hanno un loro "sleep 30" e pgrep vede tutta la macchina
+  ! pgrep -xf 'sleep 4171' >/dev/null || false
 }
 
 @test "fix: oltre il tempo del giro niente riavvii, controlli delle 6 ore né riepilogo; stato e ping sì" {

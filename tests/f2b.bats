@@ -53,7 +53,7 @@ esac'
   done
   run bash "$T" unban 1.2.3.4 altro
   [ "$status" -eq 1 ]
-  ! grep -q '^unban' "$BATS_TEST_TMPDIR/f2b.calls" 2>/dev/null
+  ! grep -q '^unban' "$BATS_TEST_TMPDIR/f2b.calls" 2>/dev/null || false
 }
 
 @test "vps-f2b: azione sconosciuta" {
@@ -67,10 +67,10 @@ esac'
   f2b_valid_ip 255.255.255.255
   f2b_valid_ip ::1
   f2b_valid_ip 2001:db8::ffff:1.2.3.4
-  ! f2b_valid_ip 1.2.3.256
-  ! f2b_valid_ip 01.2.3
-  ! f2b_valid_ip abc
-  ! f2b_valid_ip "1.2.3.4 "
+  ! f2b_valid_ip 1.2.3.256 || false
+  ! f2b_valid_ip 01.2.3 || false
+  ! f2b_valid_ip abc || false
+  ! f2b_valid_ip "1.2.3.4 " || false
 }
 
 @test "sudoers: vps-f2b è consentito al pannello" {

@@ -27,7 +27,7 @@ answers() { printf '%s\n' "$TOKEN" manu 123456789 'Una-Password-12!' 'Una-Passwo
   [ "$(jq -r .panel.version "$VPS_OPT/manifest.json")" = 1.1.0 ]
   [[ "$output" == *"https://panel.test/login"* ]]
   run ! grep -q 'Una-Password-12!' "$VPS_LOG"
-  ! grep -q AAAAAAAAAAAA "$VPS_LOG"
+  ! grep -q AAAAAAAAAAAA "$VPS_LOG" || false
 }
 
 @test "password con spazi in testa e in coda: arriva a create-admin com'è" {

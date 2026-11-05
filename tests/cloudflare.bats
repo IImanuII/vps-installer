@@ -226,7 +226,7 @@ esac'
   run cf_check_ssh_perms acc1
   [ "$status" -eq 1 ]
   [ "$output" = tunnel ]
-  ! grep -qE 'per_page|identity_providers( |$)' "$STUB_LOG"
+  ! grep -qE 'per_page|identity_providers( |$)' "$STUB_LOG" || false
 }
 
 @test "cf_check_ssh_perms: un 404 non è mai un permesso mancante, qualunque sia il messaggio" {

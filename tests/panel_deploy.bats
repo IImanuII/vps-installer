@@ -60,7 +60,7 @@ setup() {
 @test "pd_ver_gt" {
   pd_ver_gt 1.10.0 1.9.0
   run ! pd_ver_gt 1.9.0 1.10.0
-  ! pd_ver_gt 1.0.0 1.0.0
+  ! pd_ver_gt 1.0.0 1.0.0 || false
 }
 
 @test "pd_checkout porta al tag e non tocca config, logs, storage" {
@@ -162,7 +162,7 @@ dev_release() {
   pd_repo_ok
   mv "$PD_GIT_DIR" "$BATS_TEST_TMPDIR/vera.git"
   ln -s "$BATS_TEST_TMPDIR/vera.git" "$PD_GIT_DIR"
-  ! pd_repo_ok
+  ! pd_repo_ok || false
 }
 
 @test "pd_checkout non segue link simbolici nel work tree" {
@@ -172,7 +172,7 @@ dev_release() {
   [ -L "$P/trappola" ]
   # il blocco chown è -R -P -h sull'intera radice, senza giro per percorso (nei test è saltato: VPS_NO_CHOWN=1)
   grep -q 'chown -R -P -h' "$REPO_ROOT/lib/panel_deploy.sh"
-  ! grep -q 'ls-files' "$REPO_ROOT/lib/panel_deploy.sh"
+  ! grep -q 'ls-files' "$REPO_ROOT/lib/panel_deploy.sh" || false
 }
 
 @test "pd_key_ensure: cartella 700, rigenera .pub mancante" {
@@ -225,7 +225,7 @@ dev_release() {
   pd_load
   run pd_env_merge ""
   [ "$status" -ne 0 ]
-  ! grep -q '^APP_KEY=' "$PD_ENV"
+  ! grep -q '^APP_KEY=' "$PD_ENV" || false
 }
 
 @test "pd_schema legge schema.sql dal tag, non dalla radice del pannello" {
@@ -265,7 +265,7 @@ dev_release() {
   echo '-- manomessa 1.1.0' >"$P/install/migrations/1.1.0.sql"
   pd_migrations v1.0.0 v1.1.0
   grep -qx -- '-- migrazione 1.1.0' "$BATS_TEST_TMPDIR/mariadb.sql"
-  ! grep -q -e falsa -e manomessa "$BATS_TEST_TMPDIR/mariadb.sql"
+  ! grep -q -e falsa -e manomessa "$BATS_TEST_TMPDIR/mariadb.sql" || false
 }
 
 @test "pd_migrations si ferma alla prima che fallisce" {

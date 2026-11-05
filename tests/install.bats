@@ -160,7 +160,7 @@ local_id() {
   [ ! -e "$VPS_DEST" ]
   [[ "$output" == *"Script di /opt/vps aggiornati"* ]]
   # read -p non stampa il prompt senza terminale: si controlla che manchi
-  ! declare -f tools_only_done | grep -q "read "
+  ! declare -f tools_only_done | grep -q "read " || false
 }
 
 @test "start_mode: --tools-only parte diretto anche senza terminale" {
