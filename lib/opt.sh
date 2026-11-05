@@ -58,6 +58,38 @@ opt_panel_pool() {
   fi
 }
 
+# opt_site_pools — Debian spegne la pulizia delle sessioni di PHP (gc_probability 0) e la
+# sostituisce con un cron che guarda solo la cartella predefinita: le sessioni dei siti,
+# in <radice>/tmp, restavano per sempre. Fino alla 1.12.0 i pool non avevano queste righe:
+# si aggiungono senza riscrivere il file, che può avere valori cambiati a mano. Con
+# php-fpm -t o reload falliti tornano i file di prima e --tools-only prosegue.
+opt_site_pools() {
+  local ver dir f bak
+  local todo=()
+  ver="$(jq -r '.components.php // empty' "$(manifest_path)")"
+  [[ -n "$ver" ]] || return 0
+  dir="${PHP_POOL_D:-/etc/php/$ver/fpm/pool.d}"
+  for f in "$dir"/site_*.conf; do
+    [[ -f "$f" ]] || continue
+    grep -q 'session\.gc_probability' "$f" && continue
+    grep -q '^php_admin_value\[session\.save_path\]' "$f" || continue
+    todo+=("$f")
+  done
+  ((${#todo[@]})) || return 0
+  bak="$(mktemp -d)"
+  cp -p "${todo[@]}" "$bak/"
+  for f in "${todo[@]}"; do
+    sed -i '/^php_admin_value\[session\.save_path\]/a php_value[session.gc_probability] = 1\nphp_value[session.gc_divisor] = 1000' "$f"
+  done
+  if "php-fpm$ver" -t >>"$VPS_LOG" 2>&1 && systemctl reload "php$ver-fpm" >>"$VPS_LOG" 2>&1; then
+    log "Pool dei siti: pulizia delle sessioni attivata (${#todo[@]})"
+  else
+    cp -p "$bak"/* "$dir/"
+    log "ATTENZIONE: pool dei siti non aggiornati (php-fpm -t o reload falliti), lasciati com'erano"
+  fi
+  rm -rf "$bak"
+}
+
 # opt_panel_vhost — le installazioni precedenti alla 1.6.0 hanno il vhost del
 # pannello senza fastcgi_read_timeout: le operazioni sui file (fino a 120 s)
 # verrebbero tagliate dal default di nginx (60 s). Si aggiunge la riga
@@ -180,6 +212,7 @@ opt_system_files() {
   opt_backup_files
   opt_sites_acl
   opt_panel_pool
+  opt_site_pools
   opt_panel_vhost
   opt_pma_snippet
   opt_logrotate || log "ATTENZIONE: rotazione dei log di sistema e del pannello non configurata"

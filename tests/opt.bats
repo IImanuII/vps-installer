@@ -202,6 +202,37 @@ sys_setup() {
   cmp -s "$PANEL_POOL_FILE" "$BATS_TEST_TMPDIR/prima"
 }
 
+_opt_site_pools_env() {
+  jq -n '{components:{php:"8.4"}}' >"$VPS_OPT/manifest.json"
+  export PHP_POOL_D="$BATS_TEST_TMPDIR/pool.d"
+  mkdir -p "$PHP_POOL_D"
+  printf '[site_a]\npm.max_children = 12\nphp_admin_value[session.save_path] = /var/www/a/tmp\n' >"$PHP_POOL_D/site_a.conf"
+  printf '[panel]\nphp_admin_value[session.save_path] = /var/www/p/storage\n' >"$PHP_POOL_D/panel.conf"
+}
+
+@test "opt_site_pools: la pulizia delle sessioni entra nei pool dei siti, una volta, senza toccare il resto" {
+  _opt_site_pools_env
+  cp "$PHP_POOL_D/panel.conf" "$BATS_TEST_TMPDIR/panel.prima"
+  make_stub php-fpm8.4 'exit 0'
+  opt_site_pools
+  grep -qxF 'php_value[session.gc_probability] = 1' "$PHP_POOL_D/site_a.conf"
+  grep -qxF 'php_value[session.gc_divisor] = 1000' "$PHP_POOL_D/site_a.conf"
+  grep -qxF 'pm.max_children = 12' "$PHP_POOL_D/site_a.conf"
+  cmp -s "$PHP_POOL_D/panel.conf" "$BATS_TEST_TMPDIR/panel.prima"
+  [ "$(grep -c 'reload php8.4-fpm' "$BATS_TEST_TMPDIR/systemctl.calls")" -eq 1 ]
+  opt_site_pools
+  [ "$(grep -c 'gc_probability' "$PHP_POOL_D/site_a.conf")" -eq 1 ]
+  [ "$(grep -c 'reload php8.4-fpm' "$BATS_TEST_TMPDIR/systemctl.calls")" -eq 1 ]
+}
+
+@test "opt_site_pools: php-fpm -t fallito rimette i pool com'erano" {
+  _opt_site_pools_env
+  cp "$PHP_POOL_D/site_a.conf" "$BATS_TEST_TMPDIR/prima"
+  make_stub php-fpm8.4 'exit 1'
+  opt_site_pools
+  cmp -s "$PHP_POOL_D/site_a.conf" "$BATS_TEST_TMPDIR/prima"
+}
+
 @test "aggiornamenti automatici: anche nginx.org, aggiornati da --tools-only solo se la configurazione c'è già" {
   grep -qF '"origin=nginx,codename=${distro_codename}";' "$REPO_ROOT/templates/apt-52vps-unattended"
   grep -qF '"origin=cloudflared,codename=any";' "$REPO_ROOT/templates/apt-52vps-unattended"

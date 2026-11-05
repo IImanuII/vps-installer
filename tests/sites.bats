@@ -224,6 +224,8 @@ setup() {
   grep -qx "listen = /run/php/php$PHP_VERSION-fpm-site_blog_miosito_it.sock" "$f"
   grep -qx "php_admin_value\[open_basedir\] = $SITES_WWW/blog.miosito.it/" "$f"
   grep -qx "php_admin_value\[error_log\] = $SITES_WWW/blog.miosito.it/logs/php/php-error.log" "$f"
+  grep -qxF 'php_value[session.gc_probability] = 1' "$f"
+  grep -qxF 'php_value[session.gc_divisor] = 1000' "$f"
   grep -q "^systemctl reload php$PHP_VERSION-fpm" "$CALLS"
 }
 
