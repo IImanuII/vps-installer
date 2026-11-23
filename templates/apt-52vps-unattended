@@ -1,9 +1,11 @@
-// vps-installer: pacchetti Debian, Nginx di nginx.org e cloudflared, riavvio automatico alle 04:00 se serve.
+// vps-installer: pacchetti Debian, Nginx di nginx.org, PHP di Sury e cloudflared, riavvio automatico alle 04:00 se serve.
+// PHP di Sury: solo i pacchetti già installati della stessa versione (8.4); non passa mai da solo a una versione nuova.
 Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename},label=Debian";
         "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
         "origin=Debian,codename=${distro_codename}-updates";
         "origin=nginx,codename=${distro_codename}";
+        "origin=deb.sury.org,codename=${distro_codename}";
         "origin=cloudflared,codename=any";
 };
 Unattended-Upgrade::Automatic-Reboot "true";

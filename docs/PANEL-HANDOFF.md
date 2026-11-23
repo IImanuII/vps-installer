@@ -94,6 +94,7 @@ Se l'installer cambia una di queste cose, questo file va aggiornato insieme alla
 | `/etc/systemd/system/vps-cloudflared.service` | servizio di `cloudflared` (tunnel verso `ssh://localhost`) |
 | `/etc/apt/apt.conf.d/90vps-cloudflared` | hook apt (`DPkg::Post-Invoke`): riavvia `vps-cloudflared` dopo ogni aggiornamento del pacchetto; tolto con la disattivazione |
 | apt source di `cloudflared` (repository `pkg.cloudflare.com`, suite `any`) | installato con l'accesso SSH; origine aggiunta agli aggiornamenti automatici (`52vps-unattended`) |
+| `/etc/apt/apt.conf.d/52vps-unattended` | aggiornamenti automatici di Debian, Nginx (nginx.org), cloudflared e, dalla 1.13.2, PHP di Sury (`origin=deb.sury.org,codename=${distro_codename}`: solo i pacchetti installati, mai una versione nuova di PHP); riavvio alle 04:00 se serve. `--tools-only` lo riscrive solo se c'è già |
 | `/var/www/_maintenance/_maintenance.html` | pagina 503 dei siti disattivati |
 | `/etc/systemd/system/vps-monitor.service` | `root:root` 644: `Type=oneshot`, `ExecStart=/opt/vps/bin/vps-monitor _run`, `TimeoutStartSec=55`, `Nice=5` |
 | `/etc/systemd/system/vps-monitor.timer` | `root:root` 644: `OnCalendar=*:*:00`, `AccuracySec=5s`, `Persistent=false`; installato spento, lo abilita/ferma `vps-monitor config` |

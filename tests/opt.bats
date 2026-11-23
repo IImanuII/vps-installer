@@ -236,6 +236,7 @@ _opt_site_pools_env() {
 @test "aggiornamenti automatici: anche nginx.org, aggiornati da --tools-only solo se la configurazione c'è già" {
   grep -qF '"origin=nginx,codename=${distro_codename}";' "$REPO_ROOT/templates/apt-52vps-unattended"
   grep -qF '"origin=cloudflared,codename=any";' "$REPO_ROOT/templates/apt-52vps-unattended"
+  grep -qF '"origin=deb.sury.org,codename=${distro_codename}";' "$REPO_ROOT/templates/apt-52vps-unattended"
   jq -n '{installer_version:"1.5.2", admin_user:"manu"}' >"$VPS_OPT/manifest.json"
   export APT_CONF_D="$BATS_TEST_TMPDIR/apt.conf.d"
   mkdir -p "$APT_CONF_D"
