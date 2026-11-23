@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # vps-status — stato del server in JSON.
+#   vps-status          macchina, servizi e aggiornamenti in sospeso
+#   vps-status live     CPU, RAM e carico di adesso (leggero)
+#   vps-status traffic  richieste dei siti nelle ultime 24 ore, per ora
 # Sotto sudo l'ambiente del chiamante non deve influenzare lo script.
 if [[ -n "${SUDO_USER:-}" ]]; then
   VPS_OPT=/opt/vps
@@ -7,6 +10,7 @@ if [[ -n "${SUDO_USER:-}" ]]; then
   VPS_TEMPLATES=$VPS_OPT/templates
   VPS_LOG=/var/log/vps-tools.log
   unset MSMTPRC_LINK HTPASSWD_PMA ALIASES_FILE PMA_DIR NGINX_SNIPPETS CF_API CF_IPS_URL PMA_BASE_URL
+  unset VS_DIR VS_PY VS_DPKG_STATUS VS_APT_LISTS VS_UU_LOG VS_UPDATE_STAMP VS_OS_RELEASE VS_TRAFFIC_TTL VS_LIVE_SLEEP VS_NOW SITES_DIR SITES_WWW
   [[ -e "$VPS_LOG" ]] || install -m 640 /dev/null "$VPS_LOG"
   chmod 640 "$VPS_LOG"
 fi
@@ -18,6 +22,21 @@ for _lib in "${VPS_LIB:-$VPS_OPT/lib}"/*.sh; do
 done
 tool_init
 
+case "${1:-}" in
+  live)
+    vs_live_json
+    exit 0
+    ;;
+  traffic)
+    vs_traffic_json
+    exit 0
+    ;;
+  "") ;;
+  *)
+    json_err "uso: vps-status [live | traffic]"
+    ;;
+esac
+
 services='{}'
 for s in nginx "php$PHP_VERSION-fpm" mariadb redis-server fail2ban; do
   st="$(systemctl is-active "$s" 2>/dev/null || true)"
@@ -27,19 +46,9 @@ read -r dsize dused davail < <(df -B1 --output=size,used,avail / | tail -n 1)
 read -r mtotal mused mavail < <(free -b | awk '/^Mem:/ { print $2, $3, $7 }')
 read -r l1 l5 l15 _ </proc/loadavg
 up="$(cut -d' ' -f1 /proc/uptime)"
-upg="$(apt list --upgradable 2>/dev/null | grep -c 'upgradable from' || true)"
-reboot=false
-if [[ -f /var/run/reboot-required ]]; then
-  reboot=true
-fi
 
-json_ok --argjson services "$services" \
-  --argjson dsize "$dsize" --argjson dused "$dused" --argjson davail "$davail" \
-  --argjson mtotal "$mtotal" --argjson mused "$mused" --argjson mavail "$mavail" \
-  --argjson l1 "$l1" --argjson l5 "$l5" --argjson l15 "$l15" \
-  --argjson up "${up%.*}" --argjson upg "${upg:-0}" --argjson reboot "$reboot" \
-  '{ok: true, services: $services,
+json_ok --argjson services "$services"   --argjson dsize "$dsize" --argjson dused "$dused" --argjson davail "$davail"   --argjson mtotal "$mtotal" --argjson mused "$mused" --argjson mavail "$mavail"   --argjson l1 "$l1" --argjson l5 "$l5" --argjson l15 "$l15"   --argjson up "${up%.*}" --argjson cpus "$(nproc)" --argjson updates "$(vs_updates_json)"   '{ok: true, services: $services,
     disk: {total: $dsize, used: $dused, available: $davail},
     memory: {total: $mtotal, used: $mused, available: $mavail},
-    load: [$l1, $l5, $l15], uptime_seconds: $up,
-    updates: {upgradable: $upg, reboot_required: $reboot}}'
+    load: [$l1, $l5, $l15], cpus: $cpus, uptime_seconds: $up,
+    updates: $updates}'

@@ -9,6 +9,7 @@ setup() {
 }
 
 @test "vps-status restituisce JSON valido" {
+  export VS_PY=false
   make_stub systemctl 'echo active'
   make_stub apt 'printf "Listing...\nnginx/stable 1.28 amd64 [upgradable from: 1.27]\n"'
   run bash "$T/vps-status"
