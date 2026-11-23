@@ -11,6 +11,8 @@ setup() {
   export VS_DPKG_STATUS="$BATS_TEST_TMPDIR/dpkg-status" VS_APT_LISTS="$BATS_TEST_TMPDIR/lists"
   export VS_UU_LOG="$BATS_TEST_TMPDIR/uu.log" VS_UPDATE_STAMP="$BATS_TEST_TMPDIR/stamp"
   export VS_OS_RELEASE="$BATS_TEST_TMPDIR/os-release"
+  # Le date dei timer e dei log sono ora italiana: il runner della CI è in UTC.
+  export TZ=Europe/Rome
   touch "$VS_DPKG_STATUS"
   mkdir -p "$VS_APT_LISTS"
   printf 'ID=debian\nVERSION_CODENAME=trixie\n' >"$VS_OS_RELEASE"
