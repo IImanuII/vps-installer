@@ -29,44 +29,54 @@ cf_api_code() {
   CF_WCODE=1 cf_api "$@"
 }
 
-# cf_find_zone DOMINIO → "ZONE_ID ZONE_NAME"
-# 0 trovata; 1 Cloudflare risponde ma il token non vede nessuna zona del
-# dominio; 2 Cloudflare non risponde o dà errore (rete, limite di richieste,
-# 5xx, token rifiutato): il motivo va in CF_LAST_ERR e nel log, senza token.
+# cf_zone_lookup ZONA — cerca la zona attiva con esattamente quel nome e mette
+# l'id in CF_ZONE_ID (nessuna stampa: va chiamata senza $(…) per avere anche
+# CF_LAST_ERR). 0 trovata; 1 Cloudflare risponde ma il token non la vede;
+# 2 Cloudflare non risponde o dà errore (rete, limite di richieste, 5xx, token
+# rifiutato): il motivo va in CF_LAST_ERR e nel log, mai il token.
+cf_zone_lookup() {
+  local resp rc=0 dett
+  CF_ZONE_ID="" CF_LAST_ERR=""
+  resp="$(cf_api GET "/zones?name=$1&status=active")" || rc=$?
+  if ((rc != 0)); then
+    CF_LAST_ERR="Cloudflare non risponde (curl uscito con $rc)"
+  elif ! jq -e '.success == true' >/dev/null 2>&1 <<<"$resp"; then
+    dett="$(jq -r '[.errors[]? | "\(.code // "?") \(.message // "")"] | join("; ") | select(. != "")' <<<"$resp" 2>/dev/null || true)"
+    if [[ -z "$dett" ]]; then
+      # Corpo non JSON (pagina HTML, vuoto): l'inizio, su una riga, aiuta a capire.
+      dett="risposta non valida"
+      [[ -z "$resp" ]] || dett+=" ($(trim "$(tr -s '[:space:]' ' ' <<<"$resp" | cut -c1-80)"))"
+    fi
+    CF_LAST_ERR="Cloudflare ha dato errore: $dett"
+  else
+    CF_ZONE_ID="$(jq -r '.result[0].id // empty' <<<"$resp" 2>/dev/null || true)"
+    [[ -n "$CF_ZONE_ID" ]] && return 0
+    return 1
+  fi
+  log "Cloudflare: ricerca della zona $1 non riuscita: $CF_LAST_ERR"
+  return 2
+}
+
+# cf_find_zone DOMINIO → "ZONE_ID ZONE_NAME", risalendo dal nome alla zona.
+# Codici e CF_LAST_ERR come cf_zone_lookup (1 = nessuna zona del dominio visibile).
 cf_find_zone() {
-  local cand resp id rc
-  CF_LAST_ERR=""
+  local cand rc
   while read -r cand; do
     rc=0
-    resp="$(cf_api GET "/zones?name=$cand&status=active")" || rc=$?
-    if ((rc != 0)); then
-      CF_LAST_ERR="Cloudflare non risponde (curl uscito con $rc)"
-      log "Cloudflare: ricerca della zona $cand non riuscita: $CF_LAST_ERR"
-      return 2
-    fi
-    if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$resp"; then
-      CF_LAST_ERR="$(jq -r '[.errors[]? | "\(.code // "?") \(.message // "")"] | join("; ") | select(. != "")' <<<"$resp" 2>/dev/null || true)"
-      CF_LAST_ERR="Cloudflare ha dato errore: ${CF_LAST_ERR:-risposta non valida}"
-      log "Cloudflare: ricerca della zona $cand non riuscita: $CF_LAST_ERR"
-      return 2
-    fi
-    id="$(jq -r '.result[0].id // empty' <<<"$resp" 2>/dev/null || true)"
-    if [[ -n "$id" ]]; then
-      printf '%s %s\n' "$id" "$cand"
-      return 0
-    fi
+    cf_zone_lookup "$cand" || rc=$?
+    case "$rc" in
+      0) printf '%s %s\n' "$CF_ZONE_ID" "$cand"; return 0 ;;
+      2) return 2 ;;
+    esac
   done < <(domain_suffixes "$1")
   return 1
 }
 
-# cf_zone_id ZONA → id della zona attiva con esattamente quel nome
-# (1 se assente, 2 se Cloudflare non risponde).
+# cf_zone_id ZONA → stampa l'id (1 se assente, 2 se Cloudflare non risponde o
+# dà errore). Dentro $(…) CF_LAST_ERR si perde: per il motivo usare cf_zone_lookup.
 cf_zone_id() {
-  local resp id
-  resp="$(cf_api GET "/zones?name=$1&status=active")" || return 2
-  id="$(jq -r '.result[0].id // empty' <<<"$resp" 2>/dev/null || true)"
-  [[ -n "$id" ]] || return 1
-  printf '%s\n' "$id"
+  cf_zone_lookup "$1" || return
+  printf '%s\n' "$CF_ZONE_ID"
 }
 
 # cf_list_records ZONE_ID NOME — risposta JSON con tutti i record del nome.

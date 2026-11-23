@@ -454,11 +454,13 @@ _st_cf_context() {
     return 1
   }
   _st_token || return 1
-  ST_ZONE_ID="$(cf_zone_id "$ST_ZONE")" || rc=$?
+  cf_zone_lookup "$ST_ZONE" || rc=$?
+  # shellcheck disable=SC2153 # CF_ZONE_ID lo imposta cf_zone_lookup (lib/cloudflare.sh)
+  ST_ZONE_ID="$CF_ZONE_ID"
   case "$rc" in
     0) ;;
     1) ST_ERR="la zona $ST_ZONE non è visibile su Cloudflare con questo token" ;;
-    *) ST_ERR="Cloudflare non risponde" ;;
+    *) ST_ERR="${CF_LAST_ERR:-Cloudflare non risponde}" ;;
   esac
   ((rc == 0)) || return 1
   ST_ACC="$(cf_account_id "$ST_ZONE_ID")" || {

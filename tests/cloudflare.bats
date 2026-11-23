@@ -99,7 +99,7 @@ esac'
   local rc=0
   cf_find_zone html.it >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ]
-  [ "$CF_LAST_ERR" = "Cloudflare ha dato errore: risposta non valida" ]
+  [ "$CF_LAST_ERR" = "Cloudflare ha dato errore: risposta non valida (<html>bad gateway</html>)" ]
 }
 
 @test "cf_find_zone: curl fallito → 2 con il codice di curl" {

@@ -298,13 +298,38 @@ esac'
 
 @test "vps-cf-purge: rete assente e zona assente hanno errori diversi" {
   _cf_ini
-  make_stub curl 'exit 7'
-  run bash -c "bash '$T/vps-cf-purge' miosito.it --all </dev/null 2>/dev/null"
+  make_stub curl 'echo x >>"$BATS_TEST_TMPDIR/curl.n"; exit 7'
+  CF_RETRY_S=0 run bash -c "bash '$T/vps-cf-purge' miosito.it --all </dev/null 2>/dev/null"
   [ "$status" -eq 1 ]
-  [ "$(jq -r .error <<<"$output")" = "Cloudflare non risponde" ]
+  [ "$(jq -r .error <<<"$output")" = "Cloudflare non risponde (curl uscito con 7)" ]
+  [ "$(wc -l <"$BATS_TEST_TMPDIR/curl.n")" -eq 2 ]
   _cf_curl
   run bash -c "bash '$T/vps-cf-purge' altro.it --all </dev/null 2>/dev/null"
   [ "$(jq -r .error <<<"$output")" = "zona non trovata: altro.it" ]
+}
+
+@test "vps-cf-purge: errore passeggero di Cloudflare sulla zona si riprova, poi svuota" {
+  _cf_ini; _cf_curl
+  # curl che risponde "Rate limited" alla prima ricerca della zona, poi delega al finto di _cf_curl.
+  mv "$BATS_TEST_TMPDIR/bin/curl" "$BATS_TEST_TMPDIR/bin/curl.vero"
+  make_stub curl '
+for a; do last="$a"; done
+if [[ "$last" == *"/zones?name="* && ! -e "$BATS_TEST_TMPDIR/gia" ]]; then
+  touch "$BATS_TEST_TMPDIR/gia"; echo "{\"success\":false,\"errors\":[{\"code\":10429,\"message\":\"Rate limited\"}]}"; exit 0
+fi
+exec "$BATS_TEST_TMPDIR/bin/curl.vero" "$@"'
+  CF_RETRY_S=0 run bash -c "bash '$T/vps-cf-purge' miosito.it --all </dev/null 2>/dev/null"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .purged <<<"$output")" = all ]
+  grep -qF "ricerca della zona miosito.it non riuscita: Cloudflare ha dato errore: 10429 Rate limited" "$VPS_LOG"
+}
+
+@test "vps-cf-purge: Cloudflare sempre in errore → motivo vero, non 'zona non trovata'" {
+  _cf_ini
+  make_stub curl 'echo "<html>502 Bad Gateway</html>"'
+  CF_RETRY_S=0 run bash -c "bash '$T/vps-cf-purge' miosito.it --all </dev/null 2>/dev/null"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "Cloudflare ha dato errore: risposta non valida (<html>502 Bad Gateway</html>)" ]
 }
 
 @test "vps-cf-purge --host: host da stdin, svuota solo quelli (hosts), maiuscole e righe vuote tollerate" {

@@ -77,10 +77,18 @@ else
   n="${#urls[@]}"
 fi
 
+# Un errore di Cloudflare (non un "zona non vista") si riprova una volta: un
+# intoppo passeggero non deve diventare "zona non trovata".
 zrc=0
-zid="$(cf_zone_id "$zone")" || zrc=$?
-if ((zrc == 2)); then json_err "Cloudflare non risponde"; fi
+cf_zone_lookup "$zone" || zrc=$?
+if ((zrc == 2)); then
+  sleep "${CF_RETRY_S:-2}"
+  zrc=0
+  cf_zone_lookup "$zone" || zrc=$?
+fi
+if ((zrc == 2)); then json_err "$CF_LAST_ERR"; fi
 if ((zrc != 0)); then json_err "zona non trovata: $zone"; fi
+zid="$CF_ZONE_ID"
 resp="$(cf_api POST "/zones/$zid/purge_cache" "$body")" || json_err "Cloudflare non risponde"
 if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$resp"; then
   msg="$(jq -r '[.errors[]?.message] | join("; ")' <<<"$resp" 2>/dev/null || true)"
