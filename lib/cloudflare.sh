@@ -3,6 +3,21 @@
 # file header temporaneo (600), così non compare mai tra gli argomenti (ps).
 
 : "${CF_API:=https://api.cloudflare.com/client/v4}"
+# CF_API_IPV4: auto (predefinito) = l'API si chiama in IPv4 se la macchina ha una
+# rotta IPv4 predefinita; 1 sempre IPv4; 0 come capita. Il 23/11/2026 Cloudflare
+# ha risposto a tratti "971 Please wait and consider throttling your request
+# speed" a una VPS OVH che faceva poche chiamate: l'IPv6 delle VPS OVH sta in un
+# blocco condiviso con altri clienti, l'IPv4 no.
+: "${CF_API_IPV4:=auto}"
+
+# _cf_ipv4 — vero se le chiamate all'API vanno fatte in IPv4.
+_cf_ipv4() {
+  case "$CF_API_IPV4" in
+    1) return 0 ;;
+    auto) ip -4 route show default 2>/dev/null | grep -q . ;;
+    *) return 1 ;;
+  esac
+}
 
 cf_api() {
   local method="$1" path="$2" data="${3:-}" hdr rc=0
@@ -11,6 +26,9 @@ cf_api() {
   chmod 600 "$hdr"
   printf 'Authorization: Bearer %s\n' "$CF_API_TOKEN" >"$hdr"
   local args=(-sS --max-time 30 -X "$method" -H @"$hdr" -H 'Content-Type: application/json')
+  if _cf_ipv4; then
+    args=(-4 "${args[@]}")
+  fi
   if [[ -n "$data" ]]; then
     args+=(--data "$data")
   fi

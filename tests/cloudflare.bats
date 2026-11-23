@@ -69,6 +69,26 @@ esac'
   grep -q "Authorization: Bearer tok_SEGRETO" "$STUB_HDR"
 }
 
+@test "cf_api: IPv4 forzato con CF_API_IPV4=1, niente -4 con 0" {
+  CF_API_IPV4=1 cf_api GET /zones >/dev/null
+  grep -qE '(^| )-4( |$)' "$STUB_LOG"
+  : >"$STUB_LOG"
+  CF_API_IPV4=0 cf_api GET /zones >/dev/null
+  run grep -qE '(^| )-4( |$)' "$STUB_LOG"
+  [ "$status" -ne 0 ]
+}
+
+@test "cf_api: auto usa IPv4 solo se c'è una rotta IPv4 predefinita" {
+  make_stub ip 'echo "default via 192.0.2.1 dev eth0"'
+  CF_API_IPV4=auto cf_api GET /zones >/dev/null
+  grep -qE '(^| )-4( |$)' "$STUB_LOG"
+  : >"$STUB_LOG"
+  make_stub ip 'exit 0'
+  CF_API_IPV4=auto cf_api GET /zones >/dev/null
+  run grep -qE '(^| )-4( |$)' "$STUB_LOG"
+  [ "$status" -ne 0 ]
+}
+
 @test "cf_api senza token muore" {
   unset CF_API_TOKEN
   run cf_api GET /zones

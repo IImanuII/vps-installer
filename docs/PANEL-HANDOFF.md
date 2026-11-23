@@ -145,6 +145,8 @@ Il pannello **non** modifica il manifest direttamente: quando cambia lo stato (e
 
 ## 4. Script wrapper in `/opt/vps/bin`
 
+Chiamate all'API di Cloudflare (installer ≥ 1.12.4): `cf_api` usa IPv4 quando la macchina ha una rotta IPv4 predefinita (`CF_API_IPV4=auto`), perché sull'IPv6 condiviso delle VPS OVH Cloudflare rispondeva a tratti con l'errore `971`.
+
 Regole per tutti:
 - eseguiti con `sudo` dall'utente `panel`, abilitati uno per uno in `/etc/sudoers.d/vps-panel`;
 - **argomenti validati in modo rigido** (whitelist); niente shell libera, niente percorsi arbitrari;
