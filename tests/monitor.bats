@@ -772,6 +772,29 @@ sent() {
   [[ "$(sent)" == *'🟡 vps-test: il certificato di sito.it scade tra 5 giorni'* ]]
 }
 
+# cf_token_round RISPOSTA — un giro con Cloudflare attivo e vps-cf-token finto.
+cf_token_round() {
+  tool_env
+  mon_cfg '.urls = []'
+  jq '.cloudflare.enabled = true' "$VPS_OPT/manifest.json" >"$T/m.json" && mv "$T/m.json" "$VPS_OPT/manifest.json"
+  mkdir -p "$VPS_OPT/bin"
+  printf '%s\n' "$1" >"$T/cf.out"
+  printf '#!/bin/bash\ncat "%s/cf.out"\n' "$T" >"$VPS_OPT/bin/vps-cf-token"
+  chmod +x "$VPS_OPT/bin/vps-cf-token"
+  run round "$NOW"
+}
+
+@test "giro: token Cloudflare, errore di Cloudflare → 'non verificato'" {
+  cf_token_round '{"ok":false,"error":"Cloudflare ha dato errore: 10429 Rate limited"}'
+  [[ "$(sent)" == *'vps-test: token Cloudflare non verificato: Cloudflare ha dato errore: 10429 Rate limited'* ]]
+  [[ "$(sent)" != *'non funziona'* ]]
+}
+
+@test "giro: token Cloudflare senza accesso → 'non funziona'" {
+  cf_token_round '{"ok":false,"error":"il token salvato non ha accesso alla zona miosito.it"}'
+  [[ "$(sent)" == *'vps-test: il token Cloudflare non funziona: il token salvato non ha accesso alla zona miosito.it'* ]]
+}
+
 @test "giro: riepilogo delle 9 solo con contenuto e una volta al giorno" {
   tool_env
   mon_cfg '.urls = []'

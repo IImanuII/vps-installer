@@ -41,7 +41,10 @@ case "${1:-}" in
     token="$(trim "$(read_stdin_limited 512)")"
     valid_cf_token "$token" || json_err "formato del token non valido"
     [[ -n "$zone" ]] || json_err "Cloudflare non è attivo su questa VPS"
-    CF_API_TOKEN="$token" cf_find_zone "$zone" >/dev/null || json_err "il token non ha accesso alla zona $zone"
+    rc=0
+    CF_API_TOKEN="$token" cf_find_zone "$zone" >/dev/null || rc=$?
+    ((rc != 2)) || json_err "$CF_LAST_ERR"
+    ((rc == 0)) || json_err "il token non ha accesso alla zona $zone"
     mancanti="$(CF_API_TOKEN="$token" cf_missing_zones)" || json_err "il token non è valido o Cloudflare non risponde"
     [[ -z "$mancanti" ]] || json_err "il token non vede le zone: $mancanti"
     # Con l'accesso SSH attivo il nuovo token deve gestirne tunnel e app: se non li
@@ -69,7 +72,17 @@ case "${1:-}" in
     [[ -n "$zone" ]] || json_err "Cloudflare non è attivo su questa VPS"
     # shellcheck disable=SC2034
     CF_API_TOKEN="$(cf_token_from_ini)"
-    cf_find_zone "$zone" >/dev/null || json_err "il token salvato non ha accesso alla zona $zone"
+    # Un errore di Cloudflare (non un "zona non vista") si riprova una volta:
+    # un intoppo passeggero non deve diventare un avviso "token senza accesso".
+    rc=0
+    cf_find_zone "$zone" >/dev/null || rc=$?
+    if ((rc == 2)); then
+      sleep "${CF_RETRY_S:-2}"
+      rc=0
+      cf_find_zone "$zone" >/dev/null || rc=$?
+    fi
+    ((rc != 2)) || json_err "$CF_LAST_ERR"
+    ((rc == 0)) || json_err "il token salvato non ha accesso alla zona $zone"
     mancanti="$(cf_missing_zones)" || json_err "il token non è valido o Cloudflare non risponde"
     [[ -z "$mancanti" ]] || json_err "il token non vede le zone: $mancanti"
     n="$(cf_list_zones | grep -c . || true)"

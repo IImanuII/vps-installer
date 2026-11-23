@@ -49,7 +49,10 @@ case "$url" in
     if cf_deny idp; then cf_reply 403 "{\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}]}"
     elif [ -n "${CF_NO_ZT:-}" ]; then cf_reply 404 "{\"success\":false,\"errors\":[{\"code\":7003,\"message\":\"zero trust organization not found\"}]}"
     else cf_reply 200 "{\"success\":true,\"result\":{\"name\":\"x\"}}"; fi ;;
-  *"name=panel.miosito.it&"*) echo "{\"success\":true,\"result\":[]}" ;;
+  *"name=panel.miosito.it&"* | *"name=panel.altro.it&"* | *"name=altro.it&"*) echo "{\"success\":true,\"result\":[]}" ;;
+  *"name=limite.it&"*) echo "{\"success\":false,\"errors\":[{\"code\":10429,\"message\":\"Rate limited\"}],\"result\":null}" ;;
+  *"name=html.it&"*) echo "<html>bad gateway</html>" ;;
+  *"name=rete.it&"*) exit 28 ;;
   *"name=miosito.it&"*) echo "{\"success\":true,\"result\":[{\"id\":\"zone123\",\"name\":\"miosito.it\"}]}" ;;
   *"dns_records?name="*) echo "${DNS_EXISTING:-{\"success\":true,\"result\":[]\}}" ;;
   *"dns_records/"*) echo "{\"success\":true,\"result\":{\"id\":\"a1\"}}" ;;
@@ -81,6 +84,29 @@ esac'
 @test "cf_find_zone fallisce se nessuna zona è accessibile" {
   run cf_find_zone panel.altro.it
   [ "$status" -eq 1 ]
+}
+
+@test "cf_find_zone: errore di Cloudflare → 2 con il motivo, non 'zona non vista'" {
+  local rc=0
+  cf_find_zone limite.it >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ]
+  [ "$CF_LAST_ERR" = "Cloudflare ha dato errore: 10429 Rate limited" ]
+  grep -qF "ricerca della zona limite.it non riuscita: Cloudflare ha dato errore: 10429 Rate limited" "$VPS_LOG"
+  ! grep -qF SEGRETO "$VPS_LOG" || false
+}
+
+@test "cf_find_zone: risposta non JSON → 2" {
+  local rc=0
+  cf_find_zone html.it >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ]
+  [ "$CF_LAST_ERR" = "Cloudflare ha dato errore: risposta non valida" ]
+}
+
+@test "cf_find_zone: curl fallito → 2 con il codice di curl" {
+  local rc=0
+  cf_find_zone rete.it >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ]
+  [ "$CF_LAST_ERR" = "Cloudflare non risponde (curl uscito con 28)" ]
 }
 
 @test "cf_upsert_record crea il record se non esiste" {

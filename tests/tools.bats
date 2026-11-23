@@ -351,6 +351,12 @@ case "$last" in
     jq -Rn "{success: true, result: [inputs | {name: .}], result_info: {total_pages: 1}}" <"$BATS_TEST_TMPDIR/zones" ;;
   *"/zones?name="*)
     n="${last#*name=}"; n="${n%%&*}"
+    # CF_FAIL_N=K: le prime K ricerche di zona rispondono "Rate limited".
+    c=$(( $(cat "$BATS_TEST_TMPDIR/fail.count" 2>/dev/null || echo 0) + 1 ))
+    echo "$c" >"$BATS_TEST_TMPDIR/fail.count"
+    if [ "$c" -le "${CF_FAIL_N:-0}" ]; then
+      echo "{\"success\":false,\"errors\":[{\"code\":10429,\"message\":\"Rate limited\"}]}"; exit 0
+    fi
     if grep -qxF "$n" "$BATS_TEST_TMPDIR/zones"; then echo "{\"success\":true,\"result\":[{\"id\":\"z-$n\"}]}"; else echo "{\"success\":true,\"result\":[]}"; fi ;;
   *) echo "{\"success\":false}" ;;
 esac'
@@ -386,6 +392,29 @@ _cf_sito() {
   [ "$(jq -r .zones <<<"$output")" = 3 ]
   run ! grep -qF "$tok" "$BATS_TEST_TMPDIR/curl.args"
   ! grep -qF "$tok" "$VPS_LOG" || false
+}
+
+@test "vps-cf-token test: un errore passeggero di Cloudflare si riprova e passa" {
+  _cf_ini; _cf_curl_zone miosito.it
+  CF_FAIL_N=1 CF_RETRY_S=0 run bash -c "bash '$T/vps-cf-token' test 2>/dev/null"
+  [ "$status" -eq 0 ]
+  grep -qF "Cloudflare ha dato errore: 10429 Rate limited" "$VPS_LOG"
+  [ "$(jq -r .zones <<<"$output")" = 1 ]
+}
+
+@test "vps-cf-token test: Cloudflare in errore → motivo vero, non 'non ha accesso'" {
+  _cf_ini; _cf_curl_zone miosito.it
+  CF_FAIL_N=9 CF_RETRY_S=0 run bash -c "bash '$T/vps-cf-token' test 2>/dev/null"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "Cloudflare ha dato errore: 10429 Rate limited" ]
+  [ "$(cat "$BATS_TEST_TMPDIR/fail.count")" = 2 ]
+}
+
+@test "vps-cf-token test: zona davvero non vista → nessun nuovo tentativo" {
+  _cf_ini; _cf_curl_zone altro.it
+  CF_RETRY_S=0 run bash -c "bash '$T/vps-cf-token' test 2>/dev/null"
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .error <<<"$output")" = "il token salvato non ha accesso alla zona miosito.it" ]
 }
 
 @test "vps-cf-token test segnala le zone dei siti non più visibili" {

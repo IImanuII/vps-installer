@@ -460,7 +460,8 @@ mon_check_periodic() {
     esac
   done
   if [[ "$(jq -r '.cloudflare.enabled == true' "$(manifest_path)" 2>/dev/null)" == true ]]; then
-    out="$(timeout 10 "$VPS_OPT/bin/vps-cf-token" test 2>/dev/null)" || true
+    # 20 s: vps-cf-token riprova una volta se Cloudflare dà errore.
+    out="$(timeout 20 "$VPS_OPT/bin/vps-cf-token" test 2>/dev/null)" || true
     if [[ "$(jq -r '.ok == true' <<<"$out" 2>/dev/null)" == true ]]; then
       lvl=ok err=""
     else
@@ -470,7 +471,12 @@ mon_check_periodic() {
     fi
     _mon_level cf_token "$lvl" '{"kind":"cf_token","label":"token Cloudflare"}'
     case "$MON_EV" in
-      new | remind) _mon_say down "il token Cloudflare non funziona: $err" ;;
+      new | remind)
+        case "$err" in
+          "Cloudflare "* | "nessuna risposta") _mon_say down "token Cloudflare non verificato: $err" ;;
+          *) _mon_say down "il token Cloudflare non funziona: $err" ;;
+        esac
+        ;;
       up) _mon_say up "il token Cloudflare funziona di nuovo" ;;
     esac
   fi

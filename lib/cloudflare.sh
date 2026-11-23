@@ -30,10 +30,26 @@ cf_api_code() {
 }
 
 # cf_find_zone DOMINIO → "ZONE_ID ZONE_NAME"
+# 0 trovata; 1 Cloudflare risponde ma il token non vede nessuna zona del
+# dominio; 2 Cloudflare non risponde o dà errore (rete, limite di richieste,
+# 5xx, token rifiutato): il motivo va in CF_LAST_ERR e nel log, senza token.
 cf_find_zone() {
-  local cand resp id
+  local cand resp id rc
+  CF_LAST_ERR=""
   while read -r cand; do
-    resp="$(cf_api GET "/zones?name=$cand&status=active")" || return 1
+    rc=0
+    resp="$(cf_api GET "/zones?name=$cand&status=active")" || rc=$?
+    if ((rc != 0)); then
+      CF_LAST_ERR="Cloudflare non risponde (curl uscito con $rc)"
+      log "Cloudflare: ricerca della zona $cand non riuscita: $CF_LAST_ERR"
+      return 2
+    fi
+    if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$resp"; then
+      CF_LAST_ERR="$(jq -r '[.errors[]? | "\(.code // "?") \(.message // "")"] | join("; ") | select(. != "")' <<<"$resp" 2>/dev/null || true)"
+      CF_LAST_ERR="Cloudflare ha dato errore: ${CF_LAST_ERR:-risposta non valida}"
+      log "Cloudflare: ricerca della zona $cand non riuscita: $CF_LAST_ERR"
+      return 2
+    fi
     id="$(jq -r '.result[0].id // empty' <<<"$resp" 2>/dev/null || true)"
     if [[ -n "$id" ]]; then
       printf '%s %s\n' "$id" "$cand"
