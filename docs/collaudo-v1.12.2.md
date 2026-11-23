@@ -32,6 +32,12 @@ In tutti questi casi il codice trattava qualsiasi risposta senza id della zona c
 
 1168 test verdi, shellcheck ok, CI e release verdi per entrambi i tag. Test instabile già presente prima, non legato a queste modifiche: in `backup.bats`, "_restore: il job dice la copia di sicurezza dal passo safety in poi" a volte fallisce quando gira in parallelo con gli altri, da solo passa sempre.
 
+## Seguito: 1.12.4 e Cloudflare (stesso giorno)
+
+- **Dashboard di Cloudflare:** sull'account c'è un solo token usato di recente, quello della VPS. L'altro è fermo da un mese e non ci sono token a livello di account. Quindi nessun altro programma consuma il limite dell'API.
+- **1.12.4:** `cf_api` chiama l'API in IPv4 se c'è una rotta IPv4 predefinita (`CF_API_IPV4=auto`). L'IPv6 delle VPS OVH sta in un blocco condiviso con altri clienti, l'IPv4 no. Installata: `vps-cf-token test` e `vps-cf-purge --host` ok. Se nei prossimi giorni il `971` non ricompare nel log, l'ipotesi è confermata.
+- **Bot Fight Mode:** dava una verifica gestita alle richieste della VPS verso i siti della zona del sito principale, compreso il controllo URL del monitor, che riceveva sempre 403. Aggiunte regole di accesso IP "Consenti" solo su quella zona per l'IPv4 e l'IPv6 della VPS. Ora le stesse richieste ricevono 200, in IPv4 e in IPv6.
+
 ## Aperto
 
 - Non si sa chi fa scattare il rallentamento: dalla VPS partono poche chiamate. Il limite di Cloudflare vale per l'account, quindi pesano anche gli altri token dello stesso account.
